@@ -1,0 +1,4 @@
+# Local dev overrides. Activate with `MISE_ENV=development` in your shell.
+[env]
+DIFMSYNC_LOG_FORMAT = "text"
+DIFMSYNC_LOG_LEVEL = "debug"

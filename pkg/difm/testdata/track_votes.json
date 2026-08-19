@@ -1,0 +1,76 @@
+[
+  {
+    "channel_id": 174,
+    "created_at": "2026-02-28T11:02:17-05:00",
+    "down": false,
+    "id": 64755876,
+    "member_id": 10000001,
+    "network_id": 1,
+    "playlist": null,
+    "position": null,
+    "track_id": 3041427,
+    "up": true,
+    "updated_at": "2026-02-28T11:02:17-05:00",
+    "episode": null,
+    "track": {
+      "id": 3041427,
+      "length": 442,
+      "title": "Junkies (Joe Silva Remix)",
+      "version": null,
+      "display_title": "Junkies (Joe Silva Remix)",
+      "display_artist": "Funk D'Void & Berny",
+      "track": "Funk D'Void & Berny - Junkies (Joe Silva Remix)",
+      "mix": false,
+      "isrc": null,
+      "details_url": "https://www.di.fm/tracks/3041427/deephouse"
+    }
+  },
+  {
+    "channel_id": 174,
+    "created_at": "2026-02-27T09:14:00-05:00",
+    "id": 64755001,
+    "track_id": 3041000,
+    "up": true,
+    "episode": null,
+    "track": {
+      "id": 3041000,
+      "length": 4200,
+      "title": "Some Very Long DJ Set",
+      "display_title": "Some Very Long DJ Set",
+      "display_artist": "A DJ",
+      "mix": true,
+      "isrc": "GBAAA1234567",
+      "details_url": ""
+    }
+  },
+  {
+    "channel_id": 1,
+    "created_at": "2020-01-01T00:00:00-05:00",
+    "id": 100,
+    "track_id": 999,
+    "up": true,
+    "episode": {
+      "id": 55
+    },
+    "track": {
+      "id": 999,
+      "length": 3600,
+      "title": "Mix Show Episode 12",
+      "display_title": "Mix Show Episode 12",
+      "display_artist": "Host",
+      "mix": false
+    }
+  },
+  {
+    "channel_id": 1,
+    "created_at": "2021-06-06T00:00:00-05:00",
+    "id": 101,
+    "track_id": 1001,
+    "up": false,
+    "track": {
+      "id": 1001,
+      "title": "A Downvote",
+      "display_artist": "Nobody"
+    }
+  }
+]

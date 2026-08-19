@@ -1,0 +1,54 @@
+# Fly.io deployment. Identical image to the homelab compose setup — only
+# the volume mount and machine sizing differ.
+#
+# This is a worker, not a web service: there are no [http_service] or
+# [[services]] blocks, so no public port is exposed. The machine must be
+# kept running rather than scaled to zero, since the sync loop is
+# internal to the process.
+#
+# One-time setup:
+#   fly volumes create difmsync_data --size 1
+#   fly secrets set DIFMSYNC_API_KEY=... DIFMSYNC_MEMBER_ID=... \
+#       DIFMSYNC_SPOTIFY_CLIENT_ID=... DIFMSYNC_SPOTIFY_CLIENT_SECRET=... \
+#       DIFMSYNC_PLAYLIST_ID=...
+#
+# The Spotify refresh token lives in the SQLite database on the volume.
+# `difmsync auth` needs a browser, so it cannot run here. Run it locally,
+# then copy the resulting database onto the volume with `fly ssh sftp`
+# (sftp works without a shell in the image). See docs/deploy.md.
+
+app = "difm-spotify-sync"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DIFMSYNC_DB_PATH = "/data/difmsync.db"
+  DIFMSYNC_LOG_FORMAT = "json"
+  DIFMSYNC_INTERVAL = "15m"
+
+[mounts]
+  source = "difmsync_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# A sync loop that is scaled to zero never syncs, and a crashed one that
+# Fly gives up on never syncs either.
+#
+# Note what is NOT here: auto_stop_machines / auto_start_machines /
+# min_machines_running. Those live inside [http_service] or [[services]],
+# and this app deliberately has neither — it is a worker with no public
+# port. A bare [machine] table is not part of fly.toml's schema at all,
+# so setting them there configured nothing while reading as a guarantee.
+#
+# What actually holds the machine up:
+#   - No [[services]] means the proxy has nothing to autostop it from.
+#   - `fly scale count 1` pins the count; see docs/deploy.md.
+#   - The restart policy below keeps a crashed worker coming back rather
+#     than stopping after Fly's default retry budget.
+[[restart]]
+  policy = "always"
