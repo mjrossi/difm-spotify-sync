@@ -1,0 +1,35 @@
+# Pin the language runtime and project tooling. Contributors install mise
+# (https://mise.jdx.dev), then `mise install` at the repo root provisions
+# everything below.
+#
+# Per-environment overlays:
+#   - mise.development.toml  → MISE_ENV=development (local dev)
+#   - mise.ci.toml           → MISE_ENV=ci (GitHub Actions)
+#   - mise.local.toml        → uncommitted, machine-specific overrides
+#                              (see mise.local.toml.example)
+
+[tools]
+# Patch-pinned so reproducibility > convenience.
+go = "1.26.5"
+
+# Project tooling, pinned for the same reason.
+"aqua:sqlc-dev/sqlc" = "1.28.0"
+"aqua:pressly/goose" = "3.24.0"
+"aqua:casey/just" = "1.51.0"
+# The justfile's inspection recipes and docs/deploy.md shell out to
+# sqlite3; without it here, `mise install` leaves them failing with
+# "command not found".
+sqlite = "3.53.4"
+# golangci-lint v2 is the single lint + format gate (govet + staticcheck +
+# gofumpt + goimports all bundled). Config lives in .golangci.yml.
+"aqua:golangci/golangci-lint" = "2.12.2"
+
+[env]
+# Defaults that apply everywhere. Per-env files override these.
+DIFMSYNC_LOG_FORMAT = "json"
+DIFMSYNC_LOG_LEVEL = "info"
+DIFMSYNC_INTERVAL = "15m"
+DIFMSYNC_DB_PATH = "./tmp/difmsync.db"
+# Read by --network; DI.fm is the default, but the same API backs
+# RadioTunes, JazzRadio, RockRadio, ClassicalRadio and ZenRadio.
+DIFMSYNC_NETWORK = "di"

@@ -1,0 +1,114 @@
+# golangci-lint v2 configuration for the difm-spotify-sync module.
+#
+# Curated "standardization" linter set grounded in current Go community
+# consensus: the v2 `standard` defaults plus high-signal correctness/idiom
+# linters and a small, deliberately low-noise set of standardization
+# linters. golangci-lint bundles govet + staticcheck + the formatters, so
+# this file is the single source of truth for the lint + format gate
+# (`just lint` / `just fmt`). Pinned via mise (aqua:golangci/golangci-lint).
+#
+# Deliberately NOT enabled (too noisy / opinionated for this codebase):
+#   gosec (false positives on the HTTP clients), complexity gates
+#   (gocyclo/cyclop/funlen), wsl, nlreturn, lll, gochecknoglobals,
+#   varnamelen, godox, dupl, depguard, exhaustruct, mnd. testifylint is
+#   irrelevant — this project asserts with google/go-cmp, not testify.
+version: "2"
+
+run:
+  go: "1.26"
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    # correctness / idiom (near-zero false positives)
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errorlint
+    - intrange
+    - misspell
+    - nilerr
+    - noctx
+    - perfsprint
+    - unconvert
+    - usestdlibvars
+    - wastedassign
+    # standardization
+    - gocritic
+    - revive
+    - sloglint
+    - nolintlint
+  settings:
+    errcheck:
+      check-type-assertions: true # flag unchecked x := y.(T)
+    gocritic:
+      enabled-tags: # skip the opinionated `style` tag (overlaps revive)
+        - diagnostic
+        - performance
+      disabled-checks:
+        # hugeParam / rangeValCopy nag value types toward pointer-passing.
+        # That trades this codebase's deliberate value semantics for nil-able
+        # aliasing — a semantic change, not the simplification we're after.
+        - hugeParam
+        - rangeValCopy
+    misspell:
+      locale: US
+    sloglint:
+      no-mixed-args: true
+      no-global: all # enforce the explicit *slog.Logger the code already threads
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+    revive:
+      rules: # curated high-signal subset — NOT the comment-requiring rules
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: errorf
+        - name: indent-error-flow
+        - name: superfluous-else
+        - name: early-return
+        - name: unreachable-code
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: var-declaration
+        - name: redefines-builtin-id
+        - name: bool-literal-in-expr
+        - name: unnecessary-stmt
+        - name: defer
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Tests intentionally drop errors and skip request contexts.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - noctx
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      module-path: github.com/mjrossi/difm-spotify-sync
+      extra-rules: true
+    goimports:
+      local-prefixes:
+        - github.com/mjrossi/difm-spotify-sync
+  exclusions:
+    generated: lax
+    paths: # belt-and-suspenders: never reformat codegen output
+      - internal/store/sqlite/gen

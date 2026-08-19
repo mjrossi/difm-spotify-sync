@@ -1,0 +1,33 @@
+name: govulncheck
+
+# Weekly scan of the Go module graph for known vulnerabilities. Deliberately
+# off the PR critical path: a freshly published CVE should open a
+# notification to triage, not block an unrelated merge.
+#
+# Ad-hoc runs: `gh workflow run govulncheck.yml`.
+
+on:
+  schedule:
+    - cron: "0 12 * * 1" # Mondays 12:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: govulncheck
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: scan for known CVEs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: govulncheck
+        run: |
+          # Pinned rather than @latest: an unpinned `go run` of a remote
+          # module executes whatever that tag points at today, inside CI.
+          go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...

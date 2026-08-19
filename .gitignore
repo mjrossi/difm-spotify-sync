@@ -1,0 +1,12 @@
+# machine-specific mise overrides (may contain credentials)
+mise.local.toml
+.env
+
+# local state
+tmp/
+*.db
+*.db-shm
+*.db-wal
+
+# build output
+bin/

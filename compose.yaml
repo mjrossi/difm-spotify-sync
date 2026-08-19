@@ -1,0 +1,52 @@
+# Homelab deployment. Credentials come from .env (gitignored); see
+# docs/difm-api.md for how to obtain DIFMSYNC_API_KEY and
+# DIFMSYNC_MEMBER_ID.
+#
+# One-time setup, before the daemon can run unattended:
+#
+#   docker compose run --rm --service-ports connector auth
+#
+# --service-ports is required: `docker compose run` does NOT publish the
+# service's ports without it, so the `ports:` block below is inert for
+# that command and the OAuth callback never arrives. DIFMSYNC_AUTH_BIND
+# below is the other half — see the comment there.
+services:
+  connector:
+    build: .
+    image: difm-spotify-sync:dev
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DIFMSYNC_DB_PATH: /data/difmsync.db
+      DIFMSYNC_LOG_FORMAT: json
+      # A published port forwards to the container's eth0 address, not
+      # its loopback, so the `auth` listener has to bind 0.0.0.0 to be
+      # reachable from the host. The redirect URL itself stays
+      # 127.0.0.1 — that is what the browser and Spotify's dashboard
+      # both need.
+      DIFMSYNC_AUTH_BIND: 0.0.0.0
+    volumes:
+      - difmsync-data:/data
+    # The auth subcommand needs the callback port reachable from the host.
+    # Bound to the host's loopback only: nothing here should be exposed
+    # to the network.
+    ports:
+      - "127.0.0.1:8888:8888"
+    # distroless has no shell, so the check must be exec-form. `status`
+    # opens the database and reads the account, which is a real check
+    # that the process and its volume are both healthy.
+    #
+    # start_period is long because `status` exits non-zero until the
+    # one-time `difmsync auth` has run, and auth needs a human with a
+    # browser. A short period would report `unhealthy` for the whole
+    # window between first deploy and consent — inverting the signal on
+    # precisely the day someone is watching it.
+    healthcheck:
+      test: ["CMD", "/app/difmsync", "status"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30m
+
+volumes:
+  difmsync-data:

@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least-privilege: every job only reads the repo. Nothing here writes to
+# the repo, comments on PRs, or pushes packages.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Activates mise.ci.toml's [env] overlay on top of mise.toml.
+  MISE_ENV: ci
+
+jobs:
+  check:
+    name: lint + test + codegen drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # mise is the single source of truth for the Go toolchain and for
+      # sqlc/goose/golangci-lint versions, so CI and local runs cannot
+      # drift apart.
+      - uses: jdx/mise-action@v4
+
+      - name: go build
+        run: go build ./...
+
+      # Runs golangci-lint (which bundles govet, staticcheck, and the
+      # gofumpt/goimports format-drift check), the race-enabled test
+      # suite, a check that the committed sqlc output still matches the
+      # schema and queries, and a DIFMSYNC_* config-drift check.
+      - name: just check
+        run: just check
+
+      # `just check` does not cover go.mod drift, and a stale go.sum
+      # breaks the container build rather than the Go build.
+      - name: go mod tidy is a no-op
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  docker:
+    name: container image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # The image is the deployment artifact for both the homelab and
+      # Fly.io, so a Dockerfile that stops building is a release blocker
+      # even when the Go build is fine.
+      - name: docker build
+        run: docker build -t difm-spotify-sync:ci .
+
+      # Building proves the Dockerfile parses; it does not prove the
+      # image runs. The failure this catches is a /data that the nonroot
+      # process cannot write, which otherwise first appears as a crash
+      # loop on someone's homelab. `status` opens the database on the
+      # volume, so it exercises exactly that path.
+      - name: image runs and can write its volume
+        run: |
+          set -uo pipefail
+          docker volume create difmsync-ci-data
+
+          # A *positive* assertion. Grepping for the failure string meant
+          # an image that could not start at all — bad entrypoint, missing
+          # binary, exec format error — produced an empty log, matched
+          # nothing, and passed the gate green. So require the specific
+          # output that proves the binary ran, opened the database on the
+          # volume, and applied its migrations.
+          out=$(docker run --rm -v difmsync-ci-data:/data \
+                  -e DIFMSYNC_LOG_FORMAT=text \
+                  --entrypoint /app/difmsync difm-spotify-sync:ci \
+                  resync --all 2>&1)
+          status=$?
+          echo "$out"
+
+          if printf '%s' "$out" | grep -q "unable to open database file"; then
+            echo "::error::/data is not writable by the nonroot user (uid 65532)"
+            exit 1
+          fi
+          # `resync --all` on a fresh volume reaches the account lookup,
+          # which is as far as it can get without credentials. Anything
+          # else means the image did not run.
+          if ! printf '%s' "$out" | grep -qE "no account|cleared the watermark"; then
+            echo "::error::image did not run as expected (exit $status); output above"
+            exit 1
+          fi
