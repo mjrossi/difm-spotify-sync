@@ -80,6 +80,36 @@ project, so the real one is `<project>_difmsync-data`; naming the bare
 broken deployment rather than a mistyped command. The service already
 declares the volume, so there is nothing to add.
 
+### Day-2 commands
+
+Use `exec`, not `run`. `exec` reaches into the container that is already
+running, with the volume it already has; `run` starts another one and
+invites the mistake above.
+
+```sh
+docker compose exec connector /app/difmsync status
+docker compose exec connector /app/difmsync review
+docker compose exec connector /app/difmsync review --approve=<difm-track-id>
+docker compose exec connector /app/difmsync resync --forget=<id> --all
+```
+
+There is no shell in the image, so these are the whole interface — each
+one is the binary invoked directly, not a command line for something to
+interpret.
+
+### Upgrading
+
+```sh
+git pull
+docker compose build
+docker compose up -d
+```
+
+Migrations are embedded and applied on every boot, so there is no separate
+migration step. The build needs BuildKit — the Dockerfile uses
+`RUN --mount=type=cache`, which the legacy builder rejects outright, so a
+host with `DOCKER_BUILDKIT=0` fails immediately rather than subtly.
+
 ## Volume ownership
 
 **Check this if the container crash-loops on first start.** The process
@@ -147,49 +177,130 @@ Point `DIFMSYNC_PLAYLIST_ID` at a scratch playlist for the first live run.
 ## Verifying it works
 
 ```sh
-just status                        # watermark should advance after a clean pass
-just review                        # anything that didn't auto-add
-sqlite3 "$DIFMSYNC_DB_PATH" \
-  "select started_at, added, queued, skipped, error from sync_runs order by id desc limit 5;"
+just status      # the report: totals, watermark, health, recent runs
+just review      # anything that didn't auto-add
 ```
 
-An empty `error` column on the most recent row is the signal that the last
-pass completed. A pass that fails still writes its row — that is the point
-of the table.
+`status` prints a runs table. An empty `ERROR` column on the newest row is
+the signal that the last pass completed; a pass that fails still writes
+its row, which is the point of the table.
 
 **Idempotency check:** run `just sync` twice back to back. The second pass
 must add zero tracks.
 
+## Is it still working?
+
+This is the question a homelab deployment actually needs answered, because
+the sync interval is an internal ticker — nothing external triggers a
+pass, so a container that stopped, wedged, or lost its credentials simply
+stops syncing, quietly.
+
+One rule answers it, and everything below uses that same rule: **the
+newest pass that finished, recorded no error, and was not a dry run must
+be within `DIFMSYNC_STATUS_MAX_AGE`** (45m by default — three ticks of the
+15m interval, so one missed pass is tolerated and two are not).
+
+```sh
+docker compose ps                                       # healthy / unhealthy
+docker compose exec connector /app/difmsync status --check   # the same verdict, with a reason
+curl -s http://<host>:8080/healthz                      # 200 ok, or 503 and the reason
+curl -s http://<host>:8080/status.json | jq             # the full report
+```
+
+The container healthcheck runs `status --check`, deliberately rather than
+curling `/healthz`: distroless ships no curl or wget, and this way health
+still works if `DIFMSYNC_HTTP_ADDR` is unset.
+
+Point a dashboard (Uptime Kuma, Homepage, anything that polls a URL) at
+`/healthz`. Both endpoints are read-only and carry no secrets, which is
+what makes them safe to expose on the LAN without authentication.
+
+### When it goes red
+
+`/healthz` and `--check` both name the reason. Match it:
+
+| Reason | What it means | First move |
+|---|---|---|
+| `no account "default" yet` | `difmsync auth` has never run against this volume | Run the auth step above |
+| `no sync pass has run yet` | The container started but has not completed a pass | Wait one interval; then read the logs |
+| `newest run errored: …` | A pass failed and the watermark was held back | The error is the whole message — read it |
+| `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 connector` |
+| `newest run is still in flight` | A pass is running, or was killed mid-run | Wait; if it persists, restart the container |
+
+For the errored case, `/status.json` carries the last few runs with their
+errors, which is usually faster than paging through logs:
+
+```sh
+curl -s http://<host>:8080/status.json | jq '.runs[] | {started_at, added, error}'
+```
+
+A failing pass is not data loss. The watermark only advances after a fully
+clean pass, so whatever the failed pass missed is re-read on the next one.
+
 ## Backups
 
 The database is the only copy of the Spotify refresh token, and losing it
-means redoing the one interactive step in the whole system. Back it up:
+means redoing the one interactive step in the whole system. It also holds
+the ledger, the review queue and the watermark.
+
+`difmsync backup` runs inside the container, which matters: the image is
+distroless, so there is no `sqlite3` and no shell in there to copy the
+file with.
 
 ```sh
-just backup                        # -> ./tmp/difmsync-backup.db
-just backup /path/to/somewhere.db
+docker compose exec connector /app/difmsync backup --to=/data/backups/difmsync-$(date +%F).db
 ```
 
-Use that rather than `cp`: the database runs in WAL mode, so copying the
-file while the daemon is writing can capture a torn state. The backup
-contains the refresh token — store it as a secret.
+`$(date)` expands in *your* shell, not the container's — which is what you
+want, since the container has none.
 
-`just backup` reads `DIFMSYNC_DB_PATH`, defaulting to `./tmp/difmsync.db`
-— **the local path, not the deployed one**. For the compose deployment
-the database is inside the named volume, so copy it out first rather than
-backing up a path that does not exist there:
+That writes into the volume. Either let whatever backs up your Docker
+volumes pick it up, or pull it onto the host:
 
 ```sh
-docker compose cp connector:/data/difmsync.db ./tmp/difmsync.db
-just backup
+docker compose cp connector:/data/backups/difmsync-$(date +%F).db ./difmsync-backup.db
 ```
 
-The recipe fails loudly if the source is missing or the result has no
-`accounts` row. It has to: `sqlite3 ".backup"` on a nonexistent path
-creates an empty database and exits 0, so without those checks a wrong
-`DIFMSYNC_DB_PATH` yields a confident success message, a 4 KB file with
-no tables — and if you then restore that over `/data/difmsync.db`, the
-loss of the only copy of the refresh token.
+As a nightly cron on the host:
+
+```cron
+15 4 * * * cd /srv/difm-spotify-sync && docker compose exec -T connector \
+  /app/difmsync backup --to=/data/backups/difmsync-$(date +\%F).db
+```
+
+`-T` disables TTY allocation, which cron needs. Note the escaped `\%` —
+cron treats a bare `%` as a newline. Prune old snapshots on whatever
+schedule suits you; nothing rotates them.
+
+Three things the command refuses to do, all for the same reason — the
+output is often the only copy of a refresh token, and restoring one means
+writing it *over* the live database:
+
+- **Overwrite an existing destination.** Pick another `--to`, or move the
+  old file away first.
+- **Leave a snapshot it could not verify.** It reopens the result and
+  reads the account row back. A file that fails is deleted, because a
+  plausible-looking file left behind is how it gets restored later by
+  someone who never saw the error.
+- **Write it world-readable.** The snapshot is `chmod 600`.
+
+### Restoring
+
+```sh
+docker compose stop connector
+docker compose cp ./difmsync-backup.db connector:/data/difmsync.db
+docker compose start connector
+docker compose exec connector /app/difmsync status
+```
+
+Stop first: copying over a database with a live writer attached is how you
+get a corrupt one. If `/data` is a bind mount, `chown 65532:65532` the
+restored file — see [Volume ownership](#volume-ownership).
+
+After a restore the ledger may be behind the playlist's real contents.
+That is safe to fix: each pass reconciles against the live playlist before
+adding, so `difmsync resync --forget-all` followed by a sync rebuilds the
+ledger without duplicating anything.
 
 ## Recovering a deleted track
 

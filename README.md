@@ -40,6 +40,8 @@ Every flag has a `DIFMSYNC_*` environment fallback:
 | `DIFMSYNC_REVIEW_THRESHOLD` | `--review-threshold` | `0.60` |
 | `DIFMSYNC_LOG_FORMAT` | `--log-format` | `json` |
 | `DIFMSYNC_LOG_LEVEL` | `--log-level` | `info` |
+| `DIFMSYNC_HTTP_ADDR` | `--http-addr` | — (endpoints off) |
+| `DIFMSYNC_STATUS_MAX_AGE` | `--max-age` | `45m` |
 
 `just verify-config` checks this set against the code and is part of
 `just check`.
@@ -82,10 +84,36 @@ difmsync auth      # one-time Spotify OAuth consent
 difmsync sync      # one pass; --dry-run to write nothing; --loop to run forever
 difmsync review    # inspect and resolve the review queue
 difmsync resync    # reset sync state so past likes are re-evaluated
-difmsync status    # ledger totals, pending count, watermark
+difmsync status    # ledger totals, pending count, watermark, recent runs
+difmsync backup    # consistent snapshot of the database
 ```
 
 Run `just` to list every recipe.
+
+## Operating it
+
+The sync interval is an internal ticker, so nothing external notices when
+a container stops syncing. Two things answer "is it actually working?",
+and both use the same rule: **the newest pass that finished, recorded no
+error, and was not a dry run must be within `--max-age`.**
+
+```sh
+difmsync status            # the report, with the recent runs table
+difmsync status --check    # exit 0 if healthy, non-zero with the reason
+difmsync status --json     # the same report, machine-readable
+```
+
+`--check` is the container healthcheck. Set `--http-addr` and
+`sync --loop` also serves the same verdict over HTTP, for a dashboard:
+
+| Endpoint | Answer |
+|---|---|
+| `GET /healthz` | `200 ok`, or `503` and the reason |
+| `GET /status.json` | the full report; always `200`, with `"healthy": false` when it is not |
+
+Both are **read-only and carry no secrets**, which is what makes them safe
+to expose on a LAN unauthenticated. Resolving a queued match writes to
+Spotify, so it stays a CLI action — `difmsync review --approve=<id>`.
 
 ## Deployment
 
@@ -146,7 +174,8 @@ already present are recorded rather than duplicated.
 - **Watermark last.** It advances only after a fully clean pass, so an
   interrupted run re-reads instead of losing likes.
 - **Failures are recorded.** Every pass writes a `sync_runs` row including
-  its error, so a silently broken sync is visible in `difmsync status`.
+  its error, and `difmsync status` reads it — so a silently broken sync
+  shows up as a failing healthcheck rather than as nothing at all.
 - **Reconciled against reality.** Each pass reads the playlist's actual
   contents, so a restored database, a cleared ledger, or a hand-added
   track cannot produce duplicates.
@@ -159,6 +188,7 @@ pkg/difm/              AudioAddict API client (importable)
 pkg/match/             normalization + scoring (pure, heavily tested)
 pkg/spotify/           hand-rolled Web API client (search, playlist writes)
 internal/store/sqlite/ sqlc-generated queries + typed wrappers
+internal/status/       the operator report, health rule and HTTP endpoints
 internal/syncer/       orchestration
 migrations-sqlite/     goose migrations, embedded
 docs/difm-api.md       the private-API reference this depends on

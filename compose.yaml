@@ -19,6 +19,16 @@ services:
     environment:
       DIFMSYNC_DB_PATH: /data/difmsync.db
       DIFMSYNC_LOG_FORMAT: json
+      # Read-only status endpoints, reachable from the LAN so a dashboard
+      # (Uptime Kuma, Homepage) can poll them. 0.0.0.0 because the
+      # published port forwards to eth0, same as DIFMSYNC_AUTH_BIND below.
+      # Safe to expose unauthenticated only because these endpoints carry
+      # no secrets and cannot change anything — see internal/status.
+      DIFMSYNC_HTTP_ADDR: 0.0.0.0:8080
+      # How stale the last clean pass may be before /healthz and
+      # `status --check` report unhealthy. Three ticks of the default
+      # 15m interval, so one missed pass is tolerated and two are not.
+      DIFMSYNC_STATUS_MAX_AGE: 45m
       # A published port forwards to the container's eth0 address, not
       # its loopback, so the `auth` listener has to bind 0.0.0.0 to be
       # reachable from the host. The redirect URL itself stays
@@ -27,14 +37,24 @@ services:
       DIFMSYNC_AUTH_BIND: 0.0.0.0
     volumes:
       - difmsync-data:/data
-    # The auth subcommand needs the callback port reachable from the host.
-    # Bound to the host's loopback only: nothing here should be exposed
-    # to the network.
     ports:
+      # The auth subcommand needs the callback port reachable from the
+      # host. Bound to the host's loopback only, and inert outside the
+      # one-time consent step.
       - "127.0.0.1:8888:8888"
-    # distroless has no shell, so the check must be exec-form. `status`
-    # opens the database and reads the account, which is a real check
-    # that the process and its volume are both healthy.
+      # The status endpoints, published to the LAN. Narrow this to a
+      # single interface (e.g. "192.168.1.10:8080:8080") if you would
+      # rather not answer on all of them.
+      - "8080:8080"
+    # distroless has no shell, so the check must be exec-form — and no
+    # curl or wget either, which is why this probes via the CLI rather
+    # than hitting /healthz. It also means health still works if
+    # DIFMSYNC_HTTP_ADDR is ever unset.
+    #
+    # `--check` is what makes this a health check rather than a liveness
+    # check. Plain `status` only fails when the account row is missing, so
+    # a sync that had been broken for a week still reported healthy.
+    # `--check` requires a clean, non-dry pass within DIFMSYNC_STATUS_MAX_AGE.
     #
     # start_period is long because `status` exits non-zero until the
     # one-time `difmsync auth` has run, and auth needs a human with a
@@ -42,11 +62,28 @@ services:
     # window between first deploy and consent — inverting the signal on
     # precisely the day someone is watching it.
     healthcheck:
-      test: ["CMD", "/app/difmsync", "status"]
+      test: ["CMD", "/app/difmsync", "status", "--check"]
       interval: 5m
       timeout: 10s
       retries: 3
       start_period: 30m
+    # The default is 10s, which SIGKILLs a pass that is mid-flight. The
+    # engine survives that — the sync_runs row is closed through a
+    # detached context, and the watermark only moves after a clean pass —
+    # but a clean stop beats a survivable one.
+    stop_grace_period: 45s
+    # JSON logs to stdout with no cap is a reliable way to fill a homelab
+    # disk and take the sync down with it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
 
 volumes:
   difmsync-data:

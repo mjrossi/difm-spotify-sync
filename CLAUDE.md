@@ -182,6 +182,35 @@ are easy to get wrong:
   overridden to `0.0.0.0` (`DIFMSYNC_AUTH_BIND`), because a published
   port forwards to eth0 rather than loopback.
 
+## Operator surface
+
+The daemon serves exactly two HTTP endpoints, and only when
+`--http-addr` is set: `GET /healthz` and `GET /status.json`. Both are
+**read-only**. That is a rule, not a description of current scope — they
+are exposed on the LAN without authentication, and the only thing making
+that defensible is that they cannot change anything and carry no secrets.
+Anything that writes to Spotify or the database stays in the CLI, where
+`review --approve` keeps the ordering it depends on.
+
+Two consequences for code:
+
+- `internal/status` is the single implementation of the health rule,
+  shared by `status`, `status --check` and `/healthz`. Health computed in
+  two places drifts, and it always drifts the same direction: the probe
+  keeps reporting green after the thing it probes has stopped.
+- The report is assembled field by field from typed store accessors,
+  never by serializing a store struct. `accounts` carries the Spotify
+  refresh token on the same row as the label and the watermark;
+  structural exclusion is what keeps it out of the JSON, and
+  `TestReportCarriesNoSecrets` is what keeps that true.
+
+The health rule itself: the newest `sync_runs` row that finished,
+recorded no error, and was **not** a dry run must be within
+`--max-age`. The dry-run clause is load-bearing — the deployed loop never
+dry-runs, so without it a stale `just dry-run` from a debugging session
+keeps the probe green over a daemon that has not completed a real pass in
+days.
+
 ## Credentials
 
 `DIFMSYNC_API_KEY` is a long-lived DI.fm token with no visible rotation
