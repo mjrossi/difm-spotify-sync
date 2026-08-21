@@ -89,14 +89,15 @@ Run `just` to list every recipe.
 
 ## Deployment
 
-The binary is static and the image is distroless, so the same artifact runs
-either place:
+The binary is static and the image is distroless, so the deployment is one
+container with one mounted volume:
 
-- **Homelab:** `docker compose up -d` (see `compose.yaml`)
-- **Fly.io:** `fly deploy` (see `fly.toml`)
+```sh
+docker compose up -d          # see compose.yaml
+```
 
-Both mount a volume at `/data` for the SQLite database, which holds the
-sync ledger, the review queue, and the Spotify refresh token.
+The volume at `/data` holds the SQLite database — the sync ledger, the
+review queue, and the Spotify refresh token.
 
 Full runbook — Spotify app setup, the one interactive auth step, secrets,
 and verification — is in [`docs/deploy.md`](docs/deploy.md).
@@ -168,7 +169,7 @@ docs/difm-api.md       the private-API reference this depends on
 | Doc | What's in it |
 |---|---|
 | [`docs/difm-api.md`](docs/difm-api.md) | The reverse-engineered DI.fm API: auth, the likes endpoint, response shape, pagination gotchas |
-| [`docs/deploy.md`](docs/deploy.md) | Runbook: Spotify app setup, auth step, homelab + Fly.io deploys, verification |
+| [`docs/deploy.md`](docs/deploy.md) | Runbook: Spotify app setup, auth step, the homelab deploy, operating it, verification |
 | [`CLAUDE.md`](CLAUDE.md) | Code conventions — read before non-trivial changes |
 
 ## License

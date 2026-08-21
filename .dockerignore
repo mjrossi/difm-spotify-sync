@@ -13,7 +13,6 @@ CLAUDE.md
 LICENSE
 justfile
 compose.yaml
-fly.toml
 sqlc.yaml
 mise.toml
 mise.*.toml

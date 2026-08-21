@@ -55,9 +55,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      # The image is the deployment artifact for both the homelab and
-      # Fly.io, so a Dockerfile that stops building is a release blocker
-      # even when the Go build is fine.
+      # The image is the deployment artifact, so a Dockerfile that stops
+      # building is a release blocker even when the Go build is fine.
       - name: docker build
         run: docker build -t difm-spotify-sync:ci .
 

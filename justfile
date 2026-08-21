@@ -89,7 +89,7 @@ verify-config:
              $(find cmd/difmsync -name '*.go' -not -name '*_test.go') | sort -u)
     refs=$(grep -roh 'DIFMSYNC_[A-Z_]\+' \
              mise.toml mise.development.toml mise.ci.toml mise.local.toml.example \
-             compose.yaml fly.toml Dockerfile justfile README.md docs/ .github/workflows/ \
+             compose.yaml Dockerfile justfile README.md docs/ .github/workflows/ \
            | sort -u)
     # The README table is the documented surface, so it is compared on
     # its own rather than folded into the union above — otherwise a
@@ -202,10 +202,11 @@ backup DEST="./tmp/difmsync-backup.db":
     src="${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}"
     # sqlite3 creates a database rather than failing when the source does
     # not exist, so `.backup` on a wrong path exits 0 and writes a valid,
-    # empty file. This recipe is the only copy of the Spotify refresh
-    # token, and deploy.md uploads its output over the live database — a
-    # confident success message on an empty file is the worst outcome
-    # available here, so the source is checked before and the result after.
+    # empty file. Its output is the only copy of the Spotify refresh
+    # token, and restoring a backup means writing it *over* the live
+    # database — a confident success message on an empty file is the worst
+    # outcome available here, so the source is checked before and the
+    # result after.
     if [ ! -s "$src" ]; then
         echo "no database at $src — set DIFMSYNC_DB_PATH to the one you mean" >&2
         echo "(the compose deployment keeps it in a volume, not in ./tmp)" >&2

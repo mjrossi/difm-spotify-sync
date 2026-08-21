@@ -155,11 +155,13 @@ func newLogger(c *cli.Command) *slog.Logger {
 //
 // This is the first thing a container deployment hits when the data
 // volume is owned by root and the process is not. The image stages /data
-// with --chown, which covers a Docker named volume (Docker seeds a fresh
-// volume from the image's directory, ownership included). It does not
-// necessarily cover every provider: a volume that is a freshly formatted
-// block device is mounted root-owned regardless of what the image says,
-// and `fly ssh sftp put` writes as root too. See docs/deploy.md.
+// with --chown, which covers a Docker *named* volume: Docker seeds a
+// fresh named volume from the image's directory, ownership included.
+//
+// It does not cover a bind mount. Pointing /data at a host directory —
+// the obvious move for putting the database on a NAS or in a snapshotted
+// dataset — mounts that directory with the ownership it already has, and
+// nothing in the image can change it. See docs/deploy.md.
 func mountDiagnostic(path string) string {
 	dir := filepath.Dir(path)
 	fi, err := os.Stat(dir)

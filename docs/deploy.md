@@ -1,13 +1,13 @@
 # Deploy runbook
 
-The same container image runs on a homelab host and on Fly.io. The binary is
+One container on a homelab host, on the internal network. The binary is
 static (pure-Go SQLite driver, `CGO_ENABLED=0`) and the image is distroless
-and non-root, so nothing environment-specific is baked in — only the volume
-mount and the secret source differ.
+and non-root, so the whole deployment is that image plus a volume at
+`/data`.
 
 ## Prerequisites
 
-Both targets need five secrets. None may be committed.
+Five secrets. None may be committed.
 
 | Variable | Where it comes from |
 |---|---|
@@ -80,80 +80,28 @@ project, so the real one is `<project>_difmsync-data`; naming the bare
 broken deployment rather than a mistyped command. The service already
 declares the volume, so there is nothing to add.
 
-## Fly.io
+## Volume ownership
 
-```sh
-fly volumes create difmsync_data --size 1 --region iad
-
-fly secrets set \
-  DIFMSYNC_API_KEY=... \
-  DIFMSYNC_MEMBER_ID=... \
-  DIFMSYNC_SPOTIFY_CLIENT_ID=... \
-  DIFMSYNC_SPOTIFY_CLIENT_SECRET=... \
-  DIFMSYNC_PLAYLIST_ID=...
-
-fly deploy
-
-# Not optional — see "Do not let it scale to zero" below. Running the
-# blocks above without this leaves a worker Fly is free to stop, and a
-# stopped machine never syncs.
-fly scale count 1
-```
-
-Two Fly-specific notes:
-
-- **This is a worker, not a web service.** `fly.toml` has no
-  `[http_service]` block and exposes no port. Fly's default health checks
-  don't apply.
-- **Do not let it scale to zero.** The sync interval is an internal ticker,
-  so a stopped machine simply never syncs.
-
-  `min_machines_running` and `auto_stop_machines` are **not** available to
-  this app: they live inside `[http_service]` / `[[services]]`, and a
-  worker has neither. What actually keeps it up is that there is no
-  service for Fly's proxy to autostop, plus:
-
-  ```sh
-  fly scale count 1
-  ```
-
-  `fly.toml` also sets `[[restart]] policy = "always"`, so a worker that
-  hits a transient failure at boot keeps being restarted rather than
-  stopping for good after Fly's default retry budget.
-
-### Getting the refresh token onto the volume
-
-`difmsync auth` needs a browser, and the image has no shell for
-`fly ssh console`. Run auth locally and move the whole database across —
-do **not** read the token out and paste it around: it grants unattended
-playlist write access until revoked, and echoing it puts it in your shell
-history and terminal scrollback.
-
-```sh
-just auth                      # locally; writes ./tmp/difmsync.db
-just backup ./tmp/upload.db    # consistent snapshot (a live WAL copy can tear)
-
-fly ssh sftp put ./tmp/upload.db /data/difmsync.db
-fly apps restart difm-spotify-sync
-```
-
-`fly ssh sftp` works without a shell in the image, which is why it is the
-supported path here.
-
-### Volume ownership
-
-**Check this if the machine crash-loops on first deploy.** The process
+**Check this if the container crash-loops on first start.** The process
 runs as uid 65532 (`nonroot`), and the image stages `/data` with
-`--chown=65532:65532`. That is what a Docker named volume needs — Docker
-seeds a fresh volume from the image directory, ownership included.
+`--chown=65532:65532`. That is what a Docker *named* volume needs — Docker
+seeds a fresh named volume from the image directory, ownership included.
+The default `compose.yaml` uses a named volume, so this normally just
+works.
 
-A Fly volume is a freshly formatted block device, and a formatted
-filesystem is mounted `root:root` no matter what the image contains. If
-that is what your machine does, the service cannot create its database,
-and `[[restart]] policy = "always"` turns it into a crash loop rather
-than a visible failure. `fly ssh sftp put` also writes as **root**, so
-even a successful upload can leave `/data/difmsync.db` unwritable by the
-service.
+It stops working the moment you switch `/data` to a **bind mount** — the
+obvious move if you want the database on a NAS or inside a snapshotted
+dataset:
+
+```yaml
+volumes:
+  - /srv/difmsync:/data      # instead of difmsync-data:/data
+```
+
+A bind mount arrives with the ownership the host directory already has,
+and nothing in the image can change it. If that directory is root-owned,
+the service cannot create its database, and `restart: unless-stopped`
+turns the failure into a crash loop rather than something you notice.
 
 The binary reports this explicitly rather than leaving you with SQLite's
 bare `unable to open database file (14)`:
@@ -166,21 +114,18 @@ error: sqlite.Open: ping: unable to open database file (14)
 Check it before anything else goes wrong:
 
 ```sh
-fly logs -a difm-spotify-sync | head -30
+docker compose logs connector | head -30
 ```
 
-If the uids disagree, the volume needs to be chowned to 65532 once, from
-a context that has a shell — the image deliberately has none. The
-straightforward route is a one-off machine on any image with a shell,
-mounting the same volume:
+If the uids disagree, chown the host directory once — from the host, since
+the image deliberately has no shell:
 
 ```sh
-fly machine run --volume difmsync_data:/data alpine \
-  -a difm-spotify-sync -- chown -R 65532:65532 /data
+sudo chown -R 65532:65532 /srv/difmsync
+docker compose restart connector
 ```
 
-Then destroy that machine and restart the app. Verify with the log line
-above rather than assuming it took.
+Verify with the log line above rather than assuming it took.
 
 ## First run
 
@@ -243,14 +188,8 @@ The recipe fails loudly if the source is missing or the result has no
 `accounts` row. It has to: `sqlite3 ".backup"` on a nonexistent path
 creates an empty database and exits 0, so without those checks a wrong
 `DIFMSYNC_DB_PATH` yields a confident success message, a 4 KB file with
-no tables, and — on the Fly path above, where that file is uploaded over
-`/data/difmsync.db` — the loss of the only copy of the refresh token.
-
-On Fly:
-
-```sh
-fly ssh sftp get /data/difmsync.db ./difmsync-backup.db
-```
+no tables — and if you then restore that over `/data/difmsync.db`, the
+loss of the only copy of the refresh token.
 
 ## Recovering a deleted track
 
