@@ -32,7 +32,7 @@ const (
 var errPass = errors.New("sync pass incomplete: search failed")
 
 func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 func newStore(t *testing.T) (*sqlite.Store, sqlite.Account) {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -402,7 +401,7 @@ func TestCallbackTargetServesTheDerivedPath(t *testing.T) {
 
 // serveWhile is what keeps the sync loop observable, so the properties
 // that matter are: the listener is up before work starts, a bad address
-// fails loudly rather than leaving a silent daemon, and cancelling the
+// fails loudly rather than leaving a silent daemon, and canceling the
 // context stops both halves.
 func TestServeWhileServesUntilWorkStops(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -447,7 +446,7 @@ func TestServeWhileServesUntilWorkStops(t *testing.T) {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
 
-	// Cancelling is the SIGTERM path: the work returns, and serveWhile
+	// Canceling is the SIGTERM path: the work returns, and serveWhile
 	// returns with it rather than hanging on the still-listening server.
 	cancel()
 	select {
@@ -456,7 +455,7 @@ func TestServeWhileServesUntilWorkStops(t *testing.T) {
 			t.Errorf("serveWhile returned %v, want nil on a clean stop", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("serveWhile did not return after the context was cancelled")
+		t.Fatal("serveWhile did not return after the context was canceled")
 	}
 }
 
@@ -482,7 +481,7 @@ func TestServeWhileRejectsABadAddress(t *testing.T) {
 }
 
 func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 // The backup is often the only copy of the Spotify refresh token, and

@@ -389,8 +389,8 @@ func serveWhile(
 		"routes", "/healthz /status.json")
 
 	defer func() {
-		// A fresh context: ctx is already cancelled on the shutdown path,
-		// and passing a cancelled one makes Shutdown return instantly
+		// A fresh context: ctx is already canceled on the shutdown path,
+		// and passing a canceled one makes Shutdown return instantly
 		// without draining anything.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
