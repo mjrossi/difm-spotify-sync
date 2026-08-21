@@ -1,0 +1,154 @@
+// Package status builds the operator's view of the service: ledger
+// totals, the review backlog, the watermark, and the recent sync_runs
+// rows — plus a single verdict on whether syncing is actually happening.
+//
+// It exists so the CLI (`difmsync status`), the container healthcheck
+// (`difmsync status --check`) and the HTTP endpoints cannot disagree.
+// Health that is computed in two places drifts, and the direction it
+// drifts is always the same: the probe keeps reporting green after the
+// thing it probes has stopped working.
+package status
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
+)
+
+// DefaultRunLimit is how many sync_runs rows a report carries when the
+// caller does not ask for a specific number.
+const DefaultRunLimit = 5
+
+// Report is the whole operator-visible state of one account.
+//
+// Every field is populated explicitly from a typed store accessor. That
+// is deliberate and load-bearing: it is what guarantees the Spotify
+// refresh token — which lives on the same accounts row as Label and
+// WatermarkLikedAt — cannot reach the JSON encoder by accident. See
+// TestReportCarriesNoSecrets.
+type Report struct {
+	Account   string           `json:"account"`
+	Playlist  string           `json:"playlist"`
+	Synced    int64            `json:"synced"`
+	Pending   int64            `json:"pending"`
+	Skipped   int64            `json:"skipped"`
+	Watermark string           `json:"watermark"`
+	Runs      []sqlite.SyncRun `json:"runs"`
+	Healthy   bool             `json:"healthy"`
+	Reason    string           `json:"reason,omitempty"`
+}
+
+// Build assembles a Report. maxAge is how stale the newest clean pass may
+// be before the account is reported unhealthy; runLimit caps the number of
+// sync_runs rows carried (<= 0 means DefaultRunLimit).
+func Build(
+	ctx context.Context,
+	store *sqlite.Store,
+	label string,
+	maxAge time.Duration,
+	runLimit int,
+) (Report, error) {
+	if runLimit <= 0 {
+		runLimit = DefaultRunLimit
+	}
+
+	account, err := store.GetAccount(ctx, label)
+	if err != nil {
+		return Report{}, fmt.Errorf("no account %q yet — run `difmsync auth` first: %w", label, err)
+	}
+
+	synced, err := store.CountSynced(ctx, account.ID)
+	if err != nil {
+		return Report{}, err
+	}
+	// COUNT(*), not len() of a capped listing: a queue past the cap
+	// previously reported the cap as its size.
+	pending, err := store.CountReview(ctx, account.ID, "pending")
+	if err != nil {
+		return Report{}, err
+	}
+	actionable, err := store.CountActionableReview(ctx, account.ID)
+	if err != nil {
+		return Report{}, err
+	}
+	runs, err := store.ListRuns(ctx, account.ID, runLimit)
+	if err != nil {
+		return Report{}, err
+	}
+
+	r := Report{
+		Account:  account.Label,
+		Playlist: account.SpotifyPlaylistID,
+		Synced:   synced,
+		Pending:  actionable,
+		Skipped:  pending - actionable,
+		Runs:     runs,
+	}
+	if !account.WatermarkLikedAt.IsZero() {
+		r.Watermark = account.WatermarkLikedAt.UTC().Format(time.RFC3339)
+	}
+	r.Healthy, r.Reason = health(runs, maxAge, time.Now())
+	return r, nil
+}
+
+// health decides whether syncing is actually happening, and says why not
+// when it is not.
+//
+// The rule is "the newest pass that finished, wrote no error, and was not
+// a dry run is no older than maxAge". Each clause earns its place:
+//
+//   - Unfinished rows are in-flight passes, or passes killed mid-run. An
+//     open row is not evidence of success.
+//   - A non-empty error column is a pass that swallowed something. The
+//     engine holds the watermark back for exactly these, so treating one
+//     as healthy would report green on the case the watermark logic
+//     exists to survive.
+//   - Dry runs are excluded because the deployed loop never dry-runs. A
+//     stale `just dry-run` from a debugging session would otherwise keep
+//     the probe green over a daemon that has not completed a real pass in
+//     days — the precise failure this function exists to catch.
+//
+// ListRuns orders newest-first, so the first qualifying row is the one
+// that matters.
+func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (bool, string) {
+	if len(runs) == 0 {
+		return false, "no sync pass has run yet"
+	}
+	for _, run := range runs {
+		if run.DryRun || run.FinishedAt == "" || run.Error != "" {
+			continue
+		}
+		at, err := time.Parse(sqlite.TimeFormat, run.FinishedAt)
+		if err != nil {
+			// Not fatal on its own — keep looking for a row we can read
+			// rather than reporting unhealthy over a formatting problem.
+			continue
+		}
+		if age := now.Sub(at); age > maxAge {
+			return false, fmt.Sprintf("last clean pass finished %s ago (max %s)",
+				age.Round(time.Second), maxAge)
+		}
+		return true, ""
+	}
+	// Something ran, but nothing that counts. Say which, because "no clean
+	// pass" and "no pass at all" call for different first moves.
+	return false, fmt.Sprintf("no clean pass in the last %d run(s): %s",
+		len(runs), describe(runs[0]))
+}
+
+// describe summarizes why one run did not count, for the unhealthy reason
+// string. The newest run is the most useful one to name.
+func describe(run sqlite.SyncRun) string {
+	switch {
+	case run.Error != "":
+		return "newest run errored: " + run.Error
+	case run.FinishedAt == "":
+		return "newest run is still in flight or was killed mid-pass"
+	case run.DryRun:
+		return "newest run was a dry run"
+	default:
+		return "newest run has an unreadable timestamp"
+	}
+}

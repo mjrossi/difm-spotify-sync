@@ -5,12 +5,14 @@
 //	auth    one-time Spotify OAuth consent; stores the refresh token
 //	sync    one pass (--dry-run) or a continuous loop (--loop)
 //	review  inspect and resolve the review queue
-//	status  recent sync runs and ledger totals
+//	status  recent sync runs and ledger totals; --check is the healthcheck
+//	backup  consistent snapshot of the database
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/mjrossi/difm-spotify-sync/internal/status"
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/internal/syncer"
 	"github.com/mjrossi/difm-spotify-sync/pkg/difm"
@@ -483,7 +486,21 @@ func approveReview(ctx context.Context, c *cli.Command, store *sqlite.Store,
 func statusCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "status",
-		Usage: "show ledger totals and the last sync runs",
+		Usage: "show ledger totals, the review backlog and the last sync runs",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "json", Usage: "emit JSON instead of a table"},
+			&cli.BoolFlag{
+				Name: "check",
+				Usage: "exit non-zero unless a clean sync pass finished within --max-age " +
+					"(this is the container healthcheck)",
+			},
+			&cli.IntFlag{Name: "limit", Value: status.DefaultRunLimit, Usage: "how many recent runs to show"},
+			&cli.DurationFlag{
+				Name: "max-age", Value: 45 * time.Minute,
+				Usage:   "how stale the last clean pass may be before --check fails",
+				Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
+			},
+		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			store, err := openStore(ctx, c)
 			if err != nil {
@@ -491,40 +508,75 @@ func statusCommand() *cli.Command {
 			}
 			defer func() { _ = store.Close() }()
 
-			account, err := store.GetAccount(ctx, c.String("account"))
-			if err != nil {
-				return fmt.Errorf("no account %q yet — run `difmsync sync` first: %w",
-					c.String("account"), err)
-			}
-			total, err := store.CountSynced(ctx, account.ID)
-			if err != nil {
-				return err
-			}
-			// COUNT(*), not len() of a capped listing: a queue past the
-			// cap previously reported the cap as its size.
-			pending, err := store.CountReview(ctx, account.ID, "pending")
-			if err != nil {
-				return err
-			}
-			actionable, err := store.CountActionableReview(ctx, account.ID)
+			rep, err := status.Build(ctx, store, c.String("account"),
+				c.Duration("max-age"), c.Int("limit"))
 			if err != nil {
 				return err
 			}
 
-			fmt.Printf("account:   %s\n", account.Label)
-			fmt.Printf("playlist:  %s\n", account.SpotifyPlaylistID)
-			fmt.Printf("synced:    %d track(s)\n", total)
-			fmt.Printf("pending:   %d item(s) awaiting review", actionable)
-			if skipped := pending - actionable; skipped > 0 {
-				fmt.Printf(" (+%d skipped non-track(s) recorded)", skipped)
+			if c.Bool("check") {
+				// One line, no report: this runs as the container
+				// healthcheck, where the output lands in `docker inspect`
+				// and nothing reads more than the first line of it.
+				if !rep.Healthy {
+					return errors.New(rep.Reason)
+				}
+				fmt.Println("ok")
+				return nil
 			}
-			fmt.Println()
-			if account.WatermarkLikedAt.IsZero() {
-				fmt.Printf("watermark: none — next run reads full history\n")
-			} else {
-				fmt.Printf("watermark: %s\n", account.WatermarkLikedAt.Format(time.RFC3339))
+
+			if c.Bool("json") {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(rep)
 			}
+
+			printStatus(rep)
 			return nil
 		},
+	}
+}
+
+func printStatus(rep status.Report) {
+	fmt.Printf("account:   %s\n", rep.Account)
+	fmt.Printf("playlist:  %s\n", rep.Playlist)
+	fmt.Printf("synced:    %d track(s)\n", rep.Synced)
+	fmt.Printf("pending:   %d item(s) awaiting review", rep.Pending)
+	if rep.Skipped > 0 {
+		fmt.Printf(" (+%d skipped non-track(s) recorded)", rep.Skipped)
+	}
+	fmt.Println()
+	if rep.Watermark == "" {
+		fmt.Printf("watermark: none — next run reads full history\n")
+	} else {
+		fmt.Printf("watermark: %s\n", rep.Watermark)
+	}
+	if rep.Healthy {
+		fmt.Printf("health:    ok\n")
+	} else {
+		fmt.Printf("health:    NOT OK — %s\n", rep.Reason)
+	}
+
+	// The runs table is the whole point of the command's usage string,
+	// and until now it promised something it never printed. An empty
+	// error column on the newest row is the "it worked" signal.
+	fmt.Println()
+	if len(rep.Runs) == 0 {
+		fmt.Println("no sync runs recorded yet")
+		return
+	}
+	fmt.Printf("%-20s  %-5s  %5s  %5s  %5s  %s\n",
+		"STARTED", "DRY", "ADDED", "QUEUE", "SKIP", "ERROR")
+	for _, run := range rep.Runs {
+		dry := ""
+		if run.DryRun {
+			dry = "yes"
+		}
+		started := run.StartedAt
+		if len(started) > 19 {
+			started = started[:19]
+		}
+		fmt.Printf("%-20s  %-5s  %5d  %5d  %5d  %s\n",
+			started, dry, run.Added, run.Queued, run.Skipped, run.Error)
 	}
 }
