@@ -24,7 +24,7 @@ services:
       # published port forwards to eth0, same as DIFMSYNC_AUTH_BIND below.
       # Safe to expose unauthenticated only because these endpoints carry
       # no secrets and cannot change anything — see internal/status.
-      DIFMSYNC_HTTP_ADDR: 0.0.0.0:8080
+      DIFMSYNC_HTTP_ADDR: 0.0.0.0:3436
       # How stale the last clean pass may be before /healthz and
       # `status --check` report unhealthy. Three ticks of the default
       # 15m interval, so one missed pass is tolerated and two are not.
@@ -42,10 +42,19 @@ services:
       # host. Bound to the host's loopback only, and inert outside the
       # one-time consent step.
       - "127.0.0.1:8888:8888"
-      # The status endpoints, published to the LAN. Narrow this to a
-      # single interface (e.g. "192.168.1.10:8080:8080") if you would
-      # rather not answer on all of them.
-      - "8080:8080"
+      # The status endpoints, published to the LAN.
+      #
+      # 3436 is "DIFM" on a phone keypad. The point of the odd number is
+      # to stay out of the way on a host running many services: it dodges
+      # the usual occupants (3000, 8080/8081, 8096, 8123, 8384, 9000,
+      # 9090, 9100) and sits below Linux's default ephemeral range
+      # (32768-60999), where a listener can collide with an outbound
+      # connection's source port. Change both halves together, and
+      # DIFMSYNC_HTTP_ADDR above with them.
+      #
+      # Narrow to a single interface (e.g. "192.168.1.10:3436:3436") if
+      # you would rather not answer on all of them.
+      - "3436:3436"
     # distroless has no shell, so the check must be exec-form — and no
     # curl or wget either, which is why this probes via the CLI rather
     # than hitting /healthz. It also means health still works if

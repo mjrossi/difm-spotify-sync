@@ -76,11 +76,20 @@ jobs:
           # nothing, and passed the gate green. So require the specific
           # output that proves the binary ran, opened the database on the
           # volume, and applied its migrations.
+          #
+          # `resync --all` on a fresh volume exits non-zero by design:
+          # there is no account row yet, which is exactly the state
+          # asserted on below. GitHub runs this step as `bash -e {0}`,
+          # and the `set -uo pipefail` above does not turn that off, so
+          # the expected failure has to be caught here — otherwise the
+          # step dies on this line, before printing the output or
+          # reaching either assertion. status is pre-set because `set -u`
+          # would trip on it in the success case.
+          status=0
           out=$(docker run --rm -v difmsync-ci-data:/data \
                   -e DIFMSYNC_LOG_FORMAT=text \
                   --entrypoint /app/difmsync difm-spotify-sync:ci \
-                  resync --all 2>&1)
-          status=$?
+                  resync --all 2>&1) || status=$?
           echo "$out"
 
           if printf '%s' "$out" | grep -q "unable to open database file"; then

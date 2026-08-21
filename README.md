@@ -104,7 +104,9 @@ difmsync status --json     # the same report, machine-readable
 ```
 
 `--check` is the container healthcheck. Set `--http-addr` and
-`sync --loop` also serves the same verdict over HTTP, for a dashboard:
+`sync --loop` also serves the same verdict over HTTP, for a dashboard.
+`compose.yaml` uses `3436` ("DIFM" on a phone keypad — chosen to stay
+clear of the ports a homelab usually has spoken for):
 
 | Endpoint | Answer |
 |---|---|

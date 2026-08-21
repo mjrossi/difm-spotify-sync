@@ -20,7 +20,7 @@ DIFMSYNC_AUTH_BIND = ""
 # `just loop`. compose.yaml sets this for the deployment; empty (the
 # default) means no listener at all, which is what one-shot commands
 # want. See the Operating it section of the README.
-# DIFMSYNC_HTTP_ADDR = "127.0.0.1:8080"
+# DIFMSYNC_HTTP_ADDR = "127.0.0.1:3436"
 
 # How stale the last clean pass may be before `status --check` and
 # /healthz report unhealthy. Three ticks of the 15m interval.

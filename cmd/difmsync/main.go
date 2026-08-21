@@ -438,7 +438,7 @@ func reviewCommand() *cli.Command {
 
 			account, err := store.GetAccount(ctx, c.String("account"))
 			if err != nil {
-				return fmt.Errorf("no account %q yet — run `difmsync sync` first: %w",
+				return fmt.Errorf("no account %q yet — run `difmsync auth` first: %w",
 					c.String("account"), err)
 			}
 

@@ -203,8 +203,8 @@ be within `DIFMSYNC_STATUS_MAX_AGE`** (45m by default — three ticks of the
 ```sh
 docker compose ps                                       # healthy / unhealthy
 docker compose exec connector /app/difmsync status --check   # the same verdict, with a reason
-curl -s http://<host>:8080/healthz                      # 200 ok, or 503 and the reason
-curl -s http://<host>:8080/status.json | jq             # the full report
+curl -s http://<host>:3436/healthz                      # 200 ok, or 503 and the reason
+curl -s http://<host>:3436/status.json | jq             # the full report
 ```
 
 The container healthcheck runs `status --check`, deliberately rather than
@@ -231,7 +231,7 @@ For the errored case, `/status.json` carries the last few runs with their
 errors, which is usually faster than paging through logs:
 
 ```sh
-curl -s http://<host>:8080/status.json | jq '.runs[] | {started_at, added, error}'
+curl -s http://<host>:3436/status.json | jq '.runs[] | {started_at, added, error}'
 ```
 
 A failing pass is not data loss. The watermark only advances after a fully
