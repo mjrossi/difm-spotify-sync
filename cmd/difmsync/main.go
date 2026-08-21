@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -251,6 +253,17 @@ func syncCommand() *cli.Command {
 				Name: "interval", Value: 15 * time.Minute,
 				Sources: cli.EnvVars("DIFMSYNC_INTERVAL"),
 			},
+			&cli.StringFlag{
+				Name: "http-addr",
+				Usage: "serve the read-only /healthz and /status.json endpoints on this " +
+					"address (empty disables them; only applies with --loop)",
+				Sources: cli.EnvVars("DIFMSYNC_HTTP_ADDR"),
+			},
+			&cli.DurationFlag{
+				Name: "max-age", Value: 45 * time.Minute,
+				Usage:   "how stale the last clean pass may be before /healthz reports unhealthy",
+				Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if err := requireFlags(c, "api-key", "member-id", "playlist-id",
@@ -318,12 +331,88 @@ func syncCommand() *cli.Command {
 				Log: log,
 			}
 
-			if c.Bool("loop") {
+			if !c.Bool("loop") {
+				_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
+				return err
+			}
+
+			loop := func(ctx context.Context) error {
 				return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
 			}
-			_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
-			return err
+			addr := c.String("http-addr")
+			if addr == "" {
+				return loop(ctx)
+			}
+			return serveWhile(ctx, addr,
+				status.Handler(store, c.String("account"), c.Duration("max-age"), log),
+				log, loop)
 		},
+	}
+}
+
+// serveWhile runs the read-only status endpoints for as long as work is
+// running, and returns whichever of the two finishes first.
+//
+// Deliberately hand-rolled rather than reaching for errgroup:
+// golang.org/x/sync is an indirect dependency today, and promoting it to
+// a direct one for a WaitGroup with an error slot is not a trade this
+// project makes (see CLAUDE.md on adding dependencies).
+//
+// The ordering matters. The listener is opened before work starts, so a
+// bad --http-addr fails immediately and loudly instead of leaving a
+// daemon that syncs fine but silently answers nothing — which reads as a
+// dead service to whatever is polling it.
+func serveWhile(
+	ctx context.Context,
+	addr string,
+	h http.Handler,
+	log *slog.Logger,
+	work func(context.Context) error,
+) error {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s for the status endpoints: %w", addr, err)
+	}
+
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+	log.Info("status endpoints listening", "addr", ln.Addr().String(),
+		"routes", "/healthz /status.json")
+
+	defer func() {
+		// A fresh context: ctx is already cancelled on the shutdown path,
+		// and passing a cancelled one makes Shutdown return instantly
+		// without draining anything.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("status server shutdown", "err", err)
+		}
+	}()
+
+	workErr := make(chan error, 1)
+	go func() { workErr <- work(ctx) }()
+
+	select {
+	case err := <-serveErr:
+		// The server died on its own. The sync loop may still be fine,
+		// but it is now unobservable — and an unobservable daemon is the
+		// exact failure this endpoint exists to prevent. Surface it and
+		// let the restart policy start a whole one.
+		if err != nil {
+			return fmt.Errorf("status server: %w", err)
+		}
+		return nil
+	case err := <-workErr:
+		return err
 	}
 }
 

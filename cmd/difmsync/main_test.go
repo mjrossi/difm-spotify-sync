@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -393,4 +397,89 @@ func TestCallbackTargetServesTheDerivedPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// serveWhile is what keeps the sync loop observable, so the properties
+// that matter are: the listener is up before work starts, a bad address
+// fails loudly rather than leaving a silent daemon, and cancelling the
+// context stops both halves.
+func TestServeWhileServesUntilWorkStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, "pong")
+	})
+
+	// Port 0 lets the OS pick, but then the test needs the real address.
+	// Serving on a listener whose address we recover through a handler
+	// hit would be circular, so bind explicitly and read it back.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("probe close: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- serveWhile(ctx, addr, mux, discardLogger(), func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			return nil
+		})
+	}()
+
+	<-started
+	resp, err := http.Get("http://" + addr + "/ping")
+	if err != nil {
+		t.Fatalf("GET /ping: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Cancelling is the SIGTERM path: the work returns, and serveWhile
+	// returns with it rather than hanging on the still-listening server.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serveWhile returned %v, want nil on a clean stop", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveWhile did not return after the context was cancelled")
+	}
+}
+
+// A daemon that syncs fine but answers nothing reads as dead to whatever
+// polls it, so an unusable --http-addr must fail at startup rather than
+// being logged and shrugged off.
+func TestServeWhileRejectsABadAddress(t *testing.T) {
+	ranWork := false
+	err := serveWhile(context.Background(), "256.256.256.256:99999", http.NewServeMux(),
+		discardLogger(), func(context.Context) error {
+			ranWork = true
+			return nil
+		})
+	if err == nil {
+		t.Fatal("expected an error for an unbindable address")
+	}
+	if !strings.Contains(err.Error(), "status endpoints") {
+		t.Errorf("err = %v, want it to name what failed to bind", err)
+	}
+	if ranWork {
+		t.Error("work started despite the listener failing")
+	}
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
