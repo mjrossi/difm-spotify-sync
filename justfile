@@ -159,13 +159,13 @@ ledger:
                 round(match_score,3) as score, substr(added_at,1,10) as added \
          from synced_tracks order by liked_at desc;"
 
+# `status` reads the same sync_runs table this used to query by hand, and
+# it also answers the question the raw rows only imply: whether a clean
+# pass has happened recently enough to call the sync working.
 [group('ops')]
 [doc('recent sync passes including failures — is it actually working?')]
 runs:
-    @mise exec -- sqlite3 -header -column "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}" \
-        "select id, substr(started_at,1,19) as started, dry_run, added, queued, \
-                skipped, substr(error,1,40) as error \
-         from sync_runs order by id desc limit 10;"
+    @mise exec -- go run ./cmd/difmsync status --limit=10
 
 # Clears the track's ledger row AND the watermark. Both suppress a re-add,
 # and clearing only the ledger is a silent no-op — the watermark filters at
@@ -192,34 +192,14 @@ resync-all:
 resync-rebuild:
     mise exec -- go run ./cmd/difmsync resync --forget-all
 
-# A plain `cp` of a live WAL database can capture a torn state. .backup
-# takes a consistent snapshot against the running database instead.
+# `difmsync backup` rather than `sqlite3 .backup`: it is the same
+# VACUUM INTO under the hood, but it runs inside the distroless container
+# too, where there is no sqlite3 binary and no shell. One code path for
+# the local database and the deployed one beats two that can drift.
 [group('ops')]
 [doc('take a consistent backup of the database (holds the Spotify refresh token)')]
 backup DEST="./tmp/difmsync-backup.db":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    src="${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}"
-    # sqlite3 creates a database rather than failing when the source does
-    # not exist, so `.backup` on a wrong path exits 0 and writes a valid,
-    # empty file. Its output is the only copy of the Spotify refresh
-    # token, and restoring a backup means writing it *over* the live
-    # database — a confident success message on an empty file is the worst
-    # outcome available here, so the source is checked before and the
-    # result after.
-    if [ ! -s "$src" ]; then
-        echo "no database at $src — set DIFMSYNC_DB_PATH to the one you mean" >&2
-        echo "(the compose deployment keeps it in a volume, not in ./tmp)" >&2
-        exit 1
-    fi
-    mkdir -p "$(dirname '{{DEST}}')"
-    ( umask 077; mise exec -- sqlite3 "$src" ".backup '{{DEST}}'" )
-    accounts=$(mise exec -- sqlite3 "{{DEST}}" "select count(*) from accounts" 2>/dev/null || echo 0)
-    if [ "$accounts" -lt 1 ]; then
-        echo "backup at {{DEST}} has no accounts row — refusing to call that a backup" >&2
-        exit 1
-    fi
-    echo "backed up to {{DEST}} ($accounts account row(s); holds the Spotify refresh token — treat as a secret)"
+    mise exec -- go run ./cmd/difmsync backup --to '{{DEST}}' --log-format=text
 
 # open the local SQLite database
 [group('ops')]

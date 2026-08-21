@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -482,4 +483,84 @@ func TestServeWhileRejectsABadAddress(t *testing.T) {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// The backup is often the only copy of the Spotify refresh token, and
+// restoring one means writing it over the live database. Every property
+// here is about not producing something that looks restorable and isn't.
+func TestBackupRoundTrip(t *testing.T) {
+	dbPath, _ := seed(t)
+	dest := filepath.Join(t.TempDir(), "nested", "backup.db")
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	// It must open, and carry the ledger the source had.
+	account, n := inspect(t, dest)
+	if account.Label != "default" {
+		t.Errorf("account label = %q, want default", account.Label)
+	}
+	if n != 1 {
+		t.Errorf("synced count = %d, want 1", n)
+	}
+
+	// It holds the refresh token, so it must not be group- or
+	// world-readable.
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("backup mode = %o, want 600", perm)
+	}
+}
+
+// SQLite refuses to VACUUM INTO an existing path. That refusal is kept
+// rather than papered over with a truncate, because the file it would
+// overwrite is frequently the only copy of a refresh token.
+func TestBackupRefusesAnExistingDestination(t *testing.T) {
+	dbPath, _ := seed(t)
+	dest := filepath.Join(t.TempDir(), "backup.db")
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err != nil {
+		t.Fatalf("first backup: %v", err)
+	}
+	before, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err == nil {
+		t.Fatal("expected the second backup to refuse an existing destination")
+	}
+
+	after, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("reread: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("the refused backup modified the existing file")
+	}
+}
+
+// A wrong --db-path yields a database with no account row. Reporting that
+// as a successful backup is the failure mode the verification exists to
+// prevent, and leaving the file behind is how it gets restored later by
+// someone who never saw the error.
+func TestBackupRejectsAndRemovesAnAccountlessSnapshot(t *testing.T) {
+	clearEnv(t)
+	empty := filepath.Join(t.TempDir(), "empty.db")
+	dest := filepath.Join(t.TempDir(), "backup.db")
+
+	err := runCLI(t, empty, "backup", "--to", dest)
+	if err == nil {
+		t.Fatal("expected a backup of an accountless database to fail")
+	}
+	if !strings.Contains(err.Error(), "account row") {
+		t.Errorf("err = %v, want it to name the missing account row", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("the unusable backup was left at %s", dest)
+	}
 }

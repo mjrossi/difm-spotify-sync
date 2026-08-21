@@ -122,6 +122,7 @@ func newApp() *cli.Command {
 			reviewCommand(),
 			resyncCommand(),
 			statusCommand(),
+			backupCommand(),
 		},
 	}
 	return cmd

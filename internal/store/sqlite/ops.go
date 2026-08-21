@@ -409,6 +409,31 @@ func (s *Store) ClearWatermark(ctx context.Context, accountID int64) error {
 	return nil
 }
 
+// BackupTo writes a consistent snapshot of the database to dest.
+//
+// VACUUM INTO rather than a file copy: the database runs in WAL mode, so
+// copying the file while a pass is writing can capture a torn state that
+// looks valid until the moment it is restored. It is also pure Go through
+// the modernc driver, which is what lets this run inside the distroless
+// image — there is no sqlite3 binary and no shell in there.
+//
+// SQLite refuses a dest that already exists, and that refusal is kept
+// rather than papered over: the file it would overwrite is the only copy
+// of a Spotify refresh token often enough to matter.
+//
+// VACUUM cannot run inside a transaction. The pool is capped at one
+// connection, so this serializes against a running pass rather than
+// racing it.
+func (s *Store) BackupTo(ctx context.Context, dest string) error {
+	if s.inTx {
+		return errors.New("sqlite.BackupTo: cannot run inside a transaction")
+	}
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", dest); err != nil {
+		return fmt.Errorf("sqlite.BackupTo(%q): %w", dest, err)
+	}
+	return nil
+}
+
 // SyncRun is one recorded pass.
 //
 // Tagged because this type is served verbatim inside /status.json, and a
