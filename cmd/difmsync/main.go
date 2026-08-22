@@ -373,6 +373,16 @@ func syncCommand() *cli.Command {
 						"are served only by the sync loop",
 						"addr", c.String("http-addr"))
 				}
+				// The same warning for the same reason, and it matters
+				// more here: .env.defaults sets this for the whole
+				// container, so `docker compose run connector sync`
+				// inherits a consent server it will never start and
+				// fails with ErrNoCredentials instead.
+				if c.String("auth-http-addr") != "" {
+					log.Warn("--auth-http-addr is ignored without --loop; the consent flow "+
+						"is served only by the sync loop (use `difmsync auth` for a one-shot)",
+						"addr", c.String("auth-http-addr"))
+				}
 				engine, err := newEngine(ctx, account)
 				if err != nil {
 					return err
@@ -406,6 +416,16 @@ func syncCommand() *cli.Command {
 					}
 					if err := awaitConsent(ctx, authAddr,
 						c.String("spotify-redirect-url"), flow, log); err != nil {
+						// A shutdown while waiting is a clean stop, not a
+						// failure — the same verdict Engine.Loop reaches
+						// on a canceled context. Without this the process
+						// contract disagrees with itself: an authorized
+						// daemon exits 0 on SIGTERM and one still waiting
+						// for consent exits 1, which reads as a crash to
+						// anything watching exit codes.
+						if errors.Is(err, context.Canceled) {
+							return nil
+						}
 						return err
 					}
 					// Re-read rather than patching the local copy. The token

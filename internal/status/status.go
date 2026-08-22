@@ -173,14 +173,14 @@ func Build(
 	}
 
 	r := Report{
-		Account:  account.Label,
-		Playlist: account.SpotifyPlaylistID,
-		Synced:   synced,
-		Pending:  actionable,
-		Skipped:  pending - actionable,
-		Runs:     reported,
+		Account:    account.Label,
+		Playlist:   account.SpotifyPlaylistID,
+		Authorized: authorized,
+		Synced:     synced,
+		Pending:    actionable,
+		Skipped:    pending - actionable,
+		Runs:       reported,
 	}
-	r.Authorized = authorized
 	if !account.WatermarkLikedAt.IsZero() {
 		r.Watermark = account.WatermarkLikedAt.UTC().Format(time.RFC3339)
 	}

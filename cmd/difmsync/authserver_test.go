@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -41,6 +45,28 @@ func TestConsentRoutesDeriveFromTheRedirectURL(t *testing.T) {
 			// route with it. Refused outright rather than defaulted.
 			name:     "pathless is refused",
 			redirect: "https://nas.tail1234.ts.net",
+			wantErr:  true,
+		},
+		{
+			// A trailing slash is a subtree pattern in ServeMux, so the
+			// callback handler would swallow everything beneath it —
+			// including the unrouted-request logger that is the only
+			// evidence a proxy rewrote the path.
+			name:     "trailing slash is refused",
+			redirect: "https://nas.tail1234.ts.net/difmsync/",
+			wantErr:  true,
+		},
+		{
+			// The start page is derived as the callback's sibling, so a
+			// callback already named start makes the two paths identical
+			// and ServeMux panics on the duplicate registration.
+			name:     "callback named start is refused",
+			redirect: "https://nas.tail1234.ts.net/difmsync/start",
+			wantErr:  true,
+		},
+		{
+			name:     "callback named start at the root is refused",
+			redirect: "https://nas.tail1234.ts.net/start",
 			wantErr:  true,
 		},
 	} {
@@ -226,5 +252,208 @@ func TestAwaitConsentStopsOnContextCancel(t *testing.T) {
 	cancel()
 	if err := <-done; err == nil {
 		t.Error("awaitConsent returned nil after cancellation, want the context error")
+	}
+}
+
+// TestConsentPortMismatchWarnsOnlyWhenItCannotWork covers the check that
+// catches a redirect URL and a listener that were configured
+// independently — the state the shipped defaults were in, where the
+// logged start URL named a port nothing served. It has to stay quiet for
+// the proxy case, where differing ports are the normal arrangement.
+func TestConsentPortMismatchWarnsOnlyWhenItCannotWork(t *testing.T) {
+	for _, tc := range []struct {
+		name, redirect, addr string
+		want                 bool
+	}{
+		{
+			name:     "loopback ports disagree",
+			redirect: "http://127.0.0.1:8888/callback",
+			addr:     "0.0.0.0:3437",
+			want:     true,
+		},
+		{
+			name:     "loopback ports agree",
+			redirect: "http://127.0.0.1:3437/callback",
+			addr:     "0.0.0.0:3437",
+		},
+		{
+			// The deployed arrangement: a proxy terminates TLS on 443 and
+			// forwards to the container's port. Differing is the point.
+			name:     "proxied hostname says nothing",
+			redirect: "https://nas.tail1234.ts.net/difmsync/callback",
+			addr:     "0.0.0.0:3437",
+		},
+		{
+			// A bare loopback redirect means port 80, which is not 3437.
+			name:     "implicit port still counts",
+			redirect: "http://127.0.0.1/callback",
+			addr:     "0.0.0.0:3437",
+			want:     true,
+		},
+		{
+			name:     "any free port has nothing to disagree with",
+			redirect: "http://127.0.0.1:8888/callback",
+			addr:     "127.0.0.1:0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want, got, mismatch := consentPortMismatch(tc.redirect, tc.addr)
+			if mismatch != tc.want {
+				t.Fatalf("consentPortMismatch(%q, %q) = %q,%q,%v; want mismatch=%v",
+					tc.redirect, tc.addr, want, got, mismatch, tc.want)
+			}
+		})
+	}
+}
+
+// listenAddrLogger captures the address awaitConsent reports itself
+// listening on. That log line is the only place the bound port is
+// published, and reading it there is what lets the test ask for port 0
+// rather than gamble on a fixed one being free.
+type listenAddrLogger struct {
+	slog.Handler
+	addrs chan string
+}
+
+// Enabled is overridden rather than inherited: the wrapped handler
+// discards, and slog asks Enabled before it calls Handle at all.
+func (h *listenAddrLogger) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *listenAddrLogger) Handle(ctx context.Context, r slog.Record) error {
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key != "listening" {
+			return true
+		}
+		select {
+		case h.addrs <- a.Value.String():
+		default:
+		}
+		return false
+	})
+	return h.Handler.Handle(ctx, r)
+}
+
+// TestAwaitConsentCompletesAndClosesTheListener is the property the
+// daemon's whole exception rests on: the consent server exists only until
+// consent is stored, and then not at all. Nothing covered the successful
+// path — only cancellation, which is the exit nobody depends on.
+func TestAwaitConsentCompletesAndClosesTheListener(t *testing.T) {
+	const redirect = "http://127.0.0.1:3437/callback"
+	flow, store := newConsentFixture(t)
+	endpoint := &tokenEndpoint{
+		body: `{"access_token":"at","token_type":"Bearer","refresh_token":"rt-2","expires_in":3600}`,
+	}
+	// Carried into the handler by the server's BaseContext, which is how
+	// the exchange stays off the network without the callback path
+	// growing a seam the production code does not have.
+	ctx, cancel := context.WithCancel(exchangeContext(endpoint))
+	defer cancel()
+
+	addrs := make(chan string, 1)
+	log := slog.New(&listenAddrLogger{Handler: slog.DiscardHandler, addrs: addrs})
+
+	done := make(chan error, 1)
+	go func() { done <- awaitConsent(ctx, "127.0.0.1:0", redirect, flow, log) }()
+
+	addr := <-addrs
+	resp, err := http.Get("http://" + addr + "/callback?state=the-state&code=good")
+	if err != nil {
+		t.Fatalf("callback: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("callback = %d (%s), want %d", resp.StatusCode, body, http.StatusOK)
+	}
+	// Neither the code nor the state is echoed back to the browser, which
+	// is a page an operator may well leave open.
+	if strings.Contains(string(body), "the-state") || strings.Contains(string(body), "good") {
+		t.Errorf("callback response echoed flow parameters: %s", body)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("awaitConsent: %v", err)
+	}
+	if got := storedToken(t, store); got != "rt-2" {
+		t.Errorf("stored refresh token = %q, want rt-2", got)
+	}
+	// The listener is gone for the life of the process, not merely
+	// ignored: a port still accepting connections after consent is the
+	// widening of the exception CLAUDE.md forbids.
+	if conn, err := net.DialTimeout("tcp", addr, 2*time.Second); err == nil {
+		_ = conn.Close()
+		t.Errorf("consent listener still accepting connections on %s after consent", addr)
+	}
+}
+
+// freePort returns an address nothing is listening on, using the same
+// bind-and-release trick as TestServeWhileServesUntilWorkStops: the test
+// needs the address before the code under test creates its listener.
+func freePort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("probe close: %v", err)
+	}
+	return addr
+}
+
+func waitForListener(t *testing.T, addr string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("nothing came up on %s", addr)
+}
+
+// TestSyncExitsCleanWhenCanceledAwaitingConsent pins one half of the
+// process contract against the other. Engine.Loop treats a canceled
+// context as a clean stop and exits 0; a daemon still waiting for consent
+// has to agree, or SIGTERM on a freshly deployed container reads as a
+// crash to whatever watches exit codes — which under a restart policy is
+// the difference between "stopped" and "failing".
+func TestSyncExitsCleanWhenCanceledAwaitingConsent(t *testing.T) {
+	clearEnv(t)
+	addr := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- newApp().Run(ctx, []string{
+			"difmsync", "--db-path", filepath.Join(t.TempDir(), "consent.db"),
+			"--log-level", "error",
+			"sync", "--loop",
+			"--auth-http-addr", addr,
+			// Matched to the listener, which is also what keeps the
+			// port-mismatch warning quiet: this is the shape the shipped
+			// defaults now have.
+			"--spotify-redirect-url", "http://" + addr + "/callback",
+			"--api-key", "k", "--member-id", "1", "--playlist-id", "PL1",
+			"--spotify-client-id", "id", "--spotify-client-secret", "secret",
+		})
+	}()
+
+	// Waiting for the port rather than sleeping: the cancellation has to
+	// land while the consent server is up, which is the state under test.
+	waitForListener(t, addr)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("sync --loop returned %v after cancellation, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("sync --loop did not return after the context was canceled")
 	}
 }

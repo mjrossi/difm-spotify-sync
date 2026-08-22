@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -62,7 +63,65 @@ func consentRoutes(redirect string) (start, callback string, err error) {
 		return "", "", fmt.Errorf("redirect url %q needs a path (e.g. %s/difmsync/callback) "+
 			"so the consent routes do not sit at the root", redirect, strings.TrimSuffix(redirect, "/"))
 	}
-	return path.Join(path.Dir(callback), "start"), callback, nil
+	if strings.HasSuffix(callback, "/") {
+		// Same failure as the pathless case, one level down: a trailing
+		// slash is a subtree pattern in ServeMux, so this handler would
+		// swallow every path beneath it — including the unrouted-request
+		// logger, which is the only evidence an operator gets that a
+		// proxy rewrote the path.
+		return "", "", fmt.Errorf("redirect url %q must not end in a slash: a trailing "+
+			"slash registers a subtree pattern that swallows the other consent routes "+
+			"(use %scallback)", redirect, redirect)
+	}
+	start = path.Join(path.Dir(callback), "start")
+	if start == callback {
+		// A callback already named "start" collides with the sibling
+		// derived from it, and ServeMux panics on a duplicate pattern.
+		// That panic would fire in the daemon's work goroutine after the
+		// process is up — the crash loop this whole server exists to
+		// eliminate, re-armed by a config value rather than by a missing
+		// token. Refused here, where it is one legible startup error.
+		return "", "", fmt.Errorf("redirect url %q must not end in /start: the consent "+
+			"start page is derived as the callback's sibling and would collide with it "+
+			"(use a path ending in %s)", redirect, path.Join(path.Dir(callback), "callback"))
+	}
+	return start, callback, nil
+}
+
+// consentPortMismatch reports a redirect URL that cannot reach the
+// listener. A loopback redirect means the browser connects to the port
+// directly — nothing terminates TLS in front of 127.0.0.1 — so the two
+// ports have to agree, and when they do not the operator gets a start URL
+// that refuses the connection and a callback Spotify cannot deliver.
+//
+// It is a warning rather than a refusal because a container can publish
+// its port under a different number (127.0.0.1:8888:3437 is a valid
+// mapping for exactly this pair), and the process cannot see the mapping
+// from inside. A non-loopback host means a proxy is involved and the
+// ports are expected to differ, so that case says nothing.
+func consentPortMismatch(redirect, addr string) (redirectPort, listenPort string, mismatch bool) {
+	u, err := url.Parse(redirect)
+	if err != nil || u.Host == "" {
+		// consentRoutes has already rejected these; nothing to add.
+		return "", "", false
+	}
+	if ip := net.ParseIP(u.Hostname()); ip == nil || !ip.IsLoopback() {
+		return "", "", false
+	}
+	redirectPort = u.Port()
+	if redirectPort == "" {
+		redirectPort = "80"
+		if u.Scheme == "https" {
+			redirectPort = "443"
+		}
+	}
+	_, listenPort, err = net.SplitHostPort(addr)
+	// Port 0 is "any free port", which only a test asks for; it has no
+	// fixed number to disagree with.
+	if err != nil || listenPort == "" || listenPort == "0" || listenPort == redirectPort {
+		return "", "", false
+	}
+	return redirectPort, listenPort, true
 }
 
 // startURL is the link an operator clicks. Built from the redirect URL's
@@ -121,7 +180,10 @@ func (s *consentServer) handler() http.Handler {
 // the port during the unauthenticated window could complete the flow with
 // their own Spotify account and bind the sync to a stranger's playlist.
 func (s *consentServer) handleStart(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("t") != s.nonce {
+	// Constant-time, though the realistic attack is guessing rather than
+	// timing 128 bits of hex over HTTP. It costs one stdlib call, and the
+	// alternative is a guard that is correct only by argument.
+	if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("t")), []byte(s.nonce)) != 1 {
 		// Deliberately a 404 rather than a 403: an unauthenticated caller
 		// learns nothing about whether the path exists.
 		s.log.Warn("consent server: start rejected, bad or missing nonce", "path", r.URL.Path)
@@ -189,7 +251,12 @@ func awaitConsent(ctx context.Context, addr, redirect string, flow *consentFlow,
 		return fmt.Errorf("listen on %s for the consent endpoints: %w", addr, err)
 	}
 	srv := &http.Server{
-		Handler:           s.handler(),
+		Handler: s.handler(),
+		// Request contexts derive from the daemon's, so a shutdown that
+		// cancels ctx also unblocks anything in flight here. The exchange
+		// itself opts out with WithoutCancel — a consent already given
+		// must still be stored — and keeps ctx's values either way.
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -210,6 +277,20 @@ func awaitConsent(ctx context.Context, addr, redirect string, flow *consentFlow,
 			log.Warn("consent server shutdown", "err", err)
 		}
 	}()
+
+	// A loopback redirect whose port is not this listener's cannot
+	// complete: the browser connects straight to the redirect's port, so
+	// the start URL below refuses the connection and Spotify's callback
+	// lands nowhere — which is indistinguishable from Spotify never
+	// calling back. Said here, immediately above the URL it invalidates,
+	// because that log line is where the operator is already looking.
+	if want, got, mismatch := consentPortMismatch(redirect, addr); mismatch {
+		log.Warn("consent redirect port does not match the consent listener; "+
+			"the flow can only complete if something forwards one port to the other "+
+			"(a published container port does; nothing else here will)",
+			"redirect_port", want, "listen_port", got,
+			"redirect", redirect, "auth_http_addr", addr)
+	}
 
 	// One line, at Info, carrying the whole instruction. This is the only
 	// place the nonce is ever emitted, and an operator reading it is by

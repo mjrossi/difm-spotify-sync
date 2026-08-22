@@ -23,15 +23,20 @@ Five secrets. None may be committed.
 2. Add the redirect URIs. Each must match `DIFMSYNC_SPOTIFY_REDIRECT_URL`
    exactly for the context that uses it, and the dashboard accepts more
    than one — register both:
-   - `http://127.0.0.1:8888/callback` — the default, used by `just auth`
-     on a workstation.
-   - `https://<host>/difmsync/callback` — the deployed daemon, if you are
-     using the in-daemon consent flow below.
+   - `http://127.0.0.1:3437/callback` — what `.env.defaults` ships, used
+     by the deployed daemon's consent flow when you authorize from a
+     browser on the host itself.
+   - `http://127.0.0.1:8888/callback` — the binary's own default, used by
+     `just auth` on a workstation.
+   - `https://<host>/difmsync/callback` — only if you need to authorize
+     the deployed daemon from another machine; see the Tailscale section
+     below.
 
    Spotify requires HTTPS for any redirect URI that is not a loopback
    literal (`127.0.0.1` or `[::1]`); `localhost` is rejected outright.
-   That is why the deployed URL has to be fronted by something that
-   terminates TLS, and why the workstation one stays on `127.0.0.1`.
+   That is what makes the two loopback URLs above work with nothing in
+   front of them, and why reaching the daemon from anywhere else needs
+   something terminating TLS.
 3. Copy the client ID and secret.
 
 The playlist ID is the path segment in its URL:
@@ -53,11 +58,23 @@ there is no refresh token it serves the consent flow on that address and
 waits, logging one line:
 
 ```
-spotify consent required — open this URL to authorize url=https://nas.tail1234.ts.net/difmsync/start?t=<nonce>
+spotify consent required — open this URL to authorize url=http://127.0.0.1:3437/start?t=<nonce> listening=[::]:3437
 ```
 
 Open it, approve, and syncing begins on the next tick. The listener then
 shuts down for the life of the process.
+
+That URL is built from `DIFMSYNC_SPOTIFY_REDIRECT_URL`, not from the
+listen address — the daemon serves plain HTTP inside a container and
+cannot know what fronts it. `.env.defaults` points it at the consent port
+`compose.yaml` publishes, so the default works from a browser on the
+host. Point it elsewhere and the daemon prints that instead; if it names
+a loopback port that is not the one being served, the log says so
+directly above the URL:
+
+```
+consent redirect port does not match the consent listener ... redirect_port=8888 listen_port=3437
+```
 
 Two things make this safe enough to leave exposed for the minutes it is
 up. The start URL carries a **nonce** generated at startup and emitted
@@ -75,13 +92,14 @@ hostname that may front several services.
 **Unset, nothing changes**: the daemon exits with `spotify: no refresh
 token; run difmsync auth first`, which is what a workstation wants.
 
-#### Fronting it with Tailscale
+#### Authorizing from another machine, with Tailscale
 
-`DIFMSYNC_AUTH_HTTP_ADDR` serves plain HTTP, and `compose.yaml` publishes
-it to the host's loopback only. Something has to terminate TLS in front of
-it, both so a browser elsewhere can reach it and because Spotify will not
-accept a non-loopback redirect URI over HTTP. `tailscale serve` does both
-with a real certificate and no ports open to the internet:
+Only needed if the browser is not on the Docker host. `compose.yaml`
+publishes the consent port to the host's loopback, so anything else has to
+come through something that terminates TLS — both to reach it at all and
+because Spotify will not accept a non-loopback redirect URI over HTTP.
+`tailscale serve` does both with a real certificate and no ports open to
+the internet:
 
 ```sh
 tailscale serve --bg --set-path /difmsync 3437
@@ -201,7 +219,9 @@ easy to get wrong:
   the service's ports without it, so the `ports:` block in `compose.yaml`
   has no effect on that command and the callback never arrives. Note it
   publishes *every* port in that block, so stop the daemon first or it
-  collides with the running container on 3436.
+  collides with the running container on both 3436 and 3437 — and 3437
+  is also the port this command's own listener binds, since it is
+  derived from `DIFMSYNC_SPOTIFY_REDIRECT_URL`.
 - **The listener must bind `0.0.0.0` inside the container.** A published
   port forwards to the container's eth0 address, not its loopback, so a
   listener on `127.0.0.1` is unreachable from the host. `compose.yaml`

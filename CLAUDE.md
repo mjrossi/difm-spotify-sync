@@ -198,13 +198,25 @@ the ordering it depends on.
 The consent server on `--auth-http-addr` is the one exception, and it is
 built as an exception rather than as a widening of the rule. It writes a
 refresh token, so it does not join the status server; it gets its own
-port, published to loopback only, and four properties that keep the
-exception narrow:
+port, published to loopback by `compose.yaml`, and four properties that
+keep the exception narrow.
+
+The loopback half is a property of the deployment, not of the code: inside
+a container the listener must bind `0.0.0.0`, so whatever fronts the
+published port decides the real audience — and with `tailscale serve` in
+front, that is every peer on the tailnet, not one host. The nonce is the
+only guard that survives that, which is why it is the first of the four
+rather than a convenience.
 
 - It exists **only while there is no refresh token**, and shuts down for
-  the life of the process the moment one is stored.
+  the life of the process the moment one is stored. A *failed* consent
+  deliberately leaves it up: a denied grant or a mistyped state has to be
+  retryable by clicking the URL again, not by restarting the container.
+  `done` fires only after `Complete` returns nil, so the narrowing is the
+  same condition, not a second one.
 - Starting a flow requires a **nonce** generated at startup and emitted
-  once, to the log. Reaching the port is not sufficient. Without this,
+  once, to the log — one per process, valid until consent completes,
+  rather than one per attempt. Reaching the port is not sufficient. Without this,
   anyone who could reach it could complete consent with their own Spotify
   account and bind the sync to a stranger's playlist — the endpoint is
   unauthenticated by necessity, since the operator has no session yet.
@@ -219,6 +231,14 @@ exception narrow:
 
 Serving consent from the status server, or leaving the listener up after
 consent, would each turn a bounded exception back into a general one.
+
+The consent server does return raw error text to the browser, which the
+status endpoints below are forbidden from doing. That is not an oversight
+and not a precedent: it is reachable only past the state check, so an
+unauthenticated caller sees a fixed string and nothing else, and the
+operator reading it is by definition the person who started the flow.
+The status endpoints have neither property — they answer anyone on the
+LAN, unprompted.
 
 Two consequences for code:
 

@@ -4,7 +4,9 @@
 #
 # One-time setup is now part of running it. Bring the service up; while
 # there is no refresh token the daemon serves the Spotify consent flow on
-# DIFMSYNC_AUTH_HTTP_ADDR and logs a URL carrying a one-time nonce:
+# DIFMSYNC_AUTH_HTTP_ADDR and logs a URL carrying a nonce — generated at
+# startup, logged once, and good until consent completes, so a flow that
+# fails can be retried from the same URL:
 #
 #   docker compose up -d connector
 #   docker compose logs connector   # -> "spotify consent required ... url=..."
