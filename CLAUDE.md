@@ -9,8 +9,8 @@ this repo is silent, that one is the reference.
 ## What this is
 
 A Go service that mirrors DI.fm liked tracks into a Spotify playlist.
-Single module, no web frontend. Runs as a container on a homelab host or
-on Fly.io from the same image.
+Single module. Runs as one container on a homelab host, on an internal
+network — nothing about it is public-facing.
 
 ## Tooling: mise
 
@@ -21,8 +21,11 @@ Runtimes and project tools are managed by [mise](https://mise.jdx.dev).
 - **`mise.toml`** — base: tool versions + production-default env.
 - **`mise.development.toml`** — local overrides; `MISE_ENV=development`.
 - **`mise.ci.toml`** — CI overrides; `MISE_ENV=ci`.
-- **`mise.local.toml`** — gitignored, machine-specific and credential-bearing.
-  See `mise.local.toml.example`.
+- **`mise.local.toml`** — gitignored, machine-specific non-secret overrides.
+- **`.env.local`** — gitignored, and the *only* home for credentials.
+  `mise.toml` loads it via `_.file` and `compose.yaml` loads it as a
+  layer, so the host tooling and the container read one file rather than
+  two copies that drift. See `.env.local.example`.
 
 Add tooling by editing `mise.toml` rather than telling contributors to
 `brew install` things.
@@ -167,20 +170,87 @@ larger instruction than the operator gave.
 
 ## Deployment
 
-Same image both places; see [`docs/deploy.md`](docs/deploy.md) for the
-runbook. Two constraints that are easy to get wrong:
+One container on the homelab, built on the host from this repo; see
+[`docs/deploy.md`](docs/deploy.md) for the runbook. Two constraints that
+are easy to get wrong:
 
-- The sync interval is an **internal ticker**, not cron. A machine scaled
-  to zero never syncs. Note that `min_machines_running` is *not*
-  expressible for this app: it belongs to `[http_service]` /
-  `[[services]]`, and this is a worker with neither. What holds the
-  machine up is having no service for Fly's proxy to autostop, plus
-  `fly scale count 1` and `[[restart]] policy = "always"`.
+- The sync interval is an **internal ticker**, not cron. Nothing external
+  triggers a pass, so a container that is stopped, unhealthy, or
+  crash-looping simply stops syncing — silently, unless something is
+  watching. That is what `difmsync status --check` and `/healthz` are
+  for; see the Operator surface section below.
 - `difmsync auth` is the one step that cannot run headless. It must write
   to the same database the deployment mounts. Its listener binds the
   redirect URL's host and path; in a container the host must be
   overridden to `0.0.0.0` (`DIFMSYNC_AUTH_BIND`), because a published
   port forwards to eth0 rather than loopback.
+
+## Operator surface
+
+The daemon serves exactly two HTTP endpoints, and only when
+`--http-addr` is set: `GET /healthz` and `GET /status.json`. Both are
+**read-only**. That is a rule, not a description of current scope — they
+are exposed on the LAN without authentication, and the only thing making
+that defensible is that they cannot change anything and carry no secrets.
+Anything that writes to Spotify or the database stays in the CLI, where
+`review --approve` keeps the ordering it depends on.
+
+Two consequences for code:
+
+- `internal/status` is the single implementation of the health rule,
+  shared by `status`, `status --check` and `/healthz`. Health computed in
+  two places drifts, and it always drifts the same direction: the probe
+  keeps reporting green after the thing it probes has stopped.
+- The report is assembled field by field from typed store accessors,
+  never by serializing a store struct. `accounts` carries the Spotify
+  refresh token on the same row as the label and the watermark;
+  structural exclusion is what keeps it out of the JSON, and
+  `TestReportCarriesNoSecrets` is what keeps that true.
+
+  This covers the **whole payload**, not just the accounts row. `Runs`
+  was briefly `[]sqlite.SyncRun`, and serving that store struct published
+  `sync_runs.error` — which carried the DI.fm member id, because
+  `*url.Error` embeds the request URL and the member id is a path segment
+  of every `track_votes` request. `status.Run` exists to keep the
+  exclusion structural; a column added to `sync_runs` must not be able to
+  publish itself.
+
+- **Recorded error text never reaches the endpoints.** It is assembled
+  from whatever failed and reviewed by nobody, so both channels that can
+  carry it are closed: `status.Run.Error` is `json:"-"` (the CLI table
+  still prints it), and `describe()` names the failing run without
+  interpolating its text, because `Reason` is written verbatim as plain
+  text by `/healthz` on the 503 path. Fixing one channel and not the
+  other leaves the id served to whatever polls the probe.
+  `TestEndpointsCarryNoSecretsFromAFailedRun` covers both; a fixture with
+  a *clean* run passes either way, which is how this got out.
+
+  `pkg/difm` scrubs the member id at the source as well
+  (`scrubMemberID`), so the two defenses are independent.
+
+The health rule itself: the newest `sync_runs` row that finished,
+recorded no error, and was **not** a dry run must be within
+`--max-age`, **and must be within the last `healthScanLimit` (20) rows**.
+The dry-run clause is load-bearing — the deployed loop never dry-runs, so
+without it a stale `just dry-run` from a debugging session keeps the probe
+green over a daemon that has not completed a real pass in days.
+
+The row-count clause is a real part of the rule, not an implementation
+detail, so it is stated here rather than left to be discovered. It is
+unreachable at production defaults (20 rows at a 15m interval spans ~5h,
+well past the 45m `--max-age`) but reachable under
+`MISE_ENV=development`, where 20 rows at 2m is 40m — inside the same 45m
+window. There, a clean pass with 20 failures stacked on top of it reports
+unhealthy. That verdict is arguably the better one, which is why the
+window stays; what is not acceptable is the two disagreeing silently.
+
+The scan window is deliberately decoupled from the caller's display
+limit. `health()` looks for the newest *qualifying* row, so letting a
+caller asking for a short list also narrow the search made `/healthz`
+disagree with `status --check` for the duration of every pass — the
+engine opens a `sync_runs` row when a pass starts, so at a limit of 1 the
+only visible row was the in-flight one. `Build` scans the fixed window,
+decides, and truncates afterwards; `TestHealthIgnoresRunLimit` pins it.
 
 ## Credentials
 

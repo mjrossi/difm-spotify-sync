@@ -1,6 +1,15 @@
-# machine-specific mise overrides (may contain credentials)
+# machine-specific overrides (may contain credentials).
+#
+# The dotenv family mirrors the mise one: .env.defaults and .env.<env> are
+# committed and hold no secrets; the .local layers are yours alone. A bare
+# .env is ignored too — nothing reads it as a layer, but Compose picks one
+# up automatically for ${...} interpolation, so a stray file should never
+# reach the repo.
 mise.local.toml
+mise.*.local.toml
 .env
+.env.local
+.env.*.local
 
 # local state
 tmp/

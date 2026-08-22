@@ -6,7 +6,10 @@
 #   - mise.development.toml  → MISE_ENV=development (local dev)
 #   - mise.ci.toml           → MISE_ENV=ci (GitHub Actions)
 #   - mise.local.toml        → uncommitted, machine-specific overrides
-#                              (see mise.local.toml.example)
+#
+# Credentials are NOT here. They live in .env.local, which this file loads
+# below and which compose.yaml also reads — one secrets file for both the
+# host toolchain and the container. Copy .env.local.example to start.
 
 [tools]
 # Patch-pinned so reproducibility > convenience.
@@ -33,3 +36,15 @@ DIFMSYNC_DB_PATH = "./tmp/difmsync.db"
 # Read by --network; DI.fm is the default, but the same API backs
 # RadioTunes, JazzRadio, RockRadio, ClassicalRadio and ZenRadio.
 DIFMSYNC_NETWORK = "di"
+
+# The five secrets, shared with the container so there is exactly one copy
+# of them. compose.yaml reads the same file as its `.env.local` layer; see
+# .env.local.example for what belongs in it.
+#
+# Deliberately last: entries in this block are applied in document order,
+# so a value here beats the defaults above — which is the same precedence
+# Compose gives the file, and keeping the two in agreement is the point.
+#
+# A missing .env.local is not an error, so a fresh clone and CI (which
+# have no secrets) still run every `just` recipe that does not need them.
+_.file = ".env.local"

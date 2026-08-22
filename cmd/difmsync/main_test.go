@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -109,7 +113,7 @@ func TestCallbackTarget(t *testing.T) {
 
 // clearEnv unsets every DIFMSYNC_* variable for the duration of a test.
 // Without it these tests inherit the developer's real configuration —
-// mise.local.toml exports live credentials — and assertions about
+// .env.local exports live credentials — and assertions about
 // missing configuration pass or fail depending on whose machine runs
 // them.
 func clearEnv(t *testing.T) {
@@ -393,4 +397,319 @@ func TestCallbackTargetServesTheDerivedPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// serveWhile is what keeps the sync loop observable, so the properties
+// that matter are: the listener is up before work starts, a bad address
+// fails loudly rather than leaving a silent daemon, and canceling the
+// context stops both halves.
+func TestServeWhileServesUntilWorkStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, "pong")
+	})
+
+	// Port 0 lets the OS pick, but then the test needs the real address.
+	// Serving on a listener whose address we recover through a handler
+	// hit would be circular, so bind explicitly and read it back.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("probe close: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- serveWhile(ctx, addr, mux, discardLogger(), func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			return nil
+		})
+	}()
+
+	<-started
+	resp, err := http.Get("http://" + addr + "/ping")
+	if err != nil {
+		t.Fatalf("GET /ping: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Canceling is the SIGTERM path: the work returns, and serveWhile
+	// returns with it rather than hanging on the still-listening server.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serveWhile returned %v, want nil on a clean stop", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveWhile did not return after the context was canceled")
+	}
+}
+
+// A daemon that syncs fine but answers nothing reads as dead to whatever
+// polls it, so an unusable --http-addr must fail at startup rather than
+// being logged and shrugged off.
+func TestServeWhileRejectsABadAddress(t *testing.T) {
+	ranWork := false
+	err := serveWhile(context.Background(), "256.256.256.256:99999", http.NewServeMux(),
+		discardLogger(), func(context.Context) error {
+			ranWork = true
+			return nil
+		})
+	if err == nil {
+		t.Fatal("expected an error for an unbindable address")
+	}
+	if !strings.Contains(err.Error(), "status endpoints") {
+		t.Errorf("err = %v, want it to name what failed to bind", err)
+	}
+	if ranWork {
+		t.Error("work started despite the listener failing")
+	}
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
+
+// The backup is often the only copy of the Spotify refresh token, and
+// restoring one means writing it over the live database. Every property
+// here is about not producing something that looks restorable and isn't.
+func TestBackupRoundTrip(t *testing.T) {
+	dbPath, _ := seed(t)
+	dest := filepath.Join(t.TempDir(), "nested", "backup.db")
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	// It must open, and carry the ledger the source had.
+	account, n := inspect(t, dest)
+	if account.Label != "default" {
+		t.Errorf("account label = %q, want default", account.Label)
+	}
+	if n != 1 {
+		t.Errorf("synced count = %d, want 1", n)
+	}
+
+	// It holds the refresh token, so it must not be group- or
+	// world-readable.
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("backup mode = %o, want 600", perm)
+	}
+}
+
+// SQLite refuses to VACUUM INTO an existing path. That refusal is kept
+// rather than papered over with a truncate, because the file it would
+// overwrite is frequently the only copy of a refresh token.
+func TestBackupRefusesAnExistingDestination(t *testing.T) {
+	dbPath, _ := seed(t)
+	dest := filepath.Join(t.TempDir(), "backup.db")
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err != nil {
+		t.Fatalf("first backup: %v", err)
+	}
+	before, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err == nil {
+		t.Fatal("expected the second backup to refuse an existing destination")
+	}
+
+	after, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("reread: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("the refused backup modified the existing file")
+	}
+}
+
+// A wrong --db-path yields a database with no account row. Reporting that
+// as a successful backup is the failure mode the verification exists to
+// prevent, and leaving the file behind is how it gets restored later by
+// someone who never saw the error.
+func TestBackupRejectsAndRemovesAnAccountlessSnapshot(t *testing.T) {
+	clearEnv(t)
+	empty := filepath.Join(t.TempDir(), "empty.db")
+	dest := filepath.Join(t.TempDir(), "backup.db")
+
+	err := runCLI(t, empty, "backup", "--to", dest)
+	if err == nil {
+		t.Fatal("expected a backup of an accountless database to fail")
+	}
+	if !strings.Contains(err.Error(), "account row") {
+		t.Errorf("err = %v, want it to name the missing account row", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("the unusable backup was left at %s", dest)
+	}
+}
+
+// A failed backup must leave nothing at the destination.
+//
+// VACUUM INTO does not clean up its own partial output, and the nightly
+// cron writes into the same volume as the database — so a full volume
+// used to leave a truncated file with a plausible dated name, which is
+// exactly what a later restore would copy over the live database. The
+// staging directory plus rename means only a verified snapshot ever
+// appears at dest.
+func TestBackupLeavesNothingBehindOnFailure(t *testing.T) {
+	clearEnv(t)
+	// A database with no account row fails verification, which stands in
+	// for any mid-backup failure: the question is what is left at dest.
+	empty := filepath.Join(t.TempDir(), "empty.db")
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "backup.db")
+
+	if err := runCLI(t, empty, "backup", "--to", dest); err == nil {
+		t.Fatal("expected the backup to fail")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Errorf("destination %s exists after a failed backup", dest)
+	}
+
+	// And no staging directory left lying around either.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		t.Errorf("leftover in the destination directory: %s", e.Name())
+	}
+}
+
+// The snapshot holds the Spotify refresh token, so it must never be
+// world-readable — not even briefly. VACUUM INTO creates its output with
+// the process umask (0644 by default) and it can only be chmod'd once the
+// copy finishes, so the file is staged inside a 0700 directory instead.
+func TestBackupIsNeverWorldReadable(t *testing.T) {
+	dbPath, _ := seed(t)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "backup.db")
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("backup mode = %o, want 600", perm)
+	}
+	// The staging directory is what closes the window during the copy;
+	// assert it is cleaned up rather than left behind at 0700.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "backup.db" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("destination directory holds %v, want just backup.db", names)
+	}
+}
+
+// TestStatusCheckIsTheHealthcheckContract exercises `status --check`
+// through the CLI, with the exact argv compose.yaml's healthcheck runs.
+//
+// internal/status covers the health rule itself; what nothing covered was
+// the wiring between that rule and the command line. compose.yaml pins
+// `["CMD", "/app/difmsync", "status", "--check"]` and reads *only* the
+// exit code, so a renamed flag, a subcommand that stops returning an
+// error, or --max-age losing its env source all ship green here and
+// surface as a container that is permanently unhealthy — a failure mode
+// with no error message anywhere, because the check never ran.
+func TestStatusCheckIsTheHealthcheckContract(t *testing.T) {
+	ctx := context.Background()
+
+	// recordRun writes one finished, non-dry run backdated by age.
+	recordRun := func(t *testing.T, dbPath string, accountID int64, age time.Duration) {
+		t.Helper()
+		store, err := sqlite.Open(dbPath)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+		at := time.Now().Add(-age)
+		store.SetClock(func() time.Time { return at })
+		id, err := store.StartRun(ctx, accountID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := store.FinishRun(ctx, id, sqlite.RunStats{Added: 1}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+
+	t.Run("fresh clean pass exits zero", func(t *testing.T) {
+		dbPath, account := seed(t)
+		recordRun(t, dbPath, account.ID, time.Minute)
+		if err := runCLI(t, dbPath, "status", "--check"); err != nil {
+			t.Errorf("status --check on a fresh pass = %v, want nil", err)
+		}
+	})
+
+	t.Run("stale pass exits non-zero", func(t *testing.T) {
+		dbPath, account := seed(t)
+		recordRun(t, dbPath, account.ID, 3*time.Hour)
+		err := runCLI(t, dbPath, "status", "--check")
+		if err == nil {
+			t.Fatal("status --check on a 3h-old pass = nil, want an error")
+		}
+		// The message is the healthcheck's only output, and it lands in
+		// `docker inspect`. An empty or generic one is why an operator
+		// ends up reading source to find out what is wrong.
+		if !strings.Contains(err.Error(), "last clean pass") {
+			t.Errorf("unhealthy reason = %q, want it to name the stale pass", err)
+		}
+	})
+
+	t.Run("before auth exits non-zero", func(t *testing.T) {
+		// The pre-auth window is why compose.yaml sets a 30m start_period.
+		// A fresh deployment has no account row at all, and the check has
+		// to fail rather than panic on the missing row.
+		clearEnv(t)
+		dbPath := filepath.Join(t.TempDir(), "empty.db")
+		if err := runCLI(t, dbPath, "status", "--check"); err == nil {
+			t.Error("status --check with no account = nil, want an error")
+		}
+	})
+
+	t.Run("--max-age reads DIFMSYNC_STATUS_MAX_AGE", func(t *testing.T) {
+		// docs/deploy.md tells operators to shrink --max-age to see the
+		// unhealthy branch without waiting out a real stall, and the
+		// compose healthcheck has no way to pass a flag — it goes through
+		// the environment or not at all.
+		dbPath, account := seed(t)
+		recordRun(t, dbPath, account.ID, 10*time.Minute)
+		if err := runCLI(t, dbPath, "status", "--check"); err != nil {
+			t.Fatalf("precondition: 10m-old pass should be healthy at the default max-age: %v", err)
+		}
+		t.Setenv("DIFMSYNC_STATUS_MAX_AGE", "1s")
+		if err := runCLI(t, dbPath, "status", "--check"); err == nil {
+			t.Error("DIFMSYNC_STATUS_MAX_AGE=1s did not make a 10m-old pass unhealthy")
+		}
+	})
 }

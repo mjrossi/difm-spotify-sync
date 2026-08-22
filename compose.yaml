@@ -1,6 +1,6 @@
-# Homelab deployment. Credentials come from .env (gitignored); see
-# docs/difm-api.md for how to obtain DIFMSYNC_API_KEY and
-# DIFMSYNC_MEMBER_ID.
+# Homelab deployment. Credentials come from .env.local (gitignored) —
+# copy .env.local.example and fill it in; see docs/difm-api.md for how to
+# obtain DIFMSYNC_API_KEY and DIFMSYNC_MEMBER_ID.
 #
 # One-time setup, before the daemon can run unattended:
 #
@@ -15,26 +15,77 @@ services:
     build: .
     image: difm-spotify-sync:dev
     restart: unless-stopped
-    env_file: .env
+    # Layered exactly like the mise files, later winning, with the <env>
+    # layer chosen by MISE_ENV — the same switch mise reads, so one
+    # variable steers the host toolchain and the container together.
+    # Unset means production, matching mise.toml's role.
+    #
+    #   .env.defaults          <-  mise.toml              (committed)
+    #   .env.<env>             <-  mise.<env>.toml        (committed)
+    #   .env.local             <-  mise.local.toml        (gitignored)
+    #   .env.<env>.local       <-  mise.<env>.local.toml  (gitignored)
+    #
+    # Only .env.defaults is required; a missing layer is not an error, so
+    # a fresh clone runs as soon as .env.local exists.
+    env_file:
+      - .env.defaults
+      - path: .env.${MISE_ENV:-production}
+        required: false
+      - path: .env.local
+        required: false
+      - path: .env.${MISE_ENV:-production}.local
+        required: false
+
+    # Pinned here rather than in .env.defaults, deliberately: `environment:`
+    # overrides every env_file layer, and these two are facts about running
+    # inside this container rather than preferences. A stray override in a
+    # local layer would break the deployment in ways that are tedious to
+    # diagnose, so the layers are not allowed to reach them.
     environment:
+      # The volume mount point. Anything else and the database is written
+      # into the container's ephemeral filesystem, where it is lost on the
+      # next `docker compose up` — silently, because SQLite will happily
+      # create a fresh one and the service will look like it started fine.
       DIFMSYNC_DB_PATH: /data/difmsync.db
-      DIFMSYNC_LOG_FORMAT: json
-      # A published port forwards to the container's eth0 address, not
-      # its loopback, so the `auth` listener has to bind 0.0.0.0 to be
-      # reachable from the host. The redirect URL itself stays
-      # 127.0.0.1 — that is what the browser and Spotify's dashboard
-      # both need.
+      # A published port forwards to the container's eth0 address, not its
+      # loopback, so the `auth` listener has to bind 0.0.0.0 to be
+      # reachable from the host. The redirect URL itself stays 127.0.0.1 —
+      # that is what the browser and Spotify's dashboard both need. An
+      # empty value here (easy to inherit by copying mise.local.toml over)
+      # silently falls back to loopback and the callback never arrives.
       DIFMSYNC_AUTH_BIND: 0.0.0.0
     volumes:
       - difmsync-data:/data
-    # The auth subcommand needs the callback port reachable from the host.
-    # Bound to the host's loopback only: nothing here should be exposed
-    # to the network.
     ports:
+      # The auth subcommand needs the callback port reachable from the
+      # host. Bound to the host's loopback only, and inert outside the
+      # one-time consent step.
       - "127.0.0.1:8888:8888"
-    # distroless has no shell, so the check must be exec-form. `status`
-    # opens the database and reads the account, which is a real check
-    # that the process and its volume are both healthy.
+      # The status endpoints, published to the LAN.
+      #
+      # 3436 is "DIFM" on a phone keypad. The point of the odd number is
+      # to stay out of the way on a host running many services: it dodges
+      # the usual occupants (3000, 8080/8081, 8096, 8123, 8384, 9000,
+      # 9090, 9100) and sits below Linux's default ephemeral range
+      # (32768-60999), where a listener can collide with an outbound
+      # connection's source port. Change both halves together, and
+      # DIFMSYNC_HTTP_ADDR in .env.defaults with them — it moved there
+      # when the dotenv layers were introduced, and following this comment
+      # to the `environment:` block below would produce exactly the silent
+      # mismatch it is warning about.
+      #
+      # Narrow to a single interface (e.g. "192.168.1.10:3436:3436") if
+      # you would rather not answer on all of them.
+      - "3436:3436"
+    # distroless has no shell, so the check must be exec-form — and no
+    # curl or wget either, which is why this probes via the CLI rather
+    # than hitting /healthz. It also means health still works if
+    # DIFMSYNC_HTTP_ADDR is ever unset.
+    #
+    # `--check` is what makes this a health check rather than a liveness
+    # check. Plain `status` only fails when the account row is missing, so
+    # a sync that had been broken for a week still reported healthy.
+    # `--check` requires a clean, non-dry pass within DIFMSYNC_STATUS_MAX_AGE.
     #
     # start_period is long because `status` exits non-zero until the
     # one-time `difmsync auth` has run, and auth needs a human with a
@@ -42,11 +93,28 @@ services:
     # window between first deploy and consent — inverting the signal on
     # precisely the day someone is watching it.
     healthcheck:
-      test: ["CMD", "/app/difmsync", "status"]
+      test: ["CMD", "/app/difmsync", "status", "--check"]
       interval: 5m
       timeout: 10s
       retries: 3
       start_period: 30m
+    # The default is 10s, which SIGKILLs a pass that is mid-flight. The
+    # engine survives that — the sync_runs row is closed through a
+    # detached context, and the watermark only moves after a clean pass —
+    # but a clean stop beats a survivable one.
+    stop_grace_period: 45s
+    # JSON logs to stdout with no cap is a reliable way to fill a homelab
+    # disk and take the sync down with it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
 
 volumes:
   difmsync-data:
