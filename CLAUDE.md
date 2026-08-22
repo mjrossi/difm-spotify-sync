@@ -187,13 +187,38 @@ are easy to get wrong:
 
 ## Operator surface
 
-The daemon serves exactly two HTTP endpoints, and only when
-`--http-addr` is set: `GET /healthz` and `GET /status.json`. Both are
-**read-only**. That is a rule, not a description of current scope — they
-are exposed on the LAN without authentication, and the only thing making
-that defensible is that they cannot change anything and carry no secrets.
-Anything that writes to Spotify or the database stays in the CLI, where
-`review --approve` keeps the ordering it depends on.
+The daemon serves exactly two HTTP endpoints on `--http-addr`: `GET
+/healthz` and `GET /status.json`. Both are **read-only**. That is a rule,
+not a description of current scope — they are exposed on the LAN without
+authentication, and the only thing making that defensible is that they
+cannot change anything and carry no secrets. Anything that writes to
+Spotify or the database stays in the CLI, where `review --approve` keeps
+the ordering it depends on.
+
+The consent server on `--auth-http-addr` is the one exception, and it is
+built as an exception rather than as a widening of the rule. It writes a
+refresh token, so it does not join the status server; it gets its own
+port, published to loopback only, and four properties that keep the
+exception narrow:
+
+- It exists **only while there is no refresh token**, and shuts down for
+  the life of the process the moment one is stored.
+- Starting a flow requires a **nonce** generated at startup and emitted
+  once, to the log. Reaching the port is not sufficient. Without this,
+  anyone who could reach it could complete consent with their own Spotify
+  account and bind the sync to a stranger's playlist — the endpoint is
+  unauthenticated by necessity, since the operator has no session yet.
+- The callback is guarded by the OAuth `state` parameter rather than the
+  nonce, because Spotify redirects a browser to it and will not carry an
+  extra parameter. That is the standard protection and the same one
+  `difmsync auth` relies on.
+- The exchange and the token write live in `consentFlow` (`consent.go`),
+  shared with `difmsync auth`. Two entry points with the same security
+  obligations and different transports is exactly how a state check gets
+  skipped on one path while every test exercises the other.
+
+Serving consent from the status server, or leaving the listener up after
+consent, would each turn a bounded exception back into a general one.
 
 Two consequences for code:
 

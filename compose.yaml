@@ -2,14 +2,26 @@
 # copy .env.local.example and fill it in; see docs/difm-api.md for how to
 # obtain DIFMSYNC_API_KEY and DIFMSYNC_MEMBER_ID.
 #
-# One-time setup, before the daemon can run unattended:
+# One-time setup is now part of running it. Bring the service up; while
+# there is no refresh token the daemon serves the Spotify consent flow on
+# DIFMSYNC_AUTH_HTTP_ADDR and logs a URL carrying a one-time nonce:
 #
-#   docker compose run --rm --service-ports connector auth
+#   docker compose up -d connector
+#   docker compose logs connector   # -> "spotify consent required ... url=..."
 #
-# --service-ports is required: `docker compose run` does NOT publish the
-# service's ports without it, so the `ports:` block below is inert for
-# that command and the OAuth callback never arrives. DIFMSYNC_AUTH_BIND
-# below is the other half — see the comment there.
+# Open that URL, approve, and the daemon starts syncing on its next tick.
+# The consent listener shuts down for good once the token is stored.
+#
+# The port below is published to loopback only, so something has to front
+# it for a browser to reach it — `tailscale serve --set-path /difmsync
+# 3437` is the deployment this was built for, and it also satisfies
+# Spotify's rule that a redirect URI be HTTPS unless it is a loopback
+# literal. Set DIFMSYNC_SPOTIFY_REDIRECT_URL to that public URL; the
+# daemon derives both served paths from it.
+#
+# `docker compose run --rm --service-ports connector auth` still works as
+# a fallback, and DIFMSYNC_AUTH_BIND below is what makes it work in a
+# container — see the comment there.
 services:
   connector:
     build: .
@@ -57,10 +69,14 @@ services:
     volumes:
       - difmsync-data:/data
     ports:
-      # The auth subcommand needs the callback port reachable from the
-      # host. Bound to the host's loopback only, and inert outside the
-      # one-time consent step.
-      - "127.0.0.1:8888:8888"
+      # The one-time consent flow. Loopback only and deliberately so: it
+      # writes a refresh token, which is exactly what /healthz and
+      # /status.json below are forbidden from doing, so it does not go on
+      # the LAN. Reach it through whatever terminates TLS in front.
+      #
+      # Inert once consent is stored — the listener shuts down and this
+      # mapping simply reserves the port for the next time it is needed.
+      - "127.0.0.1:3437:3437"
       # The status endpoints, published to the LAN.
       #
       # 3436 is "DIFM" on a phone keypad. The point of the odd number is

@@ -452,3 +452,59 @@ func TestInFlightRunIsStillListed(t *testing.T) {
 		t.Error("Runs[0] should be the in-flight pass (newest first)")
 	}
 }
+
+// TestUnauthorizedAccountReportsWhyItIsUnhealthy covers the state the
+// in-daemon consent flow creates and the old code could not: an account
+// row exists, the container is up and serving, but consent has never been
+// given.
+//
+// Before this, such a deployment reported "no sync pass has run yet",
+// which sends an operator to the logs hunting a failure when what is
+// actually needed is one click. The clause wins over the run-based reason
+// deliberately, so a container that has also stacked up failed passes
+// still names the cause rather than a symptom.
+func TestUnauthorizedAccountReportsWhyItIsUnhealthy(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.Open(filepath.Join(t.TempDir(), "unauth.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	account, err := s.EnsureAccount(ctx, testLabel, testMemberID, testPlaylist)
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	// A clean, recent pass — which on its own would report healthy. It
+	// cannot, because there is no token for it to have used.
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.Authorized {
+		t.Error("Authorized = true for an account with no refresh token")
+	}
+	if rep.Healthy {
+		t.Error("Healthy = true for an account that has never given consent")
+	}
+	if !strings.Contains(rep.Reason, "consent") {
+		t.Errorf("Reason = %q, want it to name the missing consent", rep.Reason)
+	}
+
+	// And the positive case, so the clause cannot simply be always-on.
+	if err := s.SetSpotifyRefreshToken(ctx, account.ID, refreshToken); err != nil {
+		t.Fatalf("SetSpotifyRefreshToken: %v", err)
+	}
+	rep, err = status.Build(ctx, s, testLabel, testMaxAge, 0)
+	if err != nil {
+		t.Fatalf("Build after consent: %v", err)
+	}
+	if !rep.Authorized || !rep.Healthy {
+		t.Errorf("after consent: Authorized=%v Healthy=%v (%s), want both true",
+			rep.Authorized, rep.Healthy, rep.Reason)
+	}
+}

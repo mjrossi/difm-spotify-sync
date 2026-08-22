@@ -44,6 +44,7 @@ Every flag has a `DIFMSYNC_*` environment fallback:
 | `DIFMSYNC_LOG_FORMAT` | `--log-format` | `json` |
 | `DIFMSYNC_LOG_LEVEL` | `--log-level` | `info` |
 | `DIFMSYNC_HTTP_ADDR` | `--http-addr` | — (endpoints off) |
+| `DIFMSYNC_AUTH_HTTP_ADDR` | `--auth-http-addr` | — (daemon exits instead of waiting) |
 | `DIFMSYNC_STATUS_MAX_AGE` | `--max-age` | `45m` |
 
 `just verify-config` checks this set against the code and is part of

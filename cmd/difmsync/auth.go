@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -59,34 +57,32 @@ func authCommand() *cli.Command {
 			auth := spotify.NewAuthenticator(c.String("spotify-client-id"),
 				c.String("spotify-client-secret"), redirect)
 
-			// CSRF state: the callback is rejected unless it echoes this.
-			buf := make([]byte, 16)
-			if _, err := rand.Read(buf); err != nil {
-				return fmt.Errorf("generate oauth state: %w", err)
+			flow, err := newConsentFlow(auth, store, account.ID)
+			if err != nil {
+				return err
 			}
-			state := hex.EncodeToString(buf)
 
-			type result struct {
-				code string
-				err  error
-			}
-			results := make(chan result, 1)
+			results := make(chan error, 1)
 
 			mux := http.NewServeMux()
 			mux.HandleFunc(target.Path, func(w http.ResponseWriter, r *http.Request) {
-				q := r.URL.Query()
-				if got := q.Get("state"); got != state {
-					http.Error(w, "state mismatch", http.StatusBadRequest)
-					results <- result{err: errors.New("oauth state mismatch — retry `difmsync auth`")}
-					return
-				}
-				if e := q.Get("error"); e != "" {
-					http.Error(w, "consent denied: "+e, http.StatusBadRequest)
-					results <- result{err: fmt.Errorf("spotify consent denied: %s", e)}
+				// Completed here rather than by handing the code back to
+				// the select below, so the state check, the exchange and
+				// the token write stay in one place shared with the
+				// daemon's consent server. Splitting them across the two
+				// entry points is how the two drift.
+				//
+				// WithoutCancel because a browser that closes the tab the
+				// instant the callback lands would otherwise cancel the
+				// token exchange mid-flight, losing a consent the operator
+				// has already given.
+				if err := flow.Complete(context.WithoutCancel(r.Context()), r.URL.Query()); err != nil {
+					http.Error(w, "Consent failed: "+err.Error(), http.StatusBadRequest)
+					results <- err
 					return
 				}
 				fmt.Fprintln(w, "Authorized. You can close this tab and return to the terminal.")
-				results <- result{code: q.Get("code")}
+				results <- nil
 			})
 
 			srv := &http.Server{
@@ -101,7 +97,7 @@ func authCommand() *cli.Command {
 			}
 			go func() {
 				if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					results <- result{err: err}
+					results <- err
 				}
 			}()
 			defer func() {
@@ -112,7 +108,7 @@ func authCommand() *cli.Command {
 
 			fmt.Println("Open this URL to authorize Spotify access:")
 			fmt.Println()
-			fmt.Println("   ", auth.AuthURL(state))
+			fmt.Println("   ", flow.AuthURL())
 			fmt.Println()
 			fmt.Printf("Waiting for the callback on %s (listening on %s, timeout %s)...\n",
 				redirect, target.Addr, authCallbackTimeout)
@@ -122,18 +118,8 @@ func authCommand() *cli.Command {
 				return ctx.Err()
 			case <-time.After(authCallbackTimeout):
 				return errAuthTimeout
-			case res := <-results:
-				if res.err != nil {
-					return res.err
-				}
-				tok, err := auth.Exchange(ctx, res.code)
+			case err := <-results:
 				if err != nil {
-					return err
-				}
-				if tok.RefreshToken == "" {
-					return errors.New("spotify returned no refresh token; revoke the app's access and retry")
-				}
-				if err := store.SetSpotifyRefreshToken(ctx, account.ID, tok.RefreshToken); err != nil {
 					return err
 				}
 				fmt.Println("Refresh token stored. `difmsync sync` can now run unattended.")
