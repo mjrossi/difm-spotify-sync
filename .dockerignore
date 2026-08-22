@@ -5,8 +5,14 @@ bin/
 *.db
 *.db-shm
 *.db-wal
-.env
+# Credentials. `.env` alone matched only the literal name, which stopped
+# covering anything once the secrets moved into .env.local — the glob is
+# what keeps them out of the builder stage and the local BuildKit cache.
+# The committed, secret-free layers (.env.defaults, .env.<env>) are
+# excluded too; the build does not read them.
+.env*
 mise.local.toml
+mise.*.local.toml
 docs/
 README.md
 CLAUDE.md

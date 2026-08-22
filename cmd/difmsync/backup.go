@@ -52,17 +52,44 @@ func backupCommand() *cli.Command {
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				return fmt.Errorf("checking the backup destination %s: %w", dest, err)
 			}
-			if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+			parent := filepath.Dir(dest)
+			if err := os.MkdirAll(parent, 0o750); err != nil {
 				return fmt.Errorf("creating the backup directory: %w", err)
 			}
-			if err := store.BackupTo(ctx, dest); err != nil {
+
+			// Staged in a private directory and renamed into place, rather
+			// than written straight to dest. Two reasons, both of which bit
+			// the straightforward version:
+			//
+			//   - VACUUM INTO does not clean up after itself. A failure
+			//     partway — a full volume is the realistic one, since the
+			//     nightly backup writes to the same volume as the database —
+			//     leaves its partial output behind. At the destination that
+			//     is a truncated file with a plausible dated name, which is
+			//     exactly what a later restore would copy over the live
+			//     database.
+			//   - The file is created with the process umask (0644 on a
+			//     default setup) and can only be chmod'd once VACUUM
+			//     returns, so the refresh token would be world-readable for
+			//     however long the copy takes. MkdirTemp creates the staging
+			//     directory 0700, which closes that window at the directory
+			//     instead.
+			//
+			// Same parent as dest, so the rename stays on one filesystem.
+			stage, err := os.MkdirTemp(parent, ".difmsync-backup-")
+			if err != nil {
+				return fmt.Errorf("creating a staging directory next to %s: %w", dest, err)
+			}
+			// Removes the staging directory and anything left in it on every
+			// path out, so a failed backup leaves nothing behind at all.
+			defer func() { _ = os.RemoveAll(stage) }()
+
+			tmp := filepath.Join(stage, "difmsync.db")
+			if err := store.BackupTo(ctx, tmp); err != nil {
 				return err
 			}
-			// The snapshot inherits the process umask, and it contains the
-			// refresh token — which grants unattended playlist write access
-			// until revoked. Narrow it before anything else can read it.
-			if err := os.Chmod(dest, 0o600); err != nil {
-				return fmt.Errorf("restricting permissions on %s: %w", dest, err)
+			if err := os.Chmod(tmp, 0o600); err != nil {
+				return fmt.Errorf("restricting permissions on the snapshot: %w", err)
 			}
 
 			// Verify by reopening the snapshot and reading the account out
@@ -72,16 +99,21 @@ func backupCommand() *cli.Command {
 			//
 			// A backup without that row is not a backup, and saying so is
 			// the whole reason for checking. Restoring one means writing it
-			// *over* the live database, so a confident success message on
-			// an empty file is the worst outcome available here. Removing
-			// it is deliberate: a plausible-looking file left behind is how
-			// it gets restored later by someone who never saw this error.
-			label := c.String("account")
-			if err := verifyBackup(ctx, dest, label); err != nil {
-				if rmErr := os.Remove(dest); rmErr != nil {
-					return fmt.Errorf("%w (and removing the unusable file failed: %w)", err, rmErr)
-				}
-				return fmt.Errorf("%w — removed it; check --db-path points at the database you meant", err)
+			// *over* the live database, so a confident success message on an
+			// empty file is the worst outcome available here. Verifying
+			// before the rename means an unusable snapshot never reaches the
+			// destination to be mistaken for a good one later.
+			if err := verifyBackup(ctx, tmp, c.String("account")); err != nil {
+				return fmt.Errorf("%w — check --db-path points at the database you meant", err)
+			}
+
+			// Publish only what has been verified. The check at the top is
+			// advisory rather than a lock — rename replaces — but what it
+			// guards against is running the command twice by hand, and what
+			// matters is the invariant that survives either way: nothing
+			// unverified is ever written to dest.
+			if err := os.Rename(tmp, dest); err != nil {
+				return fmt.Errorf("moving the verified snapshot to %s: %w", dest, err)
 			}
 
 			fmt.Printf("backed up to %s (holds the Spotify refresh token — treat as a secret)\n", dest)

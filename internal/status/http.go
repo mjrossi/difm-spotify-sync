@@ -36,7 +36,12 @@ func Handler(store *sqlite.Store, label string, maxAge time.Duration, log *slog.
 		ctx, cancel := context.WithTimeout(r.Context(), handlerTimeout)
 		defer cancel()
 
-		rep, err := Build(ctx, store, label, maxAge, 1)
+		// DefaultRunLimit rather than 1: this handler renders no runs, but
+		// asking for fewer used to narrow the health scan too, which made
+		// /healthz disagree with `status --check` for the duration of every
+		// pass. Build no longer ties the two together; passing the same
+		// value as every other caller keeps that obvious.
+		rep, err := Build(ctx, store, label, maxAge, DefaultRunLimit)
 		if err != nil {
 			writeText(w, http.StatusServiceUnavailable, err.Error(), log)
 			return

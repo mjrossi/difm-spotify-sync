@@ -563,3 +563,70 @@ func TestBackupRejectsAndRemovesAnAccountlessSnapshot(t *testing.T) {
 		t.Errorf("the unusable backup was left at %s", dest)
 	}
 }
+
+// A failed backup must leave nothing at the destination.
+//
+// VACUUM INTO does not clean up its own partial output, and the nightly
+// cron writes into the same volume as the database — so a full volume
+// used to leave a truncated file with a plausible dated name, which is
+// exactly what a later restore would copy over the live database. The
+// staging directory plus rename means only a verified snapshot ever
+// appears at dest.
+func TestBackupLeavesNothingBehindOnFailure(t *testing.T) {
+	clearEnv(t)
+	// A database with no account row fails verification, which stands in
+	// for any mid-backup failure: the question is what is left at dest.
+	empty := filepath.Join(t.TempDir(), "empty.db")
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "backup.db")
+
+	if err := runCLI(t, empty, "backup", "--to", dest); err == nil {
+		t.Fatal("expected the backup to fail")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Errorf("destination %s exists after a failed backup", dest)
+	}
+
+	// And no staging directory left lying around either.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		t.Errorf("leftover in the destination directory: %s", e.Name())
+	}
+}
+
+// The snapshot holds the Spotify refresh token, so it must never be
+// world-readable — not even briefly. VACUUM INTO creates its output with
+// the process umask (0644 by default) and it can only be chmod'd once the
+// copy finishes, so the file is staged inside a 0700 directory instead.
+func TestBackupIsNeverWorldReadable(t *testing.T) {
+	dbPath, _ := seed(t)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "backup.db")
+
+	if err := runCLI(t, dbPath, "backup", "--to", dest); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("backup mode = %o, want 600", perm)
+	}
+	// The staging directory is what closes the window during the copy;
+	// assert it is cleaned up rather than left behind at 0700.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "backup.db" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("destination directory holds %v, want just backup.db", names)
+	}
+}

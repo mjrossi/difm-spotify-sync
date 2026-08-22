@@ -304,3 +304,57 @@ func TestReportCarriesRuns(t *testing.T) {
 		t.Error("Runs[0] should be the newest (errored) run")
 	}
 }
+
+// The verdict must not depend on how many runs the caller asked to see.
+//
+// It did: health() scans for the newest *qualifying* row, so a small
+// runLimit silently narrowed the search as well as the listing. /healthz
+// passed 1, and because the engine opens a sync_runs row when a pass
+// starts and closes it when it ends, the only visible row for the whole
+// duration of every pass was the in-flight one — so /healthz reported 503
+// through every sync while `status --check` reported ok.
+func TestHealthIgnoresRunLimit(t *testing.T) {
+	ctx := context.Background()
+	s, account := newStore(t)
+
+	// A clean pass, then a pass currently in flight on top of it.
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+	if _, err := s.StartRun(ctx, account.ID, false); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	for _, limit := range []int{1, 2, 5, 50} {
+		rep, err := status.Build(ctx, s, testLabel, testMaxAge, limit)
+		if err != nil {
+			t.Fatalf("Build(limit=%d): %v", limit, err)
+		}
+		if !rep.Healthy {
+			t.Errorf("limit=%d: Healthy = false (%q), want true — an in-flight pass "+
+				"must not hide the clean pass behind it", limit, rep.Reason)
+		}
+		if len(rep.Runs) > limit {
+			t.Errorf("limit=%d: reported %d runs, want at most %d", limit, len(rep.Runs), limit)
+		}
+	}
+}
+
+// The in-flight row is still reported, it just does not decide the verdict.
+func TestInFlightRunIsStillListed(t *testing.T) {
+	ctx := context.Background()
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+	if _, err := s.StartRun(ctx, account.ID, false); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, status.DefaultRunLimit)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(rep.Runs) != 2 {
+		t.Fatalf("len(Runs) = %d, want 2", len(rep.Runs))
+	}
+	if rep.Runs[0].FinishedAt != "" {
+		t.Error("Runs[0] should be the in-flight pass (newest first)")
+	}
+}

@@ -21,6 +21,20 @@ import (
 // caller does not ask for a specific number.
 const DefaultRunLimit = 5
 
+// healthScanLimit is how far back the health verdict looks, independent of
+// how many rows the caller wants reported.
+//
+// These have to be separate numbers. health() scans for the newest row
+// that *qualifies* — finished, no error, not a dry run — so a caller
+// asking for a short list was silently also narrowing the search. At a
+// limit of 1 that was reliably wrong: the engine opens a sync_runs row
+// when a pass starts and closes it when it ends, so for the whole
+// duration of every pass the only visible row was the in-flight one and
+// the verdict flipped to unhealthy. A window this size also absorbs a
+// run of dry runs or failures without losing sight of the clean pass
+// behind them.
+const healthScanLimit = 20
+
 // Report is the whole operator-visible state of one account.
 //
 // Every field is populated explicitly from a typed store accessor. That
@@ -42,7 +56,12 @@ type Report struct {
 
 // Build assembles a Report. maxAge is how stale the newest clean pass may
 // be before the account is reported unhealthy; runLimit caps the number of
-// sync_runs rows carried (<= 0 means DefaultRunLimit).
+// sync_runs rows *reported* (<= 0 means DefaultRunLimit).
+//
+// runLimit deliberately does not affect Healthy. The health scan always
+// covers healthScanLimit rows and the list is truncated afterwards, so
+// two callers asking for different amounts of detail cannot disagree
+// about whether the sync is working.
 func Build(
 	ctx context.Context,
 	store *sqlite.Store,
@@ -73,9 +92,19 @@ func Build(
 	if err != nil {
 		return Report{}, err
 	}
-	runs, err := store.ListRuns(ctx, account.ID, runLimit)
+	scan := runLimit
+	if healthScanLimit > scan {
+		scan = healthScanLimit
+	}
+	runs, err := store.ListRuns(ctx, account.ID, scan)
 	if err != nil {
 		return Report{}, err
+	}
+	// Decide first, over the whole scan window, then trim to what the
+	// caller asked to see.
+	healthy, reason := health(runs, maxAge, time.Now())
+	if len(runs) > runLimit {
+		runs = runs[:runLimit]
 	}
 
 	r := Report{
@@ -89,7 +118,7 @@ func Build(
 	if !account.WatermarkLikedAt.IsZero() {
 		r.Watermark = account.WatermarkLikedAt.UTC().Format(time.RFC3339)
 	}
-	r.Healthy, r.Reason = health(runs, maxAge, time.Now())
+	r.Healthy, r.Reason = healthy, reason
 	return r, nil
 }
 
@@ -111,7 +140,8 @@ func Build(
 //     days — the precise failure this function exists to catch.
 //
 // ListRuns orders newest-first, so the first qualifying row is the one
-// that matters.
+// that matters. The caller passes the full healthScanLimit window, never
+// a caller-chosen display slice — see Build.
 func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (bool, string) {
 	if len(runs) == 0 {
 		return false, "no sync pass has run yet"

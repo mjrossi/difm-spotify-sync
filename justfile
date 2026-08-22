@@ -199,8 +199,16 @@ resync-rebuild:
 # the local database and the deployed one beats two that can drift.
 [group('ops')]
 [doc('take a consistent backup of the database (holds the Spotify refresh token)')]
-backup DEST="./tmp/difmsync-backup.db":
-    mise exec -- go run ./cmd/difmsync backup --to '{{DEST}}' --log-format=text
+backup DEST="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Timestamped by default. A fixed name worked exactly once: the command
+    # refuses to overwrite an existing snapshot (it may be the only copy of
+    # a refresh token), so a constant default turned every run after the
+    # first into an error.
+    dest='{{DEST}}'
+    [ -n "$dest" ] || dest="./tmp/difmsync-backup-$(date +%Y%m%d-%H%M%S).db"
+    mise exec -- go run ./cmd/difmsync backup --to "$dest" --log-format=text
 
 # open the local SQLite database
 [group('ops')]

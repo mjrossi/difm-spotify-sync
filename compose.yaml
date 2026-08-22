@@ -69,7 +69,10 @@ services:
       # 9090, 9100) and sits below Linux's default ephemeral range
       # (32768-60999), where a listener can collide with an outbound
       # connection's source port. Change both halves together, and
-      # DIFMSYNC_HTTP_ADDR above with them.
+      # DIFMSYNC_HTTP_ADDR in .env.defaults with them — it moved there
+      # when the dotenv layers were introduced, and following this comment
+      # to the `environment:` block below would produce exactly the silent
+      # mismatch it is warning about.
       #
       # Narrow to a single interface (e.g. "192.168.1.10:3436:3436") if
       # you would rather not answer on all of them.

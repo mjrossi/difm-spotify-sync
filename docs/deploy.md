@@ -352,6 +352,13 @@ writing it *over* the live database:
 
 ```sh
 docker compose stop connector
+
+# Both sidecars must go, and the container is stopped — so do it from a
+# throwaway container on the same volume. Confirm the volume name with
+# `docker volume ls`; Compose namespaces it by project directory.
+docker run --rm -v difm-spotify-sync_difmsync-data:/data alpine \
+  rm -f /data/difmsync.db-wal /data/difmsync.db-shm
+
 docker compose cp ./difmsync-backup.db connector:/data/difmsync.db
 docker compose start connector
 docker compose exec connector /app/difmsync status
@@ -360,6 +367,24 @@ docker compose exec connector /app/difmsync status
 Stop first: copying over a database with a live writer attached is how you
 get a corrupt one. If `/data` is a bind mount, `chown 65532:65532` the
 restored file — see [Volume ownership](#volume-ownership).
+
+**The `rm` is not optional, and skipping it fails silently.** The database
+runs in WAL mode, so committed pages can live in the `-wal` file rather
+than in the database file. `difmsync backup` produces a single
+self-contained snapshot with no WAL of its own, so copying it into place
+beside a *stale* `-wal` means SQLite replays that leftover log over your
+restored content on the next open. The restore is discarded, the old
+database comes back, and `difmsync status` afterwards reports success —
+there is nothing to notice, because as far as SQLite is concerned nothing
+went wrong.
+
+A clean `docker compose stop` checkpoints and removes the sidecars, so in
+the happy path they are already gone and the `rm -f` does nothing. It
+matters when the process did not exit cleanly: a SIGKILL after the 45s
+grace period, a host crash, or the OOM killer (this deployment sets a
+256M limit). Those are the circumstances that make you reach for a backup
+in the first place, so the step belongs in the sequence rather than in a
+footnote.
 
 After a restore the ledger may be behind the playlist's real contents.
 That is safe to fix: each pass reconciles against the live playlist before
