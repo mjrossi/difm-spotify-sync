@@ -43,15 +43,61 @@ const healthScanLimit = 20
 // WatermarkLikedAt — cannot reach the JSON encoder by accident. See
 // TestReportCarriesNoSecrets.
 type Report struct {
-	Account   string           `json:"account"`
-	Playlist  string           `json:"playlist"`
-	Synced    int64            `json:"synced"`
-	Pending   int64            `json:"pending"`
-	Skipped   int64            `json:"skipped"`
-	Watermark string           `json:"watermark"`
-	Runs      []sqlite.SyncRun `json:"runs"`
-	Healthy   bool             `json:"healthy"`
-	Reason    string           `json:"reason,omitempty"`
+	Account   string `json:"account"`
+	Playlist  string `json:"playlist"`
+	Synced    int64  `json:"synced"`
+	Pending   int64  `json:"pending"`
+	Skipped   int64  `json:"skipped"`
+	Watermark string `json:"watermark"`
+	Runs      []Run  `json:"runs"`
+	Healthy   bool   `json:"healthy"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// Run is one recorded pass as the operator surface reports it.
+//
+// This exists rather than serving sqlite.SyncRun directly because the
+// field-by-field rule has to cover the whole payload, not just the
+// accounts row. Serving a store struct means every column added to
+// sync_runs later is published the moment it is added, with nothing in
+// the way to catch it — which is exactly how Error got out.
+//
+// Error is json:"-" on purpose, and that is the structural half of the
+// fix rather than a formatting choice. The engine records failures as
+// err.Error() text, and that text is assembled from wherever the failure
+// came from — DI.fm request URLs, Spotify responses, file paths. None of
+// it is reviewed before it lands, so none of it can be published to an
+// endpoint that is served to the LAN unauthenticated. Failed carries the
+// one bit a JSON consumer actually needs; the text stays available to
+// the CLI, which prints it in the runs table for an operator who already
+// has the database.
+type Run struct {
+	ID         int64  `json:"id"`
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at"`
+	DryRun     bool   `json:"dry_run"`
+	Fetched    int    `json:"fetched"`
+	Added      int    `json:"added"`
+	Queued     int    `json:"queued"`
+	Skipped    int    `json:"skipped"`
+	Failed     bool   `json:"failed"`
+	Error      string `json:"-"`
+}
+
+// newRun copies one store row into the reported view, field by field.
+func newRun(r sqlite.SyncRun) Run {
+	return Run{
+		ID:         r.ID,
+		StartedAt:  r.StartedAt,
+		FinishedAt: r.FinishedAt,
+		DryRun:     r.DryRun,
+		Fetched:    r.Fetched,
+		Added:      r.Added,
+		Queued:     r.Queued,
+		Skipped:    r.Skipped,
+		Failed:     r.Error != "",
+		Error:      r.Error,
+	}
 }
 
 // Build assembles a Report. maxAge is how stale the newest clean pass may
@@ -92,10 +138,7 @@ func Build(
 	if err != nil {
 		return Report{}, err
 	}
-	scan := runLimit
-	if healthScanLimit > scan {
-		scan = healthScanLimit
-	}
+	scan := max(runLimit, healthScanLimit)
 	runs, err := store.ListRuns(ctx, account.ID, scan)
 	if err != nil {
 		return Report{}, err
@@ -106,6 +149,12 @@ func Build(
 	if len(runs) > runLimit {
 		runs = runs[:runLimit]
 	}
+	// make, not a nil slice: an account with no runs should encode as
+	// "runs": [] rather than "runs": null.
+	reported := make([]Run, 0, len(runs))
+	for _, run := range runs {
+		reported = append(reported, newRun(run))
+	}
 
 	r := Report{
 		Account:  account.Label,
@@ -113,7 +162,7 @@ func Build(
 		Synced:   synced,
 		Pending:  actionable,
 		Skipped:  pending - actionable,
-		Runs:     runs,
+		Runs:     reported,
 	}
 	if !account.WatermarkLikedAt.IsZero() {
 		r.Watermark = account.WatermarkLikedAt.UTC().Format(time.RFC3339)
@@ -131,9 +180,12 @@ func Build(
 //   - Unfinished rows are in-flight passes, or passes killed mid-run. An
 //     open row is not evidence of success.
 //   - A non-empty error column is a pass that swallowed something. The
-//     engine holds the watermark back for exactly these, so treating one
-//     as healthy would report green on the case the watermark logic
-//     exists to survive.
+//     engine holds the watermark back for exactly these, so such a row is
+//     not itself evidence of success. Note this disqualifies the *row*,
+//     not the account: the loop below keeps scanning, so an errored newest
+//     run still reports healthy when a clean pass behind it is inside
+//     maxAge. That is intended — the sync is demonstrably working — and
+//     TestHealth pins it.
 //   - Dry runs are excluded because the deployed loop never dry-runs. A
 //     stale `just dry-run` from a debugging session would otherwise keep
 //     the probe green over a daemon that has not completed a real pass in
@@ -170,10 +222,19 @@ func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (bool, s
 
 // describe summarizes why one run did not count, for the unhealthy reason
 // string. The newest run is the most useful one to name.
+//
+// The recorded error text is deliberately *not* interpolated here, even
+// though it is the most informative thing available. Reason is written
+// verbatim by /healthz on the 503 path — as plain text, to an endpoint
+// served unauthenticated on the LAN — so anything this returns is
+// published. Recorded error text is assembled from whatever failed and is
+// reviewed by nobody; the Run.Error comment above has the longer version.
+// Naming the run and pointing at the CLI keeps the reason actionable
+// without turning the probe into a disclosure channel.
 func describe(run sqlite.SyncRun) string {
 	switch {
 	case run.Error != "":
-		return "newest run errored: " + run.Error
+		return "newest run errored — run `difmsync status` for the error text"
 	case run.FinishedAt == "":
 		return "newest run is still in flight or was killed mid-pass"
 	case run.DryRun:

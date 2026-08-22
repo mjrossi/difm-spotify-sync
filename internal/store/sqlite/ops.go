@@ -436,19 +436,18 @@ func (s *Store) BackupTo(ctx context.Context, dest string) error {
 
 // SyncRun is one recorded pass.
 //
-// Tagged because this type is served verbatim inside /status.json, and a
-// document that mixes Go-cased and snake_cased keys is nobody's idea of
-// an API. The other store types are untagged; they have no HTTP consumer.
+// Untagged, like every other store type. This was briefly tagged for
+// JSON, back when status.Report embedded it directly; serving a store
+// struct is what published the Error column to an unauthenticated
+// endpoint. internal/status copies it into its own status.Run instead —
+// the JSON shape belongs to the operator surface, not here.
 type SyncRun struct {
-	ID         int64  `json:"id"`
-	StartedAt  string `json:"started_at"`
-	FinishedAt string `json:"finished_at"`
-	DryRun     bool   `json:"dry_run"`
-	Fetched    int    `json:"fetched"`
-	Added      int    `json:"added"`
-	Queued     int    `json:"queued"`
-	Skipped    int    `json:"skipped"`
-	Error      string `json:"error"`
+	ID                              int64
+	StartedAt                       string
+	FinishedAt                      string
+	DryRun                          bool
+	Fetched, Added, Queued, Skipped int
+	Error                           string
 }
 
 // ListRuns returns recent passes, newest first. A failed pass is recorded

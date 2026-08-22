@@ -103,7 +103,7 @@ func backupCommand() *cli.Command {
 			// empty file is the worst outcome available here. Verifying
 			// before the rename means an unusable snapshot never reaches the
 			// destination to be mistaken for a good one later.
-			if err := verifyBackup(ctx, tmp, c.String("account")); err != nil {
+			if err := verifyBackup(ctx, tmp, dest, c.String("account")); err != nil {
 				return fmt.Errorf("%w — check --db-path points at the database you meant", err)
 			}
 
@@ -122,19 +122,26 @@ func backupCommand() *cli.Command {
 	}
 }
 
-// verifyBackup opens the snapshot and confirms it carries the account.
+// verifyBackup opens the snapshot at path and confirms it carries the
+// account.
 //
 // Deliberately no Migrate: this must read what was written, not repair it
 // into looking valid.
-func verifyBackup(ctx context.Context, path, label string) error {
+//
+// dest is reported rather than path because the two differ by design and
+// only one of them survives: path is inside the staging directory, which
+// the deferred RemoveAll deletes on exactly the failure paths that
+// produce these messages. Naming it sent operators looking for a file
+// that no longer exists.
+func verifyBackup(ctx context.Context, path, dest, label string) error {
 	store, err := sqlite.Open(path)
 	if err != nil {
-		return fmt.Errorf("backup at %s does not open as a database: %w", path, err)
+		return fmt.Errorf("the snapshot staged for %s does not open as a database: %w", dest, err)
 	}
 	defer func() { _ = store.Close() }()
 
 	if _, err := store.GetAccount(ctx, label); err != nil {
-		return fmt.Errorf("backup at %s has no %q account row: %w", path, label, err)
+		return fmt.Errorf("the snapshot staged for %s has no %q account row: %w", dest, label, err)
 	}
 	return nil
 }

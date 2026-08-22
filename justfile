@@ -168,14 +168,17 @@ ledger:
 runs:
     @mise exec -- go run ./cmd/difmsync status --limit=10
 
-# Clears the track's ledger row AND the watermark. Both suppress a re-add,
-# and clearing only the ledger is a silent no-op — the watermark filters at
-# fetch time, so the like is never retrieved. Find ids with `just ledger`,
-# then run `just sync` to actually re-add. Example: just resync-track 3057639
+# Clears the track's ledger row AND rewinds the watermark. Both suppress a
+# re-add, and clearing only the ledger is a silent no-op — the watermark
+# filters at fetch time, so the like is never retrieved. `--forget` does
+# both on its own; `--all` is deliberately NOT passed, because it would
+# clear the watermark instead of rewinding it and re-read all of history.
+# Find ids with `just ledger`, then `just sync` to actually re-add.
+# Example: just resync-track 3057639
 [group('ops')]
 [doc('re-add ONE track you deleted from Spotify (takes a DI.fm track id)')]
 resync-track ID:
-    mise exec -- go run ./cmd/difmsync resync --forget={{ID}} --all
+    mise exec -- go run ./cmd/difmsync resync --forget={{ID}}
 
 # Nothing already synced is forgotten, so this adds nothing that is already
 # in the playlist. Useful after changing matching thresholds, or to pick up

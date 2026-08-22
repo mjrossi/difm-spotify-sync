@@ -113,7 +113,7 @@ func TestCallbackTarget(t *testing.T) {
 
 // clearEnv unsets every DIFMSYNC_* variable for the duration of a test.
 // Without it these tests inherit the developer's real configuration —
-// mise.local.toml exports live credentials — and assertions about
+// .env.local exports live credentials — and assertions about
 // missing configuration pass or fail depending on whose machine runs
 // them.
 func clearEnv(t *testing.T) {
@@ -629,4 +629,87 @@ func TestBackupIsNeverWorldReadable(t *testing.T) {
 		}
 		t.Errorf("destination directory holds %v, want just backup.db", names)
 	}
+}
+
+// TestStatusCheckIsTheHealthcheckContract exercises `status --check`
+// through the CLI, with the exact argv compose.yaml's healthcheck runs.
+//
+// internal/status covers the health rule itself; what nothing covered was
+// the wiring between that rule and the command line. compose.yaml pins
+// `["CMD", "/app/difmsync", "status", "--check"]` and reads *only* the
+// exit code, so a renamed flag, a subcommand that stops returning an
+// error, or --max-age losing its env source all ship green here and
+// surface as a container that is permanently unhealthy — a failure mode
+// with no error message anywhere, because the check never ran.
+func TestStatusCheckIsTheHealthcheckContract(t *testing.T) {
+	ctx := context.Background()
+
+	// recordRun writes one finished, non-dry run backdated by age.
+	recordRun := func(t *testing.T, dbPath string, accountID int64, age time.Duration) {
+		t.Helper()
+		store, err := sqlite.Open(dbPath)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+		at := time.Now().Add(-age)
+		store.SetClock(func() time.Time { return at })
+		id, err := store.StartRun(ctx, accountID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := store.FinishRun(ctx, id, sqlite.RunStats{Added: 1}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+
+	t.Run("fresh clean pass exits zero", func(t *testing.T) {
+		dbPath, account := seed(t)
+		recordRun(t, dbPath, account.ID, time.Minute)
+		if err := runCLI(t, dbPath, "status", "--check"); err != nil {
+			t.Errorf("status --check on a fresh pass = %v, want nil", err)
+		}
+	})
+
+	t.Run("stale pass exits non-zero", func(t *testing.T) {
+		dbPath, account := seed(t)
+		recordRun(t, dbPath, account.ID, 3*time.Hour)
+		err := runCLI(t, dbPath, "status", "--check")
+		if err == nil {
+			t.Fatal("status --check on a 3h-old pass = nil, want an error")
+		}
+		// The message is the healthcheck's only output, and it lands in
+		// `docker inspect`. An empty or generic one is why an operator
+		// ends up reading source to find out what is wrong.
+		if !strings.Contains(err.Error(), "last clean pass") {
+			t.Errorf("unhealthy reason = %q, want it to name the stale pass", err)
+		}
+	})
+
+	t.Run("before auth exits non-zero", func(t *testing.T) {
+		// The pre-auth window is why compose.yaml sets a 30m start_period.
+		// A fresh deployment has no account row at all, and the check has
+		// to fail rather than panic on the missing row.
+		clearEnv(t)
+		dbPath := filepath.Join(t.TempDir(), "empty.db")
+		if err := runCLI(t, dbPath, "status", "--check"); err == nil {
+			t.Error("status --check with no account = nil, want an error")
+		}
+	})
+
+	t.Run("--max-age reads DIFMSYNC_STATUS_MAX_AGE", func(t *testing.T) {
+		// docs/deploy.md tells operators to shrink --max-age to see the
+		// unhealthy branch without waiting out a real stall, and the
+		// compose healthcheck has no way to pass a flag — it goes through
+		// the environment or not at all.
+		dbPath, account := seed(t)
+		recordRun(t, dbPath, account.ID, 10*time.Minute)
+		if err := runCLI(t, dbPath, "status", "--check"); err != nil {
+			t.Fatalf("precondition: 10m-old pass should be healthy at the default max-age: %v", err)
+		}
+		t.Setenv("DIFMSYNC_STATUS_MAX_AGE", "1s")
+		if err := runCLI(t, dbPath, "status", "--check"); err == nil {
+			t.Error("DIFMSYNC_STATUS_MAX_AGE=1s did not make a 10m-old pass unhealthy")
+		}
+	})
 }

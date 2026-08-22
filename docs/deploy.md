@@ -50,6 +50,7 @@ container the host has to be overridden — see below.
 
 ```sh
 cp .env.local.example .env.local   # then fill in the five secrets
+chmod 600 .env.local               # nothing does this for you
 docker compose run --rm --service-ports connector auth   # one-time
 docker compose up -d
 docker compose logs -f connector
@@ -79,8 +80,23 @@ means production, matching `mise.toml`'s role, so the plain command is the
 deployment one:
 
 ```sh
-docker compose up -d                          # production
+MISE_ENV=production docker compose up -d      # production
 MISE_ENV=development docker compose up -d     # text logs, debug, 2m interval
+```
+
+Set it explicitly on the deploy, rather than relying on the `:-production`
+default. `MISE_ENV` is read from *your* shell, and any shell with mise
+active for this repo already exports `MISE_ENV=development` — so a
+`docker compose up -d` typed in a working checkout picks up the
+development layer and deploys a **2m** sync interval against a private,
+undocumented API, roughly seven times the intended rate, with debug logs
+to match. It works, which is what makes it easy to miss.
+
+To confirm which layer landed, read the interval back out of the startup
+log — `Loop` records the effective value:
+
+```sh
+docker compose logs connector | grep -m1 interval
 ```
 
 Two variables are pinned in `compose.yaml`'s `environment:` block instead,
@@ -136,7 +152,7 @@ invites the mistake above.
 docker compose exec connector /app/difmsync status
 docker compose exec connector /app/difmsync review
 docker compose exec connector /app/difmsync review --approve=<difm-track-id>
-docker compose exec connector /app/difmsync resync --forget=<id> --all
+docker compose exec connector /app/difmsync resync --forget=<id>
 ```
 
 There is no shell in the image, so these are the whole interface — each
@@ -287,15 +303,24 @@ what makes them safe to expose on the LAN without authentication.
 |---|---|---|
 | `no account "default" yet` | `difmsync auth` has never run against this volume | Run the auth step above |
 | `no sync pass has run yet` | The container started but has not completed a pass | Wait one interval; then read the logs |
-| `newest run errored: …` | A pass failed and the watermark was held back | The error is the whole message — read it |
+| `newest run errored — run …` | A pass failed and the watermark was held back | `difmsync status` on the host for the error text |
 | `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 connector` |
 | `newest run is still in flight` | A pass is running, or was killed mid-run | Wait; if it persists, restart the container |
 
-For the errored case, `/status.json` carries the last few runs with their
-errors, which is usually faster than paging through logs:
+For the errored case, `/status.json` marks which passes failed, but
+**not why** — recorded error text is deliberately kept off both endpoints,
+which are served to the LAN unauthenticated and would otherwise republish
+whatever the failure happened to contain (DI.fm request URLs carry the
+member id, for one):
 
 ```sh
-curl -s http://<host>:3436/status.json | jq '.runs[] | {started_at, added, error}'
+curl -s http://<host>:3436/status.json | jq '.runs[] | {started_at, added, failed}'
+```
+
+The text itself comes from the CLI, which needs the database anyway:
+
+```sh
+docker compose exec connector /app/difmsync status
 ```
 
 A failing pass is not data loss. The watermark only advances after a fully
@@ -333,8 +358,27 @@ As a nightly cron on the host:
 ```
 
 `-T` disables TTY allocation, which cron needs. Note the escaped `\%` —
-cron treats a bare `%` as a newline. Prune old snapshots on whatever
-schedule suits you; nothing rotates them.
+cron treats a bare `%` as a newline.
+
+**Pair it with a prune.** Nothing rotates these, and `VACUUM INTO` writes
+a full copy every night into the same volume as the live database — so an
+unpruned schedule fills that volume and then stops SQLite writing, which
+takes the sync down. The backup command hardens against a full volume
+(that is why it stages and verifies before publishing), but hardening only
+means the *backup* fails cleanly; the database it shares the volume with
+still has nowhere to write.
+
+The image has no shell, so the prune runs from a throwaway container
+against the same named volume:
+
+```cron
+30 4 * * * docker run --rm -v difm-spotify-sync_difmsync-data:/data alpine \
+  find /data/backups -name 'difmsync-*.db' -mtime +14 -delete
+```
+
+Check the volume's real name with `docker volume ls` — Compose prefixes it
+with the project directory. Fourteen days is arbitrary; size it against
+how much room the volume actually has.
 
 Three things the command refuses to do, all for the same reason — the
 output is often the only copy of a refresh token, and restoring one means
@@ -397,12 +441,21 @@ The sync never re-adds what you deleted from Spotify. To override that:
 
 ```sh
 sqlite3 "$DIFMSYNC_DB_PATH" 'select difm_track_id, artist, title from synced_tracks;'
-difmsync resync --forget=<difm-track-id> --all
+difmsync resync --forget=<difm-track-id>
 difmsync sync
 ```
 
-`--all` is not optional in practice: it clears the watermark, without which
-the like is never re-read regardless of the ledger.
+`--forget` on its own is the whole instruction. Two things suppress a
+re-add and both have to go — the ledger row and the watermark, which
+filters at *fetch* time, so a cleared ledger row alone leaves the like
+unreachable. `--forget` handles both: it drops the row and rewinds the
+watermark to one second before that like.
+
+Do **not** add `--all` here, even though it sounds like the thorough
+choice. `--all` clears the watermark outright instead of rewinding it,
+which re-reads the entire like history rather than the one track you
+named. It is a much larger instruction, and it suppresses the targeted
+rewind rather than adding to it.
 
 To rebuild the ledger from scratch — after restoring a backup, say —
 `difmsync resync --forget-all` then `difmsync sync`. No duplicates result;

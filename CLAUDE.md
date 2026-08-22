@@ -207,12 +207,50 @@ Two consequences for code:
   structural exclusion is what keeps it out of the JSON, and
   `TestReportCarriesNoSecrets` is what keeps that true.
 
+  This covers the **whole payload**, not just the accounts row. `Runs`
+  was briefly `[]sqlite.SyncRun`, and serving that store struct published
+  `sync_runs.error` — which carried the DI.fm member id, because
+  `*url.Error` embeds the request URL and the member id is a path segment
+  of every `track_votes` request. `status.Run` exists to keep the
+  exclusion structural; a column added to `sync_runs` must not be able to
+  publish itself.
+
+- **Recorded error text never reaches the endpoints.** It is assembled
+  from whatever failed and reviewed by nobody, so both channels that can
+  carry it are closed: `status.Run.Error` is `json:"-"` (the CLI table
+  still prints it), and `describe()` names the failing run without
+  interpolating its text, because `Reason` is written verbatim as plain
+  text by `/healthz` on the 503 path. Fixing one channel and not the
+  other leaves the id served to whatever polls the probe.
+  `TestEndpointsCarryNoSecretsFromAFailedRun` covers both; a fixture with
+  a *clean* run passes either way, which is how this got out.
+
+  `pkg/difm` scrubs the member id at the source as well
+  (`scrubMemberID`), so the two defenses are independent.
+
 The health rule itself: the newest `sync_runs` row that finished,
 recorded no error, and was **not** a dry run must be within
-`--max-age`. The dry-run clause is load-bearing — the deployed loop never
-dry-runs, so without it a stale `just dry-run` from a debugging session
-keeps the probe green over a daemon that has not completed a real pass in
-days.
+`--max-age`, **and must be within the last `healthScanLimit` (20) rows**.
+The dry-run clause is load-bearing — the deployed loop never dry-runs, so
+without it a stale `just dry-run` from a debugging session keeps the probe
+green over a daemon that has not completed a real pass in days.
+
+The row-count clause is a real part of the rule, not an implementation
+detail, so it is stated here rather than left to be discovered. It is
+unreachable at production defaults (20 rows at a 15m interval spans ~5h,
+well past the 45m `--max-age`) but reachable under
+`MISE_ENV=development`, where 20 rows at 2m is 40m — inside the same 45m
+window. There, a clean pass with 20 failures stacked on top of it reports
+unhealthy. That verdict is arguably the better one, which is why the
+window stays; what is not acceptable is the two disagreeing silently.
+
+The scan window is deliberately decoupled from the caller's display
+limit. `health()` looks for the newest *qualifying* row, so letting a
+caller asking for a short list also narrow the search made `/healthz`
+disagree with `status --check` for the duration of every pass — the
+engine opens a `sync_runs` row when a pass starts, so at a limit of 1 the
+only visible row was the in-flight one. `Build` scans the fixed window,
+decides, and truncates afterwards; `TestHealthIgnoresRunLimit` pins it.
 
 ## Credentials
 

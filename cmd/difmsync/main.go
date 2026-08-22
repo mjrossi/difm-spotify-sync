@@ -333,6 +333,16 @@ func syncCommand() *cli.Command {
 			}
 
 			if !c.Bool("loop") {
+				// The endpoints only exist for the lifetime of the process,
+				// so serving them for one pass would mean a listener that
+				// disappears before anything could poll it. Saying so beats
+				// ignoring the flag: a compose file with --http-addr and no
+				// --loop otherwise looks configured and answers nothing.
+				if c.String("http-addr") != "" {
+					log.Warn("--http-addr is ignored without --loop; the status endpoints "+
+						"are served only by the sync loop",
+						"addr", c.String("http-addr"))
+				}
 				_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
 				return err
 			}
@@ -350,6 +360,12 @@ func syncCommand() *cli.Command {
 		},
 	}
 }
+
+// workDrainTimeout bounds how long serveWhile waits for the sync loop to
+// stop after the status server has died. Sized to let the pass in flight
+// finish its Spotify write and close its sync_runs row; past that, the
+// restart policy is a better answer than waiting.
+const workDrainTimeout = 30 * time.Second
 
 // serveWhile runs the read-only status endpoints for as long as work is
 // running, and returns whichever of the two finishes first.
@@ -376,7 +392,18 @@ func serveWhile(
 		return fmt.Errorf("listen on %s for the status endpoints: %w", addr, err)
 	}
 
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	// All four timeouts, not just the one the linter asks for. These
+	// endpoints are reachable by anything on the LAN, and a connection
+	// opened and left idle otherwise occupies the server indefinitely.
+	// WriteTimeout is comfortably above handlerTimeout so a slow database
+	// read still returns its own 503 rather than being cut off mid-body.
+	srv := &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	serveErr := make(chan error, 1)
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -399,8 +426,17 @@ func serveWhile(
 		}
 	}()
 
+	// Cancelable so the server-died path can stop the sync loop rather
+	// than abandon it. Without this, returning below unwinds into the
+	// caller's `defer store.Close()` while a pass is still running, and
+	// the database closes underneath an in-flight FinishRun — which turns
+	// the last line of the log an operator is reading into a spurious
+	// "sql: database is closed" on top of the real failure.
+	workCtx, stopWork := context.WithCancel(ctx)
+	defer stopWork()
+
 	workErr := make(chan error, 1)
-	go func() { workErr <- work(ctx) }()
+	go func() { workErr <- work(workCtx) }()
 
 	select {
 	case err := <-serveErr:
@@ -408,6 +444,19 @@ func serveWhile(
 		// but it is now unobservable — and an unobservable daemon is the
 		// exact failure this endpoint exists to prevent. Surface it and
 		// let the restart policy start a whole one.
+		//
+		// Wind the loop down first. Engine.Loop returns on cancellation
+		// once the pass in flight finishes, so this waits for a clean
+		// stopping point rather than cutting one short. The timeout keeps
+		// a wedged pass from holding the process open forever; the
+		// restart policy is the backstop for that case.
+		stopWork()
+		select {
+		case <-workErr:
+		case <-time.After(workDrainTimeout):
+			log.Warn("sync loop did not stop within the drain timeout",
+				"timeout", workDrainTimeout)
+		}
 		if err != nil {
 			return fmt.Errorf("status server: %w", err)
 		}

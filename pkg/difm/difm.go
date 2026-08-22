@@ -274,6 +274,42 @@ type pageResult struct {
 	dropped int
 }
 
+// scrubMemberID rewrites a transport error so the member id cannot travel
+// with it.
+//
+// net/http returns *url.Error from both NewRequest and Do, and *url.Error
+// embeds the full request URL in its Error() text. This client puts the
+// member id in the path, so an unscrubbed transport failure — a DNS blip,
+// a timeout, a refused connection — carries the id into the error the
+// engine records in sync_runs.error, and from there onto the status
+// endpoints, which are served to the LAN without authentication.
+//
+// The id is not a credential on its own, but it is half of the DI.fm
+// capture and a status page has no reason to publish it. The host and
+// path are kept, because "which request failed" is the useful part.
+//
+// Call this with the error exactly as net/http returned it, before any
+// wrapping of our own is added. errors.As matches a *url.Error at any
+// depth, and what comes back is the scrubbed *url.Error alone — so
+// handing this an already-wrapped error would drop the outer context.
+// Both call sites below add their context afterwards, to the return
+// value, which is why there is none to lose.
+func (c *Client) scrubMemberID(err error) error {
+	if c.MemberID == "" {
+		return err
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	// Clone rather than mutate: the *url.Error belongs to the caller's
+	// error chain. Copying keeps ue.Err intact, so errors.Is against
+	// context.Canceled and friends still works at the call site.
+	clone := *ue
+	clone.URL = strings.ReplaceAll(clone.URL, url.PathEscape(c.MemberID), "<member-id>")
+	return &clone
+}
+
 func (c *Client) fetchPage(ctx context.Context, page int) (pageResult, error) {
 	q := url.Values{}
 	q.Set("vote_type", "up")
@@ -285,7 +321,7 @@ func (c *Client) fetchPage(ctx context.Context, page int) (pageResult, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return pageResult{}, fmt.Errorf("difm: build request: %w", err)
+		return pageResult{}, fmt.Errorf("difm: build request: %w", c.scrubMemberID(err))
 	}
 	// Header rather than ?api_key= so the credential stays out of access logs.
 	req.Header.Set("X-API-Key", c.APIKey)
@@ -293,7 +329,7 @@ func (c *Client) fetchPage(ctx context.Context, page int) (pageResult, error) {
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return pageResult{}, fmt.Errorf("difm: get track_votes page %d: %w", page, err)
+		return pageResult{}, fmt.Errorf("difm: get track_votes page %d: %w", page, c.scrubMemberID(err))
 	}
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
 

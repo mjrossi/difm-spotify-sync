@@ -158,9 +158,14 @@ so dropping a ledger row alone leaves the like unreachable — it is never
 retrieved to begin with.
 
 ```sh
-difmsync resync --forget=<difm-track-id> --all   # drop ledger row + clear watermark
-difmsync sync                                     # re-adds it
+difmsync resync --forget=<difm-track-id>   # drops the row, rewinds the watermark
+difmsync sync                              # re-adds it
 ```
+
+`--forget` clears both suppressors by itself: it drops the ledger row and
+rewinds the watermark to just before that like. Adding `--all` is not a
+stronger version of the same thing — it clears the watermark entirely,
+re-reading all of history instead of the one track named.
 
 Find the track id with `sqlite3 "$DIFMSYNC_DB_PATH" 'select difm_track_id, artist, title from synced_tracks'`.
 A track id that isn't in the ledger is reported rather than silently ignored.

@@ -197,6 +197,100 @@ func TestReportCarriesNoSecrets(t *testing.T) {
 	}
 }
 
+// errWithMemberID is what a DI.fm transport failure used to look like by
+// the time it reached sync_runs.error: net/http returns *url.Error, whose
+// Error() embeds the request URL, and the member id is a path segment of
+// every track_votes request.
+var errWithMemberID = errors.New(
+	`sync pass incomplete: difm: get track_votes page 1: Get ` +
+		`"https://api.audioaddict.com/v1/di/members/` + testMemberID +
+		`/track_votes?page=1": dial tcp: lookup api.audioaddict.com: no such host`)
+
+// TestEndpointsCarryNoSecretsFromAFailedRun covers the path the test
+// above cannot: a pass that *failed*.
+//
+// The fixture matters more than the assertions here. TestReportCarriesNoSecrets
+// records a clean run, so sync_runs.error is empty and every leak channel
+// it might have exercised is dormant — it passed just as happily when the
+// report embedded the store struct verbatim. Recorded error text is
+// attacker-uncontrolled but author-unreviewed: it is assembled from
+// whatever failed, and nothing between there and the encoder looks at it.
+//
+// Both endpoints are checked because they leak independently. /status.json
+// carried it in runs[].error; /healthz never renders runs at all and
+// carried the same id in its plain-text reason, via describe(). Fixing
+// only the first leaves the second serving it to whatever polls the probe.
+func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
+	s, account := newStore(t)
+	// Newest run failed, and nothing clean behind it — so health() has to
+	// fall through to describe(), which is the /healthz leak channel.
+	recordRun(t, s, account.ID, time.Minute, false, errWithMemberID)
+
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	defer srv.Close()
+
+	for _, path := range []string{"/status.json", "/healthz"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if strings.Contains(string(body), testMemberID) {
+				t.Errorf("%s leaked the DI.fm member id from a failed run: %s", path, body)
+			}
+			if strings.Contains(string(body), refreshToken) {
+				t.Errorf("%s leaked the Spotify refresh token: %s", path, body)
+			}
+			// The endpoint must still say something. A body that reported
+			// nothing would pass the checks above for the wrong reason.
+			if len(strings.TrimSpace(string(body))) == 0 {
+				t.Fatal("empty body")
+			}
+		})
+	}
+}
+
+// TestCLIKeepsTheErrorText is the other half of the fix. Redacting the
+// endpoints is only correct if the text is still reachable somewhere —
+// otherwise a failing deployment becomes undiagnosable, which is a worse
+// outcome than the disclosure. status.Run keeps it as an untagged field
+// for the CLI table.
+func TestCLIKeepsTheErrorText(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, errPass)
+
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(rep.Runs) != 1 {
+		t.Fatalf("got %d runs, want 1", len(rep.Runs))
+	}
+	if !strings.Contains(rep.Runs[0].Error, "search failed") {
+		t.Errorf("Run.Error = %q, want it to carry the recorded text", rep.Runs[0].Error)
+	}
+	if !rep.Runs[0].Failed {
+		t.Error("Run.Failed = false, want true for a run that recorded an error")
+	}
+
+	// ...and the same value must not survive the JSON encoder.
+	blob, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(blob), "search failed") {
+		t.Errorf("encoded report carries the error text: %s", blob)
+	}
+	if !strings.Contains(string(blob), `"failed":true`) {
+		t.Errorf("encoded report drops the failed flag, leaving no signal at all: %s", blob)
+	}
+}
+
 func TestHealthzStatusCodes(t *testing.T) {
 	tests := []struct {
 		name     string
