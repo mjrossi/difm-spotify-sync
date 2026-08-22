@@ -237,6 +237,22 @@ func requireFlags(c *cli.Command, names ...string) error {
 	return nil
 }
 
+// requireAccount loads the configured account, turning the store's bare
+// "no rows" into the one thing the operator can act on.
+//
+// Every subcommand that reads an existing account needs this same
+// translation: `auth` is what creates the row, and until it has run there
+// is nothing to read. sync and auth deliberately do not go through here —
+// they call EnsureAccount, which creates the row rather than requiring it.
+func requireAccount(ctx context.Context, c *cli.Command, store *sqlite.Store) (sqlite.Account, error) {
+	account, err := store.GetAccount(ctx, c.String("account"))
+	if err != nil {
+		return sqlite.Account{}, fmt.Errorf("no account %q yet — run `difmsync auth` first: %w",
+			c.String("account"), err)
+	}
+	return account, nil
+}
+
 func syncCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "sync",
@@ -485,10 +501,9 @@ func reviewCommand() *cli.Command {
 			}
 			defer func() { _ = store.Close() }()
 
-			account, err := store.GetAccount(ctx, c.String("account"))
+			account, err := requireAccount(ctx, c, store)
 			if err != nil {
-				return fmt.Errorf("no account %q yet — run `difmsync auth` first: %w",
-					c.String("account"), err)
+				return err
 			}
 
 			if id := c.Int("approve"); id != 0 {

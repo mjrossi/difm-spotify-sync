@@ -221,17 +221,7 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 			// put the ledger ahead of the Spotify write, inverting the
 			// first invariant. Deferring keeps every ledger row behind the
 			// add, in the one transaction with the watermark.
-			pendingLedge = append(pendingLedge, sqlite.SyncedTrack{
-				AccountID:      account.ID,
-				DifmTrackID:    like.TrackID,
-				DifmVoteID:     like.VoteID,
-				SpotifyTrackID: best.ID,
-				PlaylistID:     e.PlaylistID,
-				Artist:         like.Artist,
-				Title:          like.Title,
-				MatchScore:     best.Score,
-				LikedAt:        like.LikedAt,
-			})
+			pendingLedge = append(pendingLedge, e.ledgerEntry(account.ID, like, best))
 
 		case ok && best.Score >= e.Thresholds.Auto:
 			e.Log.Info("match",
@@ -239,17 +229,7 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 				"spotify", best.Artist+" - "+best.Title,
 				"score", roundTo(best.Score, 3))
 			pendingIDs = append(pendingIDs, best.ID)
-			pendingLedge = append(pendingLedge, sqlite.SyncedTrack{
-				AccountID:      account.ID,
-				DifmTrackID:    like.TrackID,
-				DifmVoteID:     like.VoteID,
-				SpotifyTrackID: best.ID,
-				PlaylistID:     e.PlaylistID,
-				Artist:         like.Artist,
-				Title:          like.Title,
-				MatchScore:     best.Score,
-				LikedAt:        like.LikedAt,
-			})
+			pendingLedge = append(pendingLedge, e.ledgerEntry(account.ID, like, best))
 			// Mark it present immediately. Two DI.fm likes can resolve to
 			// one Spotify track — the same recording liked on two channels,
 			// or two DI.fm ids for the same release — and without this the
@@ -384,6 +364,28 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 	e.Log.Info("sync complete",
 		"added", stats.Added, "queued", stats.Queued, "skipped", stats.Skipped)
 	return stats, nil
+}
+
+// ledgerEntry builds the idempotency ledger row for a like that resolved
+// to a Spotify track.
+//
+// Both auto-add branches produce the identical row — one for a track this
+// pass posts, one for a track reconciliation already found in the
+// playlist — and they must stay identical. These rows are what IsSynced
+// reads on later passes, so a field populated on one path and not the
+// other makes a track look unsynced forever and re-search every tick.
+func (e *Engine) ledgerEntry(accountID int64, like difm.Track, best match.Scored) sqlite.SyncedTrack {
+	return sqlite.SyncedTrack{
+		AccountID:      accountID,
+		DifmTrackID:    like.TrackID,
+		DifmVoteID:     like.VoteID,
+		SpotifyTrackID: best.ID,
+		PlaylistID:     e.PlaylistID,
+		Artist:         like.Artist,
+		Title:          like.Title,
+		MatchScore:     best.Score,
+		LikedAt:        like.LikedAt,
+	}
 }
 
 func (e *Engine) enqueue(ctx context.Context, like difm.Track, candidates []match.Scored, reason string) error {

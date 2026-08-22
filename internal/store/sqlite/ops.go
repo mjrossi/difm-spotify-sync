@@ -170,6 +170,35 @@ type ReviewItem struct {
 	LikedAt       time.Time
 }
 
+// toReviewItem flattens a queue row, the single place the mapping lives.
+// Both accessors read the same sqlc row type, and they drifted apart once
+// already: a column added to review_queue has to reach the listing and
+// the single-item lookup together, or `review --approve` decides on a
+// field that `review` never showed.
+//
+// A malformed candidates blob is tolerated rather than fatal — the row's
+// own fields are still useful to a human reviewer — and so is an
+// unparseable liked_at, which leaves LikedAt zero.
+func toReviewItem(r sqlitegen.ReviewQueue) ReviewItem {
+	item := ReviewItem{
+		AccountID:   r.AccountID,
+		DifmTrackID: r.DifmTrackID,
+		DifmVoteID:  r.DifmVoteID,
+		Artist:      r.Artist,
+		Title:       r.Title,
+		DurationSec: int(r.DurationSec),
+		DetailsURL:  r.DetailsUrl,
+		BestScore:   r.BestScore,
+		Reason:      r.Reason,
+		Status:      r.Status,
+	}
+	_ = json.Unmarshal([]byte(r.CandidatesJson), &item.Candidates)
+	if ts, err := time.Parse(TimeFormat, r.LikedAt); err == nil {
+		item.LikedAt = ts.UTC()
+	}
+	return item
+}
+
 // Enqueue records a like that did not auto-add.
 func (s *Store) Enqueue(ctx context.Context, item ReviewItem) error {
 	payload, err := json.Marshal(item.Candidates)
@@ -206,25 +235,7 @@ func (s *Store) ListReview(ctx context.Context, accountID int64, status string, 
 	}
 	out := make([]ReviewItem, 0, len(rows))
 	for _, r := range rows {
-		item := ReviewItem{
-			AccountID:   r.AccountID,
-			DifmTrackID: r.DifmTrackID,
-			DifmVoteID:  r.DifmVoteID,
-			Artist:      r.Artist,
-			Title:       r.Title,
-			DurationSec: int(r.DurationSec),
-			DetailsURL:  r.DetailsUrl,
-			BestScore:   r.BestScore,
-			Reason:      r.Reason,
-			Status:      r.Status,
-		}
-		// A malformed candidates blob must not sink the whole listing —
-		// the row's own fields are still useful to a human reviewer.
-		_ = json.Unmarshal([]byte(r.CandidatesJson), &item.Candidates)
-		if ts, err := time.Parse(TimeFormat, r.LikedAt); err == nil {
-			item.LikedAt = ts.UTC()
-		}
-		out = append(out, item)
+		out = append(out, toReviewItem(r))
 	}
 	return out, nil
 }
@@ -255,23 +266,7 @@ func (s *Store) GetReviewItem(ctx context.Context, accountID, trackID int64) (Re
 	if err != nil {
 		return ReviewItem{}, fmt.Errorf("sqlite.GetReviewItem(%d): %w", trackID, err)
 	}
-	item := ReviewItem{
-		AccountID:   r.AccountID,
-		DifmTrackID: r.DifmTrackID,
-		DifmVoteID:  r.DifmVoteID,
-		Artist:      r.Artist,
-		Title:       r.Title,
-		DurationSec: int(r.DurationSec),
-		DetailsURL:  r.DetailsUrl,
-		BestScore:   r.BestScore,
-		Reason:      r.Reason,
-		Status:      r.Status,
-	}
-	_ = json.Unmarshal([]byte(r.CandidatesJson), &item.Candidates)
-	if ts, err := time.Parse(TimeFormat, r.LikedAt); err == nil {
-		item.LikedAt = ts.UTC()
-	}
-	return item, nil
+	return toReviewItem(r), nil
 }
 
 // CountReview returns how many queue items carry a status. `status`
