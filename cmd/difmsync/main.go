@@ -276,6 +276,13 @@ func syncCommand() *cli.Command {
 					"address (empty disables them; only applies with --loop)",
 				Sources: cli.EnvVars("DIFMSYNC_HTTP_ADDR"),
 			},
+			&cli.StringFlag{
+				Name: "auth-http-addr",
+				Usage: "serve the one-time Spotify consent flow on this address while there " +
+					"is no refresh token, instead of exiting (empty keeps the old behavior; " +
+					"only applies with --loop)",
+				Sources: cli.EnvVars("DIFMSYNC_AUTH_HTTP_ADDR"),
+			},
 			&cli.DurationFlag{
 				Name: "max-age", Value: 45 * time.Minute,
 				Usage:   "how stale the last clean pass may be before /healthz reports unhealthy",
@@ -304,48 +311,55 @@ func syncCommand() *cli.Command {
 			auth := spotify.NewAuthenticator(c.String("spotify-client-id"),
 				c.String("spotify-client-secret"), c.String("spotify-redirect-url"))
 
-			// Persist a rotated refresh token as Spotify issues it. Held
-			// only in memory, a rotation survives until the next restart
-			// and then leaves the daemon presenting a dead token — with
-			// the interactive consent step as the only way back.
-			sp, err := auth.Client(ctx, account.SpotifyRefreshToken, func(tok string) error {
-				log.Info("spotify rotated the refresh token; persisting")
-				return store.SetSpotifyRefreshToken(ctx, account.ID, tok)
-			})
-			if err != nil {
-				return err
-			}
-
-			// Name the playlist in the log before writing to it, so a
-			// misconfigured id is obvious rather than silently wrong.
-			if name, err := sp.PlaylistName(ctx, account.SpotifyPlaylistID); err != nil {
-				// Logged, not swallowed: this is the loudest early signal
-				// that the deployment is pointed at the wrong playlist, or
-				// that the grant lost its scopes. Discarding it defeats
-				// the entire point of the check.
-				log.Warn("could not read target playlist",
-					"id", account.SpotifyPlaylistID, "err", err)
-			} else {
-				log.Info("target playlist", "id", account.SpotifyPlaylistID, "name", name)
-			}
-
 			difmClient := difm.New(c.String("api-key"), c.String("member-id"))
 			difmClient.Network = c.String("network")
 			difmClient.Logf = func(format string, args ...any) {
 				log.Warn(fmt.Sprintf(format, args...))
 			}
 
-			engine := &syncer.Engine{
-				DiFM:       difmClient,
-				Spotify:    sp,
-				Store:      store,
-				Account:    account,
-				PlaylistID: account.SpotifyPlaylistID,
-				Thresholds: syncer.Thresholds{
-					Auto:   c.Float("auto-threshold"),
-					Review: c.Float("review-threshold"),
-				},
-				Log: log,
+			// Engine construction is behind a closure rather than inline
+			// because the daemon may have to wait for consent before a
+			// Spotify client can exist at all. Both callers below reach it
+			// with a refresh token already in hand, so nothing downstream
+			// has to reason about a half-authenticated engine.
+			newEngine := func(ctx context.Context, account sqlite.Account) (*syncer.Engine, error) {
+				// Persist a rotated refresh token as Spotify issues it. Held
+				// only in memory, a rotation survives until the next restart
+				// and then leaves the daemon presenting a dead token — with
+				// the interactive consent step as the only way back.
+				sp, err := auth.Client(ctx, account.SpotifyRefreshToken, func(tok string) error {
+					log.Info("spotify rotated the refresh token; persisting")
+					return store.SetSpotifyRefreshToken(ctx, account.ID, tok)
+				})
+				if err != nil {
+					return nil, err
+				}
+
+				// Name the playlist in the log before writing to it, so a
+				// misconfigured id is obvious rather than silently wrong.
+				if name, err := sp.PlaylistName(ctx, account.SpotifyPlaylistID); err != nil {
+					// Logged, not swallowed: this is the loudest early signal
+					// that the deployment is pointed at the wrong playlist, or
+					// that the grant lost its scopes. Discarding it defeats
+					// the entire point of the check.
+					log.Warn("could not read target playlist",
+						"id", account.SpotifyPlaylistID, "err", err)
+				} else {
+					log.Info("target playlist", "id", account.SpotifyPlaylistID, "name", name)
+				}
+
+				return &syncer.Engine{
+					DiFM:       difmClient,
+					Spotify:    sp,
+					Store:      store,
+					Account:    account,
+					PlaylistID: account.SpotifyPlaylistID,
+					Thresholds: syncer.Thresholds{
+						Auto:   c.Float("auto-threshold"),
+						Review: c.Float("review-threshold"),
+					},
+					Log: log,
+				}, nil
 			}
 
 			if !c.Bool("loop") {
@@ -359,11 +373,76 @@ func syncCommand() *cli.Command {
 						"are served only by the sync loop",
 						"addr", c.String("http-addr"))
 				}
+				// The same warning for the same reason, and it matters
+				// more here: .env.defaults sets this for the whole
+				// container, so `docker compose run connector sync`
+				// inherits a consent server it will never start and
+				// fails with ErrNoCredentials instead.
+				if c.String("auth-http-addr") != "" {
+					log.Warn("--auth-http-addr is ignored without --loop; the consent flow "+
+						"is served only by the sync loop (use `difmsync auth` for a one-shot)",
+						"addr", c.String("auth-http-addr"))
+				}
+				engine, err := newEngine(ctx, account)
+				if err != nil {
+					return err
+				}
 				_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
 				return err
 			}
 
 			loop := func(ctx context.Context) error {
+				// The one step that cannot run headless, handled in-process.
+				//
+				// Returning ErrNoCredentials here is what made a missing
+				// token a crash loop rather than a prompt: the process
+				// exits, `restart: unless-stopped` starts it again, and the
+				// operator sees the same line forever with nothing to act
+				// on. With --auth-http-addr set the daemon instead serves
+				// the consent flow and waits, so the whole deployment is
+				// `up -d` plus one click.
+				//
+				// Unset, the old behavior is preserved exactly, which is
+				// what a workstation running `difmsync sync --loop` wants:
+				// fail loudly and tell the operator to run `difmsync auth`.
+				if account.SpotifyRefreshToken == "" {
+					authAddr := c.String("auth-http-addr")
+					if authAddr == "" {
+						return spotify.ErrNoCredentials
+					}
+					flow, err := newConsentFlow(auth, store, account.ID)
+					if err != nil {
+						return err
+					}
+					if err := awaitConsent(ctx, authAddr,
+						c.String("spotify-redirect-url"), flow, log); err != nil {
+						// A shutdown while waiting is a clean stop, not a
+						// failure — the same verdict Engine.Loop reaches
+						// on a canceled context. Without this the process
+						// contract disagrees with itself: an authorized
+						// daemon exits 0 on SIGTERM and one still waiting
+						// for consent exits 1, which reads as a crash to
+						// anything watching exit codes.
+						if errors.Is(err, context.Canceled) {
+							return nil
+						}
+						return err
+					}
+					// Re-read rather than patching the local copy. The token
+					// was written through the store, and everything below
+					// keys off this struct — an in-memory field set by hand
+					// here would work until someone adds a second thing
+					// consent changes.
+					updated, err := store.GetAccount(ctx, c.String("account"))
+					if err != nil {
+						return err
+					}
+					account = updated
+				}
+				engine, err := newEngine(ctx, account)
+				if err != nil {
+					return err
+				}
 				return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
 			}
 			addr := c.String("http-addr")

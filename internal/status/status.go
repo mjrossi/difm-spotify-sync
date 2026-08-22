@@ -50,8 +50,13 @@ type Report struct {
 	Skipped   int64  `json:"skipped"`
 	Watermark string `json:"watermark"`
 	Runs      []Run  `json:"runs"`
-	Healthy   bool   `json:"healthy"`
-	Reason    string `json:"reason,omitempty"`
+	// Authorized reports whether the one-time Spotify consent has been
+	// completed. A bool derived from the refresh token, never the token —
+	// the field-by-field rule above is what keeps that distinction, and
+	// TestReportCarriesNoSecrets is what keeps it true.
+	Authorized bool   `json:"authorized"`
+	Healthy    bool   `json:"healthy"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 // Run is one recorded pass as the operator surface reports it.
@@ -146,6 +151,17 @@ func Build(
 	// Decide first, over the whole scan window, then trim to what the
 	// caller asked to see.
 	healthy, reason := health(runs, maxAge, time.Now())
+	// Checked after health() rather than inside it, because health() is
+	// about whether passes are completing and this is about whether the
+	// daemon has been given the credentials to run one at all. It wins
+	// when both apply: "no sync pass has run yet" is true of a freshly
+	// deployed container, but it sends an operator to the logs looking
+	// for a failure when what is actually needed is one click.
+	authorized := account.SpotifyRefreshToken != ""
+	if !authorized {
+		healthy = false
+		reason = "awaiting Spotify consent — open the authorization URL from the daemon log"
+	}
 	if len(runs) > runLimit {
 		runs = runs[:runLimit]
 	}
@@ -157,12 +173,13 @@ func Build(
 	}
 
 	r := Report{
-		Account:  account.Label,
-		Playlist: account.SpotifyPlaylistID,
-		Synced:   synced,
-		Pending:  actionable,
-		Skipped:  pending - actionable,
-		Runs:     reported,
+		Account:    account.Label,
+		Playlist:   account.SpotifyPlaylistID,
+		Authorized: authorized,
+		Synced:     synced,
+		Pending:    actionable,
+		Skipped:    pending - actionable,
+		Runs:       reported,
 	}
 	if !account.WatermarkLikedAt.IsZero() {
 		r.Watermark = account.WatermarkLikedAt.UTC().Format(time.RFC3339)

@@ -165,6 +165,13 @@ func seed(t *testing.T) (string, sqlite.Account) {
 	if err := store.SetWatermark(ctx, account.ID, seededMark); err != nil {
 		t.Fatalf("SetWatermark: %v", err)
 	}
+	// Every scenario built on seed models a deployed, already-authorized
+	// daemon, so the fixture has to carry a refresh token: an account
+	// without one now reports unhealthy for that reason alone, which would
+	// mask whatever the test is actually asserting about health.
+	if err := store.SetSpotifyRefreshToken(ctx, account.ID, "seed-refresh-token"); err != nil {
+		t.Fatalf("SetSpotifyRefreshToken: %v", err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
