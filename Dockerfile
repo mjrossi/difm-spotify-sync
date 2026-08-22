@@ -33,6 +33,14 @@ FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/difmsync /app/difmsync
 
+# Links the published GHCR package to this repository. Not cosmetic: the
+# link is what makes the package inherit the repo's visibility (private,
+# here) and what grants the workflow's GITHUB_TOKEN write access to it.
+# Without the label the first push lands an *unlinked* package that
+# defaults to needing its own access grant, which reads as a permissions
+# bug in CI rather than a missing label.
+LABEL org.opencontainers.image.source="https://github.com/mjrossi/difm-spotify-sync"
+
 # Mounted volume for the SQLite database.
 #
 # The ownership matters and is easy to lose: Docker initializes a named
