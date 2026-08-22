@@ -172,6 +172,143 @@ migration step. The build needs BuildKit — the Dockerfile uses
 `RUN --mount=type=cache`, which the legacy builder rejects outright, so a
 host with `DOCKER_BUILDKIT=0` fails immediately rather than subtly.
 
+### Deploying into an existing Compose stack
+
+Everything above assumes this repo *is* the Compose project — `build: .`,
+`env_file` paths relative to the checkout, and a volume Compose namespaces
+`difm-spotify-sync_difmsync-data`. Adding the service to a homelab stack
+that already runs other things breaks all three at once, so pull a
+published image instead of building in place.
+
+CI publishes to GHCR on every push to `main`:
+
+| Tag | Use |
+|---|---|
+| `ghcr.io/mjrossi/difm-spotify-sync:latest` | tracks `main` |
+| `ghcr.io/mjrossi/difm-spotify-sync:sha-<short>` | immutable; what to pin |
+
+The package is **private**, because the repo is. One-time login on the
+homelab host, with a classic PAT carrying `read:packages` — the workflow's
+`GITHUB_TOKEN` writes it, but that token exists only inside Actions and
+cannot be used to pull:
+
+```sh
+printf '%s' "$GHCR_PAT" | docker login ghcr.io -u mjrossi --password-stdin
+```
+
+Then the service block, dropped into your stack's `compose.yaml`:
+
+```yaml
+  difmsync:
+    # Pin the sha in production and bump it deliberately. `latest` moves
+    # under you on the next merge, which is the one thing a homelab
+    # deployment should never do unattended.
+    image: ghcr.io/mjrossi/difm-spotify-sync:sha-abc1234
+    restart: unless-stopped
+
+    # Two layers, not four. The homelab is always production, so the
+    # `.env.${MISE_ENV:-production}` layer is dropped along with the
+    # interpolation — which also removes the footgun described above,
+    # where a shell with mise active exports MISE_ENV=development and
+    # silently deploys a 2m interval. There is no MISE_ENV to read here.
+    #
+    # Copy .env.defaults out of the repo to sit beside this file. It is
+    # committed and secret-free, but it is now a *copy* — re-copy it when
+    # upgrading, or a default added upstream silently never arrives.
+    env_file:
+      - ./difmsync/.env.defaults
+      - ./difmsync/.env.local
+
+    # Same two pins as the standalone compose.yaml, and for the same
+    # reason: this block overrides every env_file layer, and both values
+    # are facts about running in this container rather than preferences.
+    environment:
+      DIFMSYNC_DB_PATH: /data/difmsync.db
+      DIFMSYNC_AUTH_BIND: 0.0.0.0
+
+    volumes:
+      - difmsync-data:/data
+    ports:
+      - "127.0.0.1:8888:8888"   # auth callback; inert after consent
+      - "3436:3436"             # /healthz and /status.json
+    healthcheck:
+      test: ["CMD", "/app/difmsync", "status", "--check"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30m
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+volumes:
+  difmsync-data:
+    # Pinned, so the real volume name stops depending on which project the
+    # service lives in.
+    #
+    # This is the migration. Compose would otherwise namespace the volume
+    # as <yourstack>_difmsync-data — a brand-new empty one — leaving the
+    # Spotify refresh token behind in the volume the standalone deployment
+    # created. The symptom is `no account "default" yet`, and with a 30m
+    # start_period that reads as a slow boot rather than a fault. Naming
+    # the existing volume outright means there is nothing to copy.
+    #
+    # It also keeps the literal volume names in the backup, prune and
+    # restore commands below correct, which project-prefixing would not.
+    name: difm-spotify-sync_difmsync-data
+```
+
+Alongside it:
+
+```sh
+mkdir -p difmsync
+cp /path/to/repo/.env.defaults difmsync/.env.defaults
+cp /path/to/repo/.env.local    difmsync/.env.local   # the five secrets
+chmod 600 difmsync/.env.local
+```
+
+If you would rather the volume were named for the stack it now lives in,
+that is a copy rather than a rename — stop the container first, since
+copying a database out from under a live writer is how you get a corrupt
+one:
+
+```sh
+docker compose stop difmsync
+docker volume create difmsync-data
+docker run --rm \
+  -v difm-spotify-sync_difmsync-data:/from -v difmsync-data:/to \
+  alpine sh -c 'cd /from && cp -a . /to'
+```
+
+`cp -a` preserves the uid 65532 ownership, which the nonroot process
+needs — see [Volume ownership](#volume-ownership). Point `name:` at the
+new volume, `docker compose up -d`, confirm with `difmsync status`, and
+only then remove the old one.
+
+Two things change in the commands above once the service lives here: it is
+`difmsync` rather than `connector`, and you run them from the stack's
+directory. The one-time consent step is otherwise unchanged, and still
+needs `--service-ports`:
+
+```sh
+docker compose run --rm --service-ports difmsync auth
+```
+
+Upgrading no longer builds anything:
+
+```sh
+docker compose pull difmsync     # only for :latest; a pinned sha is a file edit
+docker compose up -d difmsync
+```
+
 ## Volume ownership
 
 **Check this if the container crash-loops on first start.** The process
