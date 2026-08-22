@@ -11,15 +11,18 @@ for the reverse-engineered reference this is built on.
 
 ```sh
 mise install          # provisions go, sqlc, goose, just, golangci-lint
-cp mise.local.toml.example mise.local.toml   # then fill in credentials
+cp .env.local.example .env.local             # then fill in credentials
 just auth             # one-time Spotify consent
 just dry-run          # score everything, write nothing
 just sync             # for real
 ```
 
-`mise.local.toml` is gitignored. Obtaining `DIFMSYNC_API_KEY` and
-`DIFMSYNC_MEMBER_ID` is described in [`docs/difm-api.md`](docs/difm-api.md);
-no DI.fm password is needed at any point.
+`.env.local` is gitignored, and it is the only place credentials live —
+`mise.toml` loads it for the host tooling and `compose.yaml` loads it for
+the container, so there is one copy to keep current. Obtaining
+`DIFMSYNC_API_KEY` and `DIFMSYNC_MEMBER_ID` is described in
+[`docs/difm-api.md`](docs/difm-api.md); no DI.fm password is needed at any
+point.
 
 Every flag has a `DIFMSYNC_*` environment fallback:
 

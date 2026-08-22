@@ -21,8 +21,11 @@ Runtimes and project tools are managed by [mise](https://mise.jdx.dev).
 - **`mise.toml`** — base: tool versions + production-default env.
 - **`mise.development.toml`** — local overrides; `MISE_ENV=development`.
 - **`mise.ci.toml`** — CI overrides; `MISE_ENV=ci`.
-- **`mise.local.toml`** — gitignored, machine-specific and credential-bearing.
-  See `mise.local.toml.example`.
+- **`mise.local.toml`** — gitignored, machine-specific non-secret overrides.
+- **`.env.local`** — gitignored, and the *only* home for credentials.
+  `mise.toml` loads it via `_.file` and `compose.yaml` loads it as a
+  layer, so the host tooling and the container read one file rather than
+  two copies that drift. See `.env.local.example`.
 
 Add tooling by editing `mise.toml` rather than telling contributors to
 `brew install` things.

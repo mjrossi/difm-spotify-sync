@@ -92,11 +92,14 @@ tedious to diagnose — a wrong `DB_PATH` writes the database into the
 container's ephemeral filesystem and looks like a clean start. Setting
 either in a `.env` layer has no effect, by design.
 
-The mise files still drive the *host* toolchain — `just sync`, `just auth`
-and friends read `mise.local.toml`. That means the five secrets exist in
-two places if you use both paths. Keeping them in step is manual; if you
-would rather have one copy, point mise at the dotenv file with
-`_.file = ".env.local"` in `mise.local.toml`.
+`.env.local` is also what the *host* toolchain reads: `mise.toml` loads it
+with `_.file`, so `just sync` and `just auth` see the same credentials the
+container does. There is one secrets file, not two to keep in step.
+
+A missing `.env.local` is not an error — CI and a fresh clone still run
+every recipe that does not need credentials. And because editing
+`mise.toml` changes its content hash, mise will ask you to `mise trust`
+once after pulling this change.
 
 Two things about that `auth` line, both easy to get wrong:
 

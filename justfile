@@ -88,7 +88,7 @@ verify-config:
     code=$(grep -oh 'DIFMSYNC_[A-Z_]\+' \
              $(find cmd/difmsync -name '*.go' -not -name '*_test.go') | sort -u)
     refs=$(grep -roh 'DIFMSYNC_[A-Z_]\+' \
-             mise.toml mise.development.toml mise.ci.toml mise.local.toml.example \
+             mise.toml mise.development.toml mise.ci.toml \
              .env.defaults .env.development .env.local.example \
              compose.yaml Dockerfile justfile README.md docs/ .github/workflows/ \
            | sort -u)
