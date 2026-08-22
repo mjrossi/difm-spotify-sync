@@ -20,8 +20,23 @@ Five secrets. None may be committed.
 ### Creating the Spotify app
 
 1. <https://developer.spotify.com/dashboard> → **Create app**.
-2. Add a redirect URI. It must match `DIFMSYNC_SPOTIFY_REDIRECT_URL`
-   exactly; the default is `http://127.0.0.1:8888/callback`.
+2. Add the redirect URIs. Each must match `DIFMSYNC_SPOTIFY_REDIRECT_URL`
+   exactly for the context that uses it, and the dashboard accepts more
+   than one — register both:
+   - `http://127.0.0.1:3437/callback` — what `.env.defaults` ships, used
+     by the deployed daemon's consent flow when you authorize from a
+     browser on the host itself.
+   - `http://127.0.0.1:8888/callback` — the binary's own default, used by
+     `just auth` on a workstation.
+   - `https://<host>/difmsync/callback` — only if you need to authorize
+     the deployed daemon from another machine; see the Tailscale section
+     below.
+
+   Spotify requires HTTPS for any redirect URI that is not a loopback
+   literal (`127.0.0.1` or `[::1]`); `localhost` is rejected outright.
+   That is what makes the two loopback URLs above work with nothing in
+   front of them, and why reaching the daemon from anywhere else needs
+   something terminating TLS.
 3. Copy the client ID and secret.
 
 The playlist ID is the path segment in its URL:
@@ -33,9 +48,84 @@ Spotify's Authorization Code flow needs one interactive browser consent.
 Everything after it is unattended — the refresh token is stored in the
 SQLite database and the OAuth transport renews access tokens on its own.
 
-This is the only step that cannot run headless, so **run it before
-deploying**, and make sure the database it writes to is the one the
-deployment will mount.
+There are two ways to give that consent. They write the same token to the
+same place; pick whichever suits where the database lives.
+
+### In the daemon (deployed)
+
+Set `DIFMSYNC_AUTH_HTTP_ADDR` and the daemon handles it itself. While
+there is no refresh token it serves the consent flow on that address and
+waits, logging one line:
+
+```
+spotify consent required — open this URL to authorize url=http://127.0.0.1:3437/start?t=<nonce> listening=[::]:3437
+```
+
+Open it, approve, and syncing begins on the next tick. The listener then
+shuts down for the life of the process.
+
+That URL is built from `DIFMSYNC_SPOTIFY_REDIRECT_URL`, not from the
+listen address — the daemon serves plain HTTP inside a container and
+cannot know what fronts it. `.env.defaults` points it at the consent port
+`compose.yaml` publishes, so the default works from a browser on the
+host. Point it elsewhere and the daemon prints that instead; if it names
+a loopback port that is not the one being served, the log says so
+directly above the URL:
+
+```
+consent redirect port does not match the consent listener ... redirect_port=8888 listen_port=3437
+```
+
+Two things make this safe enough to leave exposed for the minutes it is
+up. The start URL carries a **nonce** generated at startup and emitted
+only to the log, so reaching the port is not enough to begin a flow —
+without it, anyone who could reach the port could complete consent with
+*their* Spotify account and bind your sync to a stranger's playlist. The
+callback itself is guarded by the OAuth `state` parameter, as it must be:
+Spotify redirects a browser there and will not carry an extra parameter.
+
+Both served paths are derived from `DIFMSYNC_SPOTIFY_REDIRECT_URL`, so
+scoping it to `/difmsync/callback` puts the start page at
+`/difmsync/start` rather than claiming `/callback` at the root of a
+hostname that may front several services.
+
+**Unset, nothing changes**: the daemon exits with `spotify: no refresh
+token; run difmsync auth first`, which is what a workstation wants.
+
+#### Authorizing from another machine, with Tailscale
+
+Only needed if the browser is not on the Docker host. `compose.yaml`
+publishes the consent port to the host's loopback, so anything else has to
+come through something that terminates TLS — both to reach it at all and
+because Spotify will not accept a non-loopback redirect URI over HTTP.
+`tailscale serve` does both with a real certificate and no ports open to
+the internet:
+
+```sh
+tailscale serve --bg --set-path /difmsync 3437
+tailscale serve status          # confirm the mapping
+```
+
+Then set, in `.env.local` on that host:
+
+```sh
+DIFMSYNC_SPOTIFY_REDIRECT_URL=https://<node>.<tailnet>.ts.net/difmsync/callback
+```
+
+and register that same URL in the Spotify dashboard.
+
+Whether a path-mounted proxy passes its prefix through to the backend or
+strips it has changed across Tailscale releases. The daemon answers on
+both the full path and its last segment for exactly this reason — a
+mismatch would 404 the callback, which is indistinguishable from Spotify
+never calling back. Anything that reaches neither is logged with the path
+it asked for, so a rewrite leaves evidence:
+
+```sh
+docker compose logs connector | grep unrouted
+```
+
+### On a workstation
 
 ```sh
 just auth        # prints a URL, waits on 127.0.0.1:8888 for the callback
@@ -43,17 +133,18 @@ just auth        # prints a URL, waits on 127.0.0.1:8888 for the callback
 
 The listener's address and path are both derived from
 `DIFMSYNC_SPOTIFY_REDIRECT_URL`, so a custom redirect URI works as long
-as it matches what you registered in the Spotify dashboard. Inside a
-container the host has to be overridden — see below.
+as it matches what you registered in the Spotify dashboard. This path
+requires an `http` loopback redirect URL and will refuse an `https` one —
+it serves plain HTTP and cannot terminate TLS. **Make sure the database it
+writes to is the one the deployment will mount.**
 
 ## Homelab (Docker Compose)
 
 ```sh
 cp .env.local.example .env.local   # then fill in the five secrets
 chmod 600 .env.local               # nothing does this for you
-docker compose run --rm --service-ports connector auth   # one-time
 docker compose up -d
-docker compose logs -f connector
+docker compose logs -f connector   # -> the consent URL, once
 ```
 
 The first build prints `pull access denied for difm-spotify-sync,
@@ -117,17 +208,27 @@ every recipe that does not need credentials. And because editing
 `mise.toml` changes its content hash, mise will ask you to `mise trust`
 once after pulling this change.
 
-Two things about that `auth` line, both easy to get wrong:
+### Consent inside the container, the long way
+
+The in-daemon flow above replaces this, but `docker compose run --rm
+--service-ports connector auth` still works and is the fallback when you
+would rather not expose a consent port at all. Two things about it, both
+easy to get wrong:
 
 - **`--service-ports` is required.** `docker compose run` does not publish
   the service's ports without it, so the `ports:` block in `compose.yaml`
-  has no effect on that command and the callback never arrives.
+  has no effect on that command and the callback never arrives. Note it
+  publishes *every* port in that block, so stop the daemon first or it
+  collides with the running container on both 3436 and 3437 — and 3437
+  is also the port this command's own listener binds, since it is
+  derived from `DIFMSYNC_SPOTIFY_REDIRECT_URL`.
 - **The listener must bind `0.0.0.0` inside the container.** A published
   port forwards to the container's eth0 address, not its loopback, so a
   listener on `127.0.0.1` is unreachable from the host. `compose.yaml`
-  sets `DIFMSYNC_AUTH_BIND=0.0.0.0` for this. The redirect URL stays
-  `http://127.0.0.1:8888/callback` — that is what your browser opens and
-  what Spotify's dashboard requires.
+  sets `DIFMSYNC_AUTH_BIND=0.0.0.0` for this. The redirect URL stays a
+  loopback literal — that is what your browser opens and what Spotify's
+  dashboard requires — so reaching it from another machine means an ssh
+  tunnel to the published port.
 
 The database lives on the `difmsync-data` named volume. To inspect it:
 
@@ -229,7 +330,7 @@ Then the service block, dropped into your stack's `compose.yaml`:
     volumes:
       - difmsync-data:/data
     ports:
-      - "127.0.0.1:8888:8888"   # auth callback; inert after consent
+      - "127.0.0.1:3437:3437"   # consent flow; inert after consent
       - "3436:3436"             # /healthz and /status.json
     healthcheck:
       test: ["CMD", "/app/difmsync", "status", "--check"]
@@ -438,7 +539,8 @@ what makes them safe to expose on the LAN without authentication.
 
 | Reason | What it means | First move |
 |---|---|---|
-| `no account "default" yet` | `difmsync auth` has never run against this volume | Run the auth step above |
+| `awaiting Spotify consent` | The daemon is up but has no refresh token | Open the consent URL from the log |
+| `no account "default" yet` | Nothing has ever run against this volume | Start the container; it creates the row |
 | `no sync pass has run yet` | The container started but has not completed a pass | Wait one interval; then read the logs |
 | `newest run errored — run …` | A pass failed and the watermark was held back | `difmsync status` on the host for the error text |
 | `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 connector` |
