@@ -1,6 +1,6 @@
-# Homelab deployment. Credentials come from .env (gitignored); see
-# docs/difm-api.md for how to obtain DIFMSYNC_API_KEY and
-# DIFMSYNC_MEMBER_ID.
+# Homelab deployment. Credentials come from .env.local (gitignored) —
+# copy .env.local.example and fill it in; see docs/difm-api.md for how to
+# obtain DIFMSYNC_API_KEY and DIFMSYNC_MEMBER_ID.
 #
 # One-time setup, before the daemon can run unattended:
 #
@@ -15,25 +15,44 @@ services:
     build: .
     image: difm-spotify-sync:dev
     restart: unless-stopped
-    env_file: .env
+    # Layered exactly like the mise files, later winning, with the <env>
+    # layer chosen by MISE_ENV — the same switch mise reads, so one
+    # variable steers the host toolchain and the container together.
+    # Unset means production, matching mise.toml's role.
+    #
+    #   .env.defaults          <-  mise.toml              (committed)
+    #   .env.<env>             <-  mise.<env>.toml        (committed)
+    #   .env.local             <-  mise.local.toml        (gitignored)
+    #   .env.<env>.local       <-  mise.<env>.local.toml  (gitignored)
+    #
+    # Only .env.defaults is required; a missing layer is not an error, so
+    # a fresh clone runs as soon as .env.local exists.
+    env_file:
+      - .env.defaults
+      - path: .env.${MISE_ENV:-production}
+        required: false
+      - path: .env.local
+        required: false
+      - path: .env.${MISE_ENV:-production}.local
+        required: false
+
+    # Pinned here rather than in .env.defaults, deliberately: `environment:`
+    # overrides every env_file layer, and these two are facts about running
+    # inside this container rather than preferences. A stray override in a
+    # local layer would break the deployment in ways that are tedious to
+    # diagnose, so the layers are not allowed to reach them.
     environment:
+      # The volume mount point. Anything else and the database is written
+      # into the container's ephemeral filesystem, where it is lost on the
+      # next `docker compose up` — silently, because SQLite will happily
+      # create a fresh one and the service will look like it started fine.
       DIFMSYNC_DB_PATH: /data/difmsync.db
-      DIFMSYNC_LOG_FORMAT: json
-      # Read-only status endpoints, reachable from the LAN so a dashboard
-      # (Uptime Kuma, Homepage) can poll them. 0.0.0.0 because the
-      # published port forwards to eth0, same as DIFMSYNC_AUTH_BIND below.
-      # Safe to expose unauthenticated only because these endpoints carry
-      # no secrets and cannot change anything — see internal/status.
-      DIFMSYNC_HTTP_ADDR: 0.0.0.0:3436
-      # How stale the last clean pass may be before /healthz and
-      # `status --check` report unhealthy. Three ticks of the default
-      # 15m interval, so one missed pass is tolerated and two are not.
-      DIFMSYNC_STATUS_MAX_AGE: 45m
-      # A published port forwards to the container's eth0 address, not
-      # its loopback, so the `auth` listener has to bind 0.0.0.0 to be
-      # reachable from the host. The redirect URL itself stays
-      # 127.0.0.1 — that is what the browser and Spotify's dashboard
-      # both need.
+      # A published port forwards to the container's eth0 address, not its
+      # loopback, so the `auth` listener has to bind 0.0.0.0 to be
+      # reachable from the host. The redirect URL itself stays 127.0.0.1 —
+      # that is what the browser and Spotify's dashboard both need. An
+      # empty value here (easy to inherit by copying mise.local.toml over)
+      # silently falls back to loopback and the callback never arrives.
       DIFMSYNC_AUTH_BIND: 0.0.0.0
     volumes:
       - difmsync-data:/data

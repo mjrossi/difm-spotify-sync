@@ -49,11 +49,47 @@ container the host has to be overridden — see below.
 ## Homelab (Docker Compose)
 
 ```sh
-cp mise.local.toml.example .env   # then fill in; compose reads .env
+cp .env.local.example .env.local   # then fill in the five secrets
 docker compose run --rm --service-ports connector auth   # one-time
 docker compose up -d
 docker compose logs -f connector
 ```
+
+### Where configuration lives
+
+The dotenv files layer the same way the mise ones do, and the `<env>`
+layer is chosen by the same `MISE_ENV` switch:
+
+| Layer | Mirrors | Committed | Holds |
+|---|---|---|---|
+| `.env.defaults` | `mise.toml` | yes | non-secret container defaults |
+| `.env.<env>` | `mise.<env>.toml` | yes | per-environment non-secrets |
+| `.env.local` | `mise.local.toml` | **no** | the five secrets |
+| `.env.<env>.local` | `mise.<env>.local.toml` | **no** | per-environment secrets |
+
+Later layers win, and only `.env.defaults` has to exist. Unset `MISE_ENV`
+means production, matching `mise.toml`'s role, so the plain command is the
+deployment one:
+
+```sh
+docker compose up -d                          # production
+MISE_ENV=development docker compose up -d     # text logs, debug, 2m interval
+```
+
+Two variables are pinned in `compose.yaml`'s `environment:` block instead,
+because that block overrides every layer: `DIFMSYNC_DB_PATH` (the volume
+mount point) and `DIFMSYNC_AUTH_BIND` (`0.0.0.0`, since a published port
+forwards to eth0 rather than loopback). Both are facts about running in
+this container rather than preferences, and both fail in ways that are
+tedious to diagnose — a wrong `DB_PATH` writes the database into the
+container's ephemeral filesystem and looks like a clean start. Setting
+either in a `.env` layer has no effect, by design.
+
+The mise files still drive the *host* toolchain — `just sync`, `just auth`
+and friends read `mise.local.toml`. That means the five secrets exist in
+two places if you use both paths. Keeping them in step is manual; if you
+would rather have one copy, point mise at the dotenv file with
+`_.file = ".env.local"` in `mise.local.toml`.
 
 Two things about that `auth` line, both easy to get wrong:
 
