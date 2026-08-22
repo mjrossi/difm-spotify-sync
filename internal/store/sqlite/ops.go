@@ -171,10 +171,13 @@ type ReviewItem struct {
 }
 
 // toReviewItem flattens a queue row, the single place the mapping lives.
-// Both accessors read the same sqlc row type, and they drifted apart once
-// already: a column added to review_queue has to reach the listing and
-// the single-item lookup together, or `review --approve` decides on a
-// field that `review` never showed.
+//
+// ListReview and GetReviewItem read the same sqlc row type, so a column
+// added to review_queue has to reach both or neither. Two hand-written
+// copies make "neither" easy to miss: `review` lists through one and
+// `review --approve` decides through the other, so a field that lands on
+// only one path means the operator approves against something the
+// listing never showed them.
 //
 // A malformed candidates blob is tolerated rather than fatal — the row's
 // own fields are still useful to a human reviewer — and so is an
