@@ -55,6 +55,13 @@ docker compose up -d
 docker compose logs -f connector
 ```
 
+The first build prints `pull access denied for difm-spotify-sync,
+repository does not exist or may require 'docker login'` before it starts
+building. That is not a failure: the service names an `image:` as well as
+a `build:`, so Compose checks the registry for that tag before falling
+back to building it locally. The tag is local-only by design — there is
+no registry to push to. Once the image exists the line does not reappear.
+
 ### Where configuration lives
 
 The dotenv files layer the same way the mise ones do, and the `<env>`
@@ -245,7 +252,25 @@ curl -s http://<host>:3436/status.json | jq             # the full report
 
 The container healthcheck runs `status --check`, deliberately rather than
 curling `/healthz`: distroless ships no curl or wget, and this way health
-still works if `DIFMSYNC_HTTP_ADDR` is unset.
+still works if `DIFMSYNC_HTTP_ADDR` is unset. To see what the healthcheck
+itself last decided, rather than inferring it:
+
+```sh
+docker inspect --format '{{json .State.Health}}' \
+  $(docker compose ps -q connector) | jq
+```
+
+`--max-age` is a flag, so shrinking it is the cheapest way to exercise the
+unhealthy path without waiting 45 minutes for a real stall:
+
+```sh
+docker compose exec connector /app/difmsync status --check --max-age=1s
+```
+
+That should exit non-zero and name how stale the last pass is. Note
+`docker compose ps` reads `starting`, not `healthy`, for a while after
+first launch — the check interval is 5m and `start_period` is 30m, which
+is the pre-auth window working as intended rather than a stall.
 
 Point a dashboard (Uptime Kuma, Homepage, anything that polls a URL) at
 `/healthz`. Both endpoints are read-only and carry no secrets, which is
