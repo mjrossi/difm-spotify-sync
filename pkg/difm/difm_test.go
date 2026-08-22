@@ -391,3 +391,42 @@ func TestListLikedTracks_UnauthorizedIsTyped(t *testing.T) {
 		t.Errorf("err = %v, want ErrUnauthorized", err)
 	}
 }
+
+// TestTransportErrorHidesTheMemberID pins the scrub at the point the
+// member id would otherwise escape this package.
+//
+// net/http returns *url.Error from Do, and *url.Error embeds the request
+// URL in its Error() text. The member id is a path segment of every
+// track_votes request, so an unscrubbed transport failure carries it into
+// whatever records the error — for this project, sync_runs.error, which
+// the operator endpoints then serve to the LAN unauthenticated.
+//
+// Pointed at a closed listener so the failure is a real dial error rather
+// than a synthesized one: the wrapping under test is net/http's, and a
+// hand-built *url.Error would not prove the client hands the real thing
+// to the scrub.
+func TestTransportErrorHidesTheMemberID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closed := srv.URL
+	srv.Close()
+
+	const memberID = "10000001"
+	c := difm.New("test-key", memberID)
+	c.BaseURL = closed
+
+	_, err := c.ListLikedTracks(context.Background(), time.Time{})
+	if err == nil {
+		t.Fatal("ListLikedTracks against a closed listener returned no error")
+	}
+	if strings.Contains(err.Error(), memberID) {
+		t.Errorf("transport error carries the member id: %v", err)
+	}
+	// The scrub must not cost the diagnosis: which host and which page
+	// failed is the part an operator reads.
+	if !strings.Contains(err.Error(), "<member-id>") {
+		t.Errorf("scrubbed URL lost its placeholder, so the path is unreadable: %v", err)
+	}
+	if !strings.Contains(err.Error(), "track_votes") {
+		t.Errorf("error no longer says which request failed: %v", err)
+	}
+}

@@ -53,10 +53,9 @@ func resyncCommand() *cli.Command {
 			}
 			defer func() { _ = store.Close() }()
 
-			account, err := store.GetAccount(ctx, c.String("account"))
+			account, err := requireAccount(ctx, c, store)
 			if err != nil {
-				return fmt.Errorf("no account %q yet — run `difmsync sync` first: %w",
-					c.String("account"), err)
+				return err
 			}
 
 			forget := c.IntSlice("forget")

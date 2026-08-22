@@ -5,14 +5,18 @@
 //	auth    one-time Spotify OAuth consent; stores the refresh token
 //	sync    one pass (--dry-run) or a continuous loop (--loop)
 //	review  inspect and resolve the review queue
-//	status  recent sync runs and ledger totals
+//	status  recent sync runs and ledger totals; --check is the healthcheck
+//	backup  consistent snapshot of the database
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,6 +26,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/mjrossi/difm-spotify-sync/internal/status"
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/internal/syncer"
 	"github.com/mjrossi/difm-spotify-sync/pkg/difm"
@@ -117,6 +122,7 @@ func newApp() *cli.Command {
 			reviewCommand(),
 			resyncCommand(),
 			statusCommand(),
+			backupCommand(),
 		},
 	}
 	return cmd
@@ -155,11 +161,13 @@ func newLogger(c *cli.Command) *slog.Logger {
 //
 // This is the first thing a container deployment hits when the data
 // volume is owned by root and the process is not. The image stages /data
-// with --chown, which covers a Docker named volume (Docker seeds a fresh
-// volume from the image's directory, ownership included). It does not
-// necessarily cover every provider: a volume that is a freshly formatted
-// block device is mounted root-owned regardless of what the image says,
-// and `fly ssh sftp put` writes as root too. See docs/deploy.md.
+// with --chown, which covers a Docker *named* volume: Docker seeds a
+// fresh named volume from the image's directory, ownership included.
+//
+// It does not cover a bind mount. Pointing /data at a host directory —
+// the obvious move for putting the database on a NAS or in a snapshotted
+// dataset — mounts that directory with the ownership it already has, and
+// nothing in the image can change it. See docs/deploy.md.
 func mountDiagnostic(path string) string {
 	dir := filepath.Dir(path)
 	fi, err := os.Stat(dir)
@@ -229,6 +237,22 @@ func requireFlags(c *cli.Command, names ...string) error {
 	return nil
 }
 
+// requireAccount loads the configured account, turning the store's bare
+// "no rows" into the one thing the operator can act on.
+//
+// Every subcommand that reads an existing account needs this same
+// translation: `auth` is what creates the row, and until it has run there
+// is nothing to read. sync and auth deliberately do not go through here —
+// they call EnsureAccount, which creates the row rather than requiring it.
+func requireAccount(ctx context.Context, c *cli.Command, store *sqlite.Store) (sqlite.Account, error) {
+	account, err := store.GetAccount(ctx, c.String("account"))
+	if err != nil {
+		return sqlite.Account{}, fmt.Errorf("no account %q yet — run `difmsync auth` first: %w",
+			c.String("account"), err)
+	}
+	return account, nil
+}
+
 func syncCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "sync",
@@ -245,6 +269,17 @@ func syncCommand() *cli.Command {
 			&cli.DurationFlag{
 				Name: "interval", Value: 15 * time.Minute,
 				Sources: cli.EnvVars("DIFMSYNC_INTERVAL"),
+			},
+			&cli.StringFlag{
+				Name: "http-addr",
+				Usage: "serve the read-only /healthz and /status.json endpoints on this " +
+					"address (empty disables them; only applies with --loop)",
+				Sources: cli.EnvVars("DIFMSYNC_HTTP_ADDR"),
+			},
+			&cli.DurationFlag{
+				Name: "max-age", Value: 45 * time.Minute,
+				Usage:   "how stale the last clean pass may be before /healthz reports unhealthy",
+				Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
 			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
@@ -313,12 +348,137 @@ func syncCommand() *cli.Command {
 				Log: log,
 			}
 
-			if c.Bool("loop") {
+			if !c.Bool("loop") {
+				// The endpoints only exist for the lifetime of the process,
+				// so serving them for one pass would mean a listener that
+				// disappears before anything could poll it. Saying so beats
+				// ignoring the flag: a compose file with --http-addr and no
+				// --loop otherwise looks configured and answers nothing.
+				if c.String("http-addr") != "" {
+					log.Warn("--http-addr is ignored without --loop; the status endpoints "+
+						"are served only by the sync loop",
+						"addr", c.String("http-addr"))
+				}
+				_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
+				return err
+			}
+
+			loop := func(ctx context.Context) error {
 				return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
 			}
-			_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
-			return err
+			addr := c.String("http-addr")
+			if addr == "" {
+				return loop(ctx)
+			}
+			return serveWhile(ctx, addr,
+				status.Handler(store, c.String("account"), c.Duration("max-age"), log),
+				log, loop)
 		},
+	}
+}
+
+// workDrainTimeout bounds how long serveWhile waits for the sync loop to
+// stop after the status server has died. Sized to let the pass in flight
+// finish its Spotify write and close its sync_runs row; past that, the
+// restart policy is a better answer than waiting.
+const workDrainTimeout = 30 * time.Second
+
+// serveWhile runs the read-only status endpoints for as long as work is
+// running, and returns whichever of the two finishes first.
+//
+// Deliberately hand-rolled rather than reaching for errgroup:
+// golang.org/x/sync is an indirect dependency today, and promoting it to
+// a direct one for a WaitGroup with an error slot is not a trade this
+// project makes (see CLAUDE.md on adding dependencies).
+//
+// The ordering matters. The listener is opened before work starts, so a
+// bad --http-addr fails immediately and loudly instead of leaving a
+// daemon that syncs fine but silently answers nothing — which reads as a
+// dead service to whatever is polling it.
+func serveWhile(
+	ctx context.Context,
+	addr string,
+	h http.Handler,
+	log *slog.Logger,
+	work func(context.Context) error,
+) error {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s for the status endpoints: %w", addr, err)
+	}
+
+	// All four timeouts, not just the one the linter asks for. These
+	// endpoints are reachable by anything on the LAN, and a connection
+	// opened and left idle otherwise occupies the server indefinitely.
+	// WriteTimeout is comfortably above handlerTimeout so a slow database
+	// read still returns its own 503 rather than being cut off mid-body.
+	srv := &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+	log.Info("status endpoints listening", "addr", ln.Addr().String(),
+		"routes", "/healthz /status.json")
+
+	defer func() {
+		// A fresh context: ctx is already canceled on the shutdown path,
+		// and passing a canceled one makes Shutdown return instantly
+		// without draining anything.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("status server shutdown", "err", err)
+		}
+	}()
+
+	// Cancelable so the server-died path can stop the sync loop rather
+	// than abandon it. Without this, returning below unwinds into the
+	// caller's `defer store.Close()` while a pass is still running, and
+	// the database closes underneath an in-flight FinishRun — which turns
+	// the last line of the log an operator is reading into a spurious
+	// "sql: database is closed" on top of the real failure.
+	workCtx, stopWork := context.WithCancel(ctx)
+	defer stopWork()
+
+	workErr := make(chan error, 1)
+	go func() { workErr <- work(workCtx) }()
+
+	select {
+	case err := <-serveErr:
+		// The server died on its own. The sync loop may still be fine,
+		// but it is now unobservable — and an unobservable daemon is the
+		// exact failure this endpoint exists to prevent. Surface it and
+		// let the restart policy start a whole one.
+		//
+		// Wind the loop down first. Engine.Loop returns on cancellation
+		// once the pass in flight finishes, so this waits for a clean
+		// stopping point rather than cutting one short. The timeout keeps
+		// a wedged pass from holding the process open forever; the
+		// restart policy is the backstop for that case.
+		stopWork()
+		select {
+		case <-workErr:
+		case <-time.After(workDrainTimeout):
+			log.Warn("sync loop did not stop within the drain timeout",
+				"timeout", workDrainTimeout)
+		}
+		if err != nil {
+			return fmt.Errorf("status server: %w", err)
+		}
+		return nil
+	case err := <-workErr:
+		return err
 	}
 }
 
@@ -341,10 +501,9 @@ func reviewCommand() *cli.Command {
 			}
 			defer func() { _ = store.Close() }()
 
-			account, err := store.GetAccount(ctx, c.String("account"))
+			account, err := requireAccount(ctx, c, store)
 			if err != nil {
-				return fmt.Errorf("no account %q yet — run `difmsync sync` first: %w",
-					c.String("account"), err)
+				return err
 			}
 
 			if id := c.Int("approve"); id != 0 {
@@ -481,7 +640,21 @@ func approveReview(ctx context.Context, c *cli.Command, store *sqlite.Store,
 func statusCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "status",
-		Usage: "show ledger totals and the last sync runs",
+		Usage: "show ledger totals, the review backlog and the last sync runs",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "json", Usage: "emit JSON instead of a table"},
+			&cli.BoolFlag{
+				Name: "check",
+				Usage: "exit non-zero unless a clean sync pass finished within --max-age " +
+					"(this is the container healthcheck)",
+			},
+			&cli.IntFlag{Name: "limit", Value: status.DefaultRunLimit, Usage: "how many recent runs to show"},
+			&cli.DurationFlag{
+				Name: "max-age", Value: 45 * time.Minute,
+				Usage:   "how stale the last clean pass may be before --check fails",
+				Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
+			},
+		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			store, err := openStore(ctx, c)
 			if err != nil {
@@ -489,40 +662,75 @@ func statusCommand() *cli.Command {
 			}
 			defer func() { _ = store.Close() }()
 
-			account, err := store.GetAccount(ctx, c.String("account"))
-			if err != nil {
-				return fmt.Errorf("no account %q yet — run `difmsync sync` first: %w",
-					c.String("account"), err)
-			}
-			total, err := store.CountSynced(ctx, account.ID)
-			if err != nil {
-				return err
-			}
-			// COUNT(*), not len() of a capped listing: a queue past the
-			// cap previously reported the cap as its size.
-			pending, err := store.CountReview(ctx, account.ID, "pending")
-			if err != nil {
-				return err
-			}
-			actionable, err := store.CountActionableReview(ctx, account.ID)
+			rep, err := status.Build(ctx, store, c.String("account"),
+				c.Duration("max-age"), c.Int("limit"))
 			if err != nil {
 				return err
 			}
 
-			fmt.Printf("account:   %s\n", account.Label)
-			fmt.Printf("playlist:  %s\n", account.SpotifyPlaylistID)
-			fmt.Printf("synced:    %d track(s)\n", total)
-			fmt.Printf("pending:   %d item(s) awaiting review", actionable)
-			if skipped := pending - actionable; skipped > 0 {
-				fmt.Printf(" (+%d skipped non-track(s) recorded)", skipped)
+			if c.Bool("check") {
+				// One line, no report: this runs as the container
+				// healthcheck, where the output lands in `docker inspect`
+				// and nothing reads more than the first line of it.
+				if !rep.Healthy {
+					return errors.New(rep.Reason)
+				}
+				fmt.Println("ok")
+				return nil
 			}
-			fmt.Println()
-			if account.WatermarkLikedAt.IsZero() {
-				fmt.Printf("watermark: none — next run reads full history\n")
-			} else {
-				fmt.Printf("watermark: %s\n", account.WatermarkLikedAt.Format(time.RFC3339))
+
+			if c.Bool("json") {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(rep)
 			}
+
+			printStatus(rep)
 			return nil
 		},
+	}
+}
+
+func printStatus(rep status.Report) {
+	fmt.Printf("account:   %s\n", rep.Account)
+	fmt.Printf("playlist:  %s\n", rep.Playlist)
+	fmt.Printf("synced:    %d track(s)\n", rep.Synced)
+	fmt.Printf("pending:   %d item(s) awaiting review", rep.Pending)
+	if rep.Skipped > 0 {
+		fmt.Printf(" (+%d skipped non-track(s) recorded)", rep.Skipped)
+	}
+	fmt.Println()
+	if rep.Watermark == "" {
+		fmt.Printf("watermark: none — next run reads full history\n")
+	} else {
+		fmt.Printf("watermark: %s\n", rep.Watermark)
+	}
+	if rep.Healthy {
+		fmt.Printf("health:    ok\n")
+	} else {
+		fmt.Printf("health:    NOT OK — %s\n", rep.Reason)
+	}
+
+	// The runs table is the whole point of the command's usage string,
+	// and until now it promised something it never printed. An empty
+	// error column on the newest row is the "it worked" signal.
+	fmt.Println()
+	if len(rep.Runs) == 0 {
+		fmt.Println("no sync runs recorded yet")
+		return
+	}
+	fmt.Printf("%-20s  %-5s  %5s  %5s  %5s  %s\n",
+		"STARTED", "DRY", "ADDED", "QUEUE", "SKIP", "ERROR")
+	for _, run := range rep.Runs {
+		dry := ""
+		if run.DryRun {
+			dry = "yes"
+		}
+		started := run.StartedAt
+		if len(started) > 19 {
+			started = started[:19]
+		}
+		fmt.Printf("%-20s  %-5s  %5d  %5d  %5d  %s\n",
+			started, dry, run.Added, run.Queued, run.Skipped, run.Error)
 	}
 }

@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 # Declared because this file uses `RUN --mount=type=cache`, which the
-# legacy (non-BuildKit) builder rejects outright. GitHub runners and Fly's
-# remote builder default to BuildKit; a homelab `DOCKER_BUILDKIT=0 docker
-# compose build` does not.
+# legacy (non-BuildKit) builder rejects outright. GitHub runners default
+# to BuildKit; a homelab `DOCKER_BUILDKIT=0 docker compose build` does
+# not, and this is the only builder that matters now that the homelab is
+# the sole deployment target.
 # Multi-stage build. The final image is distroless and non-root; the
 # binary is fully static (modernc.org/sqlite is pure Go, so no CGO and no
-# libc dependency), which is what lets the same image run unchanged on a
-# homelab host and on Fly.io.
+# libc dependency), so the runtime stage needs no libc and no shell.
 
 # Patch-pinned to match mise.toml and go.mod. A floating `1.26-alpine`
 # would build the release artifact on a different toolchain than `just
@@ -32,6 +32,14 @@ RUN mkdir -p /data
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/difmsync /app/difmsync
+
+# Links the published GHCR package to this repository. Not cosmetic: the
+# link is what makes the package inherit the repo's visibility (private,
+# here) and what grants the workflow's GITHUB_TOKEN write access to it.
+# Without the label the first push lands an *unlinked* package that
+# defaults to needing its own access grant, which reads as a permissions
+# bug in CI rather than a missing label.
+LABEL org.opencontainers.image.source="https://github.com/mjrossi/difm-spotify-sync"
 
 # Mounted volume for the SQLite database.
 #

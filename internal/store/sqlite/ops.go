@@ -170,6 +170,38 @@ type ReviewItem struct {
 	LikedAt       time.Time
 }
 
+// toReviewItem flattens a queue row, the single place the mapping lives.
+//
+// ListReview and GetReviewItem read the same sqlc row type, so a column
+// added to review_queue has to reach both or neither. Two hand-written
+// copies make "neither" easy to miss: `review` lists through one and
+// `review --approve` decides through the other, so a field that lands on
+// only one path means the operator approves against something the
+// listing never showed them.
+//
+// A malformed candidates blob is tolerated rather than fatal — the row's
+// own fields are still useful to a human reviewer — and so is an
+// unparseable liked_at, which leaves LikedAt zero.
+func toReviewItem(r sqlitegen.ReviewQueue) ReviewItem {
+	item := ReviewItem{
+		AccountID:   r.AccountID,
+		DifmTrackID: r.DifmTrackID,
+		DifmVoteID:  r.DifmVoteID,
+		Artist:      r.Artist,
+		Title:       r.Title,
+		DurationSec: int(r.DurationSec),
+		DetailsURL:  r.DetailsUrl,
+		BestScore:   r.BestScore,
+		Reason:      r.Reason,
+		Status:      r.Status,
+	}
+	_ = json.Unmarshal([]byte(r.CandidatesJson), &item.Candidates)
+	if ts, err := time.Parse(TimeFormat, r.LikedAt); err == nil {
+		item.LikedAt = ts.UTC()
+	}
+	return item
+}
+
 // Enqueue records a like that did not auto-add.
 func (s *Store) Enqueue(ctx context.Context, item ReviewItem) error {
 	payload, err := json.Marshal(item.Candidates)
@@ -206,25 +238,7 @@ func (s *Store) ListReview(ctx context.Context, accountID int64, status string, 
 	}
 	out := make([]ReviewItem, 0, len(rows))
 	for _, r := range rows {
-		item := ReviewItem{
-			AccountID:   r.AccountID,
-			DifmTrackID: r.DifmTrackID,
-			DifmVoteID:  r.DifmVoteID,
-			Artist:      r.Artist,
-			Title:       r.Title,
-			DurationSec: int(r.DurationSec),
-			DetailsURL:  r.DetailsUrl,
-			BestScore:   r.BestScore,
-			Reason:      r.Reason,
-			Status:      r.Status,
-		}
-		// A malformed candidates blob must not sink the whole listing —
-		// the row's own fields are still useful to a human reviewer.
-		_ = json.Unmarshal([]byte(r.CandidatesJson), &item.Candidates)
-		if ts, err := time.Parse(TimeFormat, r.LikedAt); err == nil {
-			item.LikedAt = ts.UTC()
-		}
-		out = append(out, item)
+		out = append(out, toReviewItem(r))
 	}
 	return out, nil
 }
@@ -255,23 +269,7 @@ func (s *Store) GetReviewItem(ctx context.Context, accountID, trackID int64) (Re
 	if err != nil {
 		return ReviewItem{}, fmt.Errorf("sqlite.GetReviewItem(%d): %w", trackID, err)
 	}
-	item := ReviewItem{
-		AccountID:   r.AccountID,
-		DifmTrackID: r.DifmTrackID,
-		DifmVoteID:  r.DifmVoteID,
-		Artist:      r.Artist,
-		Title:       r.Title,
-		DurationSec: int(r.DurationSec),
-		DetailsURL:  r.DetailsUrl,
-		BestScore:   r.BestScore,
-		Reason:      r.Reason,
-		Status:      r.Status,
-	}
-	_ = json.Unmarshal([]byte(r.CandidatesJson), &item.Candidates)
-	if ts, err := time.Parse(TimeFormat, r.LikedAt); err == nil {
-		item.LikedAt = ts.UTC()
-	}
-	return item, nil
+	return toReviewItem(r), nil
 }
 
 // CountReview returns how many queue items carry a status. `status`
@@ -409,7 +407,38 @@ func (s *Store) ClearWatermark(ctx context.Context, accountID int64) error {
 	return nil
 }
 
+// BackupTo writes a consistent snapshot of the database to dest.
+//
+// VACUUM INTO rather than a file copy: the database runs in WAL mode, so
+// copying the file while a pass is writing can capture a torn state that
+// looks valid until the moment it is restored. It is also pure Go through
+// the modernc driver, which is what lets this run inside the distroless
+// image — there is no sqlite3 binary and no shell in there.
+//
+// SQLite refuses a dest that already exists, and that refusal is kept
+// rather than papered over: the file it would overwrite is the only copy
+// of a Spotify refresh token often enough to matter.
+//
+// VACUUM cannot run inside a transaction. The pool is capped at one
+// connection, so this serializes against a running pass rather than
+// racing it.
+func (s *Store) BackupTo(ctx context.Context, dest string) error {
+	if s.inTx {
+		return errors.New("sqlite.BackupTo: cannot run inside a transaction")
+	}
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", dest); err != nil {
+		return fmt.Errorf("sqlite.BackupTo(%q): %w", dest, err)
+	}
+	return nil
+}
+
 // SyncRun is one recorded pass.
+//
+// Untagged, like every other store type. This was briefly tagged for
+// JSON, back when status.Report embedded it directly; serving a store
+// struct is what published the Error column to an unauthenticated
+// endpoint. internal/status copies it into its own status.Run instead —
+// the JSON shape belongs to the operator surface, not here.
 type SyncRun struct {
 	ID                              int64
 	StartedAt                       string
