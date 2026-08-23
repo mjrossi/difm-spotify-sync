@@ -289,9 +289,14 @@ to begin with. `--forget` handles both by itself.
 Adding `--all` is not a stronger version of the same thing: it clears the
 watermark entirely, re-reading all of history instead of the one track named.
 
-Find the track id in the review output, or straight from the database:
-`sqlite3 /config/difmsync.db 'select difm_track_id, artist, title from synced_tracks'`.
-A track id that is not in the ledger is reported rather than silently ignored.
+A track id that is not in the ledger is reported rather than silently
+ignored, so a wrong guess is cheap. To look one up, query the database —
+the image ships no `sqlite3`, so run it on the host against a bind mount or
+a `difmsync backup` snapshot:
+
+```sh
+sqlite3 difmsync.db 'select difm_track_id, artist, title from synced_tracks'
+```
 
 `difmsync resync --forget-all` clears the whole ledger. This is safe: each pass
 reconciles against the live playlist before adding, so tracks already present
