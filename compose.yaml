@@ -1,117 +1,70 @@
-# Homelab deployment. Credentials come from .env.local (gitignored) —
-# copy .env.local.example and fill it in; see docs/difm-api.md for how to
-# obtain DIFMSYNC_API_KEY and DIFMSYNC_MEMBER_ID.
+# Compose file for running difm-spotify-sync from a checkout of this
+# repo — it builds the image locally. If you just want to run the
+# service, you do not need this file or a checkout at all; copy the
+# compose snippet from the README, which pulls the published image.
 #
-# One-time setup is now part of running it. Bring the service up; while
-# there is no refresh token the daemon serves the Spotify consent flow on
-# DIFMSYNC_AUTH_HTTP_ADDR and logs a URL carrying a nonce — generated at
-# startup, logged once, and good until consent completes, so a flow that
-# fails can be retried from the same URL:
+# Configuration is environment variables. Every non-secret default is
+# baked into the image (see the ENV block in the Dockerfile), so the only
+# thing that has to come from outside is the five credentials, and those
+# live in .env.local — gitignored, and the same file mise loads for the
+# host tooling, so `just sync` and the container read one copy.
 #
-#   docker compose up -d connector
-#   docker compose logs connector   # -> "spotify consent required ... url=..."
+#   cp .env.local.example .env.local   # then fill it in
+#   chmod 600 .env.local
+#   docker compose up -d
+#   docker compose logs -f connector   # -> the consent URL, once
 #
-# Open that URL, approve, and the daemon starts syncing on its next tick.
-# The consent listener shuts down for good once the token is stored.
-#
-# The port below is published to loopback only, so something has to front
-# it for a browser to reach it — `tailscale serve --set-path /difmsync
-# 3437` is the deployment this was built for, and it also satisfies
-# Spotify's rule that a redirect URI be HTTPS unless it is a loopback
-# literal. Set DIFMSYNC_SPOTIFY_REDIRECT_URL to that public URL; the
-# daemon derives both served paths from it.
-#
-# `docker compose run --rm --service-ports connector auth` still works as
-# a fallback, and DIFMSYNC_AUTH_BIND below is what makes it work in a
-# container — see the comment there.
+# While there is no refresh token the daemon serves the Spotify consent
+# flow and logs a URL carrying a nonce. Open it, approve, and syncing
+# starts on the next tick. If you cannot reach that port from a browser,
+# `docker compose exec -it connector /app/difmsync auth --manual` needs no
+# networking at all. See docs/deploy.md.
 services:
   connector:
     build: .
     image: difm-spotify-sync:dev
     restart: unless-stopped
-    # Layered exactly like the mise files, later winning, with the <env>
-    # layer chosen by MISE_ENV — the same switch mise reads, so one
-    # variable steers the host toolchain and the container together.
-    # Unset means production, matching mise.toml's role.
-    #
-    #   .env.defaults          <-  mise.toml              (committed)
-    #   .env.<env>             <-  mise.<env>.toml        (committed)
-    #   .env.local             <-  mise.local.toml        (gitignored)
-    #   .env.<env>.local       <-  mise.<env>.local.toml  (gitignored)
-    #
-    # Only .env.defaults is required; a missing layer is not an error, so
-    # a fresh clone runs as soon as .env.local exists.
     env_file:
-      - .env.defaults
-      - path: .env.${MISE_ENV:-production}
-        required: false
-      - path: .env.local
-        required: false
-      - path: .env.${MISE_ENV:-production}.local
-        required: false
-
-    # Pinned here rather than in .env.defaults, deliberately: `environment:`
-    # overrides every env_file layer, and these two are facts about running
-    # inside this container rather than preferences. A stray override in a
-    # local layer would break the deployment in ways that are tedious to
-    # diagnose, so the layers are not allowed to reach them.
+      # Secrets only. Everything else is an image default or an override
+      # in the environment block below — keeping this file to credentials
+      # is what makes it safe to say "this is the only file to protect".
+      - .env.local
     environment:
-      # The volume mount point. Anything else and the database is written
-      # into the container's ephemeral filesystem, where it is lost on the
-      # next `docker compose up` — silently, because SQLite will happily
-      # create a fresh one and the service will look like it started fine.
-      DIFMSYNC_DB_PATH: /data/difmsync.db
-      # A published port forwards to the container's eth0 address, not its
-      # loopback, so the `auth` listener has to bind 0.0.0.0 to be
-      # reachable from the host. The redirect URL itself stays 127.0.0.1 —
-      # that is what the browser and Spotify's dashboard both need. An
-      # empty value here (easy to inherit by copying mise.local.toml over)
-      # silently falls back to loopback and the callback never arrives.
-      DIFMSYNC_AUTH_BIND: 0.0.0.0
+      # Ownership of the config directory. Set these to the uid/gid that
+      # owns whatever you mount at /config; `id -u` and `id -g` on the
+      # host. They matter most for a bind mount, which arrives with the
+      # ownership the host directory already has.
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-UTC}
     volumes:
-      - difmsync-data:/data
+      - difmsync-data:/config
     ports:
-      # The one-time consent flow. Loopback only and deliberately so: it
-      # writes a refresh token, which is exactly what /healthz and
-      # /status.json below are forbidden from doing, so it does not go on
-      # the LAN. Reach it through whatever terminates TLS in front.
+      # The one-time consent flow, published to loopback only and
+      # deliberately so: it writes a refresh token, which is exactly what
+      # the status endpoints below are forbidden from doing. Reach it
+      # through an SSH tunnel or whatever terminates TLS in front — or
+      # skip it entirely with `auth --manual`.
       #
-      # Inert once consent is stored — the listener shuts down and this
-      # mapping simply reserves the port for the next time it is needed.
+      # Inert once consent is stored: the listener shuts down for the life
+      # of the process and this mapping just reserves the port.
       - "127.0.0.1:3437:3437"
-      # The status endpoints, published to the LAN.
-      #
-      # 3436 is "DIFM" on a phone keypad. The point of the odd number is
-      # to stay out of the way on a host running many services: it dodges
-      # the usual occupants (3000, 8080/8081, 8096, 8123, 8384, 9000,
-      # 9090, 9100) and sits below Linux's default ephemeral range
-      # (32768-60999), where a listener can collide with an outbound
-      # connection's source port. Change both halves together, and
-      # DIFMSYNC_HTTP_ADDR in .env.defaults with them — it moved there
-      # when the dotenv layers were introduced, and following this comment
-      # to the `environment:` block below would produce exactly the silent
-      # mismatch it is warning about.
-      #
-      # Narrow to a single interface (e.g. "192.168.1.10:3436:3436") if
-      # you would rather not answer on all of them.
+      # The read-only status endpoints, published to the LAN so a
+      # dashboard can poll them. Narrow to one interface (e.g.
+      # "192.168.1.10:3436:3436") if you would rather not answer on all.
       - "3436:3436"
-    # distroless has no shell, so the check must be exec-form — and no
-    # curl or wget either, which is why this probes via the CLI rather
-    # than hitting /healthz. It also means health still works if
-    # DIFMSYNC_HTTP_ADDR is ever unset.
+    # Drops privileges before touching the database — see
+    # docker/healthcheck.sh for why that is not optional. `--check`
+    # rather than plain `status`: `status` only fails when the account
+    # row is missing, so a sync broken for a week still reported healthy.
     #
-    # `--check` is what makes this a health check rather than a liveness
-    # check. Plain `status` only fails when the account row is missing, so
-    # a sync that had been broken for a week still reported healthy.
-    # `--check` requires a clean, non-dry pass within DIFMSYNC_STATUS_MAX_AGE.
-    #
-    # start_period is long because `status` exits non-zero until the
-    # one-time `difmsync auth` has run, and auth needs a human with a
-    # browser. A short period would report `unhealthy` for the whole
-    # window between first deploy and consent — inverting the signal on
-    # precisely the day someone is watching it.
+    # start_period is long because the check fails until the one-time
+    # consent has happened, and that needs a human with a browser. A
+    # short period would report `unhealthy` for the whole window between
+    # first deploy and consent — inverting the signal on precisely the
+    # day someone is watching it.
     healthcheck:
-      test: ["CMD", "/app/difmsync", "status", "--check"]
+      test: ["CMD", "/healthcheck.sh"]
       interval: 5m
       timeout: 10s
       retries: 3
