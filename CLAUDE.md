@@ -194,15 +194,30 @@ larger instruction than the operator gave.
 - The container's own behaviour is gated in CI rather than by hand, and
   the assertions are chosen for failures that are **silent in
   production**: that the database ends up owned by `PUID` rather than
-  root, that a root-run healthcheck leaves nothing root-owned behind, and
-  that a legacy `/data` mount is refused rather than replaced with a
-  fresh database. Add to that list when a new startup behaviour can fail
-  quietly.
+  root, that a root-run healthcheck leaves nothing root-owned behind,
+  that a root-owned restored database is repaired rather than
+  crash-looping, that difmsync is pid 1 and exits 0 on SIGTERM, that the
+  arm64 image runs at all, and that a legacy `/data` mount is refused
+  rather than replaced with a fresh database. Add to that list when a new
+  startup behaviour can fail quietly.
+
+  They live in `.github/workflows/container-tests.yml`, which `ci.yml`
+  and `release.yml` both call. Both, because a tag can point at any
+  commit: a gate that runs only on main lets a regression reach `latest`,
+  which is the tag unattended deployments pull.
+
+  The healthcheck assertion carries a **negative control** — the same
+  check run without the privilege drop, asserted to leave a root-owned
+  database. Without it the test passed either way, because against a
+  cleanly-closed database root creates no new file and SQLite removes the
+  sidecars on close. Any assertion here whose fixture is the steady state
+  needs the same treatment; the interesting states are the unpopulated
+  and the interrupted ones.
 
 ## Deployment
 
 One container plus one volume at `/config`, published multi-arch to GHCR.
-`docs/deploy.md` is the runbook. Four constraints that are easy to get
+`docs/deploy.md` is the runbook. The constraints that are easy to get
 wrong:
 
 - The sync interval is an **internal ticker**, not cron. Nothing external
@@ -225,12 +240,38 @@ wrong:
   ownership and environment.
 
 - **Anything run by `docker exec` runs as root**, including the
-  healthcheck, and that is why `docker/healthcheck.sh` exists rather than
-  the healthcheck naming the binary. A root process that creates a file
-  under `/config` leaves it root-owned, and the entrypoint will not
-  repair it: its chown re-runs only when `/config` *itself* has the wrong
-  owner, which in steady state it does not. Any future exec-based check
-  must drop privileges the same way.
+  healthcheck, so `docker/difmsync` is the documented way in and
+  `/app/difmsync` is internal. The wrapper drops to `PUID:PGID`;
+  `docker/healthcheck.sh` goes through it rather than repeating the drop.
+  A root process that creates a file under `/config` leaves it
+  root-owned, and the entrypoint repairs the database and its sidecars by
+  name but nothing else — its directory chown re-runs only when `/config`
+  *itself* has the wrong owner, which in steady state it does not.
+  `backup` is the case that lasts: run as root it creates
+  `/config/backups` root-owned and every snapshot in it.
+
+  So: any new exec-based entry point goes through `/difmsync`, and any
+  doc that tells an operator to exec names `/difmsync`. A path documented
+  as `/app/difmsync` is the bug, even when the command works the day it
+  is written.
+
+- **The entrypoint repairs the database, not just its directory.** The
+  conditional chown covers `/config`; the database, its `-wal`/`-shm`
+  sidecars and its parent directory are repaired by name, derived from
+  `DIFMSYNC_DB_PATH`. That is what makes two documented procedures work
+  at all — a restore, where `docker cp` lands the file root-owned `0600`
+  inside a correctly-owned `/config`, and an upgrade that keeps
+  `DIFMSYNC_DB_PATH=/data/difmsync.db`, where the volume is owned by the
+  distroless-era 65532 and the `/config` chown never reaches it. Four
+  named paths rather than a recursive walk, so it stays cheap with a year
+  of backups in `/config`.
+
+- **The image declares its own `HEALTHCHECK`.** It lived only in
+  `compose.yaml`, which left the `docker run` deployment the README leads
+  with unmonitored — and since nothing external triggers a pass, an
+  unhealthy container is the only signal that syncing stopped. The
+  `start-period` is 30m because the first pass cannot succeed until a
+  human gives consent.
 
 - **`difmsync auth` is the one step that cannot run headless**, and it
   must write to the same database the deployment mounts. Three routes

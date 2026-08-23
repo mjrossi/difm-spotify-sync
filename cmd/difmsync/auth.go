@@ -305,15 +305,21 @@ func manualCallbackQuery(pasted string) (url.Values, error) {
 		raw = raw[:i]
 	}
 
+	// Neither error echoes the paste back. It is an authorization code
+	// most of the time, and in the bare-code case below it is one by
+	// definition — single-use and useless without the client secret, but
+	// this is the one path where credential material arrives as an
+	// argument, and errors get pasted into issues. The messages say what
+	// to do instead, which is what the operator needs anyway.
 	q, err := url.ParseQuery(raw)
 	if err != nil {
-		return nil, fmt.Errorf("could not parse %q as a callback URL: %w", in, err)
+		return nil, fmt.Errorf("could not parse the pasted text as a callback URL: %w", err)
 	}
 	if q.Get("code") == "" && q.Get("error") == "" {
-		return nil, fmt.Errorf("no code parameter in %q — paste the whole URL the browser "+
-			"was redirected to, query string included (it looks like "+
-			"…/callback?code=…&state=…). The code on its own is not enough: the state "+
-			"beside it is what proves the callback belongs to this flow", in)
+		return nil, errors.New("no code parameter in what you pasted — paste the whole URL " +
+			"the browser was redirected to, query string included (it looks like " +
+			"…/callback?code=…&state=…). The code on its own is not enough: the state " +
+			"beside it is what proves the callback belongs to this flow")
 	}
 	return q, nil
 }

@@ -99,6 +99,30 @@ func TestBareCodeErrorExplainsWhy(t *testing.T) {
 	}
 }
 
+// TestParseErrorsDoNotEchoThePaste keeps credential material out of the
+// error text on the one path where it arrives as an argument. What gets
+// pasted here is an authorization code — by definition in the bare-code
+// case — and an error an operator cannot fix is an error they paste into
+// an issue. Single-use and useless without the client secret, so this is
+// hygiene rather than a hole; it is also the only place in the codebase
+// where a credential could reach a string, which is why it is pinned.
+func TestParseErrorsDoNotEchoThePaste(t *testing.T) {
+	for _, tc := range []struct{ name, pasted string }{
+		{"bare code", "AQD-secret-code-123"},
+		{"unparseable", "%zz-secret-code-123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := manualCallbackQuery(tc.pasted)
+			if err == nil {
+				t.Fatalf("manualCallbackQuery(%q) succeeded", tc.pasted)
+			}
+			if strings.Contains(err.Error(), "secret-code-123") {
+				t.Errorf("error echoes the pasted credential: %q", err)
+			}
+		})
+	}
+}
+
 // TestRunManualConsentStoresTheToken exercises the flow end to end
 // against the real store and a stubbed token endpoint, which is what
 // proves the manual path writes a durable token rather than merely

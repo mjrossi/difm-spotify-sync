@@ -474,7 +474,6 @@ func TestAwaitConsentReturnsWhenATokenIsStoredElsewhere(t *testing.T) {
 
 	restore := consentPollInterval
 	consentPollInterval = 10 * time.Millisecond
-	t.Cleanup(func() { consentPollInterval = restore })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -483,7 +482,22 @@ func TestAwaitConsentReturnsWhenATokenIsStoredElsewhere(t *testing.T) {
 	log := slog.New(&listenAddrLogger{Handler: slog.DiscardHandler, addrs: addrs})
 
 	done := make(chan error, 1)
-	go func() { done <- awaitConsent(ctx, "127.0.0.1:0", redirect, flow, log) }()
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		done <- awaitConsent(ctx, "127.0.0.1:0", redirect, flow, log)
+	}()
+
+	// Restore only once awaitConsent has returned. It reads the interval
+	// after publishing its address, which is what unblocks the test below
+	// — so restoring on the way out of a *failing* test would race that
+	// read and report a data race on top of the real failure. The deferred
+	// cancel above runs first (t.Fatal unwinds defers, then cleanups), so
+	// this cannot hang.
+	t.Cleanup(func() {
+		<-returned
+		consentPollInterval = restore
+	})
 
 	addr := <-addrs
 	waitForListener(t, addr)

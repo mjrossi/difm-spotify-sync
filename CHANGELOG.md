@@ -17,6 +17,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Tagged releases: `latest` now tracks the newest release rather than `main`,
   which publishes `edge` and `sha-<short>`.
 - `CONTRIBUTING.md`, `SECURITY.md`, `NOTICE`, and this file.
+- A `HEALTHCHECK` in the image itself, so `docker run` deployments report
+  health without configuring anything. It was previously only in `compose.yaml`.
+- `/difmsync` in the image: the privilege-dropping way to run commands with
+  `docker exec`, which runs as root. Use it in place of `/app/difmsync`.
 
 ### Changed
 
@@ -38,3 +42,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   waiting for consent. Previously, authorizing through a sidecar or restoring a
   database left it waiting forever on a URL nobody was going to open, with the
   account already authorized.
+- Restoring a backup no longer ends in a crash loop. `docker cp` lands the file
+  owned by root and mode `0600`, which the service cannot read; the entrypoint
+  now repairs the database and its sidecars by name rather than only the
+  `/config` directory, which in steady state is already correct.
+- Upgrading with `DIFMSYNC_DB_PATH=/data/difmsync.db` kept works. The old
+  distroless volume is owned by uid 65532, and only `/config` was ever chowned.
+- Day-2 `docker exec` commands no longer leave root-owned files behind. `backup`
+  was the lasting one: run as root it created `/config/backups` and every
+  snapshot in it owned by root, which the service then could not write.
+- `auth --manual` no longer echoes the pasted authorization code back in its
+  error messages.
