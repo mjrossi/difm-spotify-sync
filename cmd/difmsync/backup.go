@@ -16,10 +16,14 @@ import (
 // backupCommand takes a consistent snapshot of the database.
 //
 // This exists as a subcommand rather than only as a `just` recipe because
-// the deployed database lives inside a container built on distroless:
-// there is no shell and no sqlite3 binary in there, so the recipe's
-// `sqlite3 ".backup"` cannot reach it. `docker compose exec connector
-// /app/difmsync backup --to=...` can.
+// the deployed database lives inside a container with no sqlite3 binary
+// in it, so the recipe's `sqlite3 ".backup"` cannot reach it.
+// `docker compose exec connector /difmsync backup --to=...` can.
+//
+// Through /difmsync rather than /app/difmsync: `docker exec` runs as
+// root, and this command creates its destination directory. Run without
+// the privilege drop it leaves /config/backups and every snapshot in it
+// root-owned, which the daemon cannot then write to.
 func backupCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "backup",

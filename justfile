@@ -89,8 +89,8 @@ verify-config:
              $(find cmd/difmsync -name '*.go' -not -name '*_test.go') | sort -u)
     refs=$(grep -roh 'DIFMSYNC_[A-Z_]\+' \
              mise.toml mise.development.toml mise.ci.toml \
-             .env.defaults .env.development .env.local.example \
-             compose.yaml Dockerfile justfile README.md docs/ .github/workflows/ \
+             .env.local.example compose.yaml Dockerfile docker/ justfile \
+             README.md docs/ .github/workflows/ \
            | sort -u)
     # The README table is the documented surface, so it is compared on
     # its own rather than folded into the union above — otherwise a
@@ -139,6 +139,14 @@ loop:
 [group('run')]
 auth:
     mise exec -- go run ./cmd/difmsync auth --log-format=text
+
+# Paste-the-URL consent. Nothing listens, so the redirect URI only has to
+# be registered with Spotify, not reachable — which is what makes this the
+# fallback when the browser is not on the machine running the sync.
+[group('run')]
+[doc('one-time Spotify consent without a callback listener')]
+auth-manual:
+    mise exec -- go run ./cmd/difmsync auth --manual --log-format=text
 
 # list the review queue
 [group('run')]
@@ -197,9 +205,9 @@ resync-rebuild:
     mise exec -- go run ./cmd/difmsync resync --forget-all
 
 # `difmsync backup` rather than `sqlite3 .backup`: it is the same
-# VACUUM INTO under the hood, but it runs inside the distroless container
-# too, where there is no sqlite3 binary and no shell. One code path for
-# the local database and the deployed one beats two that can drift.
+# VACUUM INTO under the hood, but it also runs inside the container,
+# which ships no sqlite3. One code path for the local database and the
+# deployed one beats two that can drift.
 [group('ops')]
 [doc('take a consistent backup of the database (holds the Spotify refresh token)')]
 backup DEST="":
@@ -222,3 +230,12 @@ db:
 [group('ops')]
 docker-build:
     docker build -t difm-spotify-sync:dev .
+
+# Both architectures the release publishes. The build stage
+# cross-compiles rather than emulating, so this is not appreciably slower
+# than building one — worth running before tagging a release, since an
+# arm64 break is otherwise found by whoever pulls it onto a Pi.
+[group('ops')]
+[doc('check the image builds for both published architectures')]
+docker-build-multi:
+    docker buildx build --platform linux/amd64,linux/arm64 -t difm-spotify-sync:multi .

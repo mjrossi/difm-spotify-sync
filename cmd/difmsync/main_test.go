@@ -642,9 +642,10 @@ func TestBackupIsNeverWorldReadable(t *testing.T) {
 // through the CLI, with the exact argv compose.yaml's healthcheck runs.
 //
 // internal/status covers the health rule itself; what nothing covered was
-// the wiring between that rule and the command line. compose.yaml pins
-// `["CMD", "/app/difmsync", "status", "--check"]` and reads *only* the
-// exit code, so a renamed flag, a subcommand that stops returning an
+// the wiring between that rule and the command line. The image's
+// HEALTHCHECK runs /healthcheck.sh, which execs `status --check` through
+// /difmsync, and reads *only* the exit code — so a renamed flag, a
+// subcommand that stops returning an
 // error, or --max-age losing its env source all ship green here and
 // surface as a container that is permanently unhealthy — a failure mode
 // with no error message anywhere, because the check never ran.

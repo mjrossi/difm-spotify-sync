@@ -49,83 +49,45 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
-  docker:
-    name: container image builds
+  # The behavioural gate over the built image lives in its own reusable
+  # workflow, because release.yml has to run the identical one. Duplicated,
+  # the copy that matters — the one guarding `latest` — is the copy that
+  # silently falls behind.
+  container:
+    uses: ./.github/workflows/container-tests.yml
+
+  publish:
+    name: publish the moving tags
+    needs: [check, container]
+    # Publishing is main-only. A pull_request build must never move a tag
+    # a deployment pulls, and a fork PR could not authenticate to GHCR
+    # anyway. `needs` is the other half of that: nothing reaches GHCR
+    # until the Go gate and the container gate have both passed.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Overrides the workflow-level block rather than adding to it, so
     # `contents: read` has to be restated. `packages: write` is scoped to
-    # this job alone — the check job has no reason to hold it.
+    # this job alone — no other job here has reason to hold it.
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
-      # The image is the deployment artifact, so a Dockerfile that stops
-      # building is a release blocker even when the Go build is fine.
-      - name: docker build
-        run: docker build -t difm-spotify-sync:ci .
+      - uses: docker/setup-buildx-action@v3
 
-      # Building proves the Dockerfile parses; it does not prove the
-      # image runs. The failure this catches is a /data that the nonroot
-      # process cannot write, which otherwise first appears as a crash
-      # loop on someone's homelab. `status` opens the database on the
-      # volume, so it exercises exactly that path.
-      - name: image runs and can write its volume
-        run: |
-          set -uo pipefail
-          docker volume create difmsync-ci-data
-
-          # A *positive* assertion. Grepping for the failure string meant
-          # an image that could not start at all — bad entrypoint, missing
-          # binary, exec format error — produced an empty log, matched
-          # nothing, and passed the gate green. So require the specific
-          # output that proves the binary ran, opened the database on the
-          # volume, and applied its migrations.
-          #
-          # `resync --all` on a fresh volume exits non-zero by design:
-          # there is no account row yet, which is exactly the state
-          # asserted on below. GitHub runs this step as `bash -e {0}`,
-          # and the `set -uo pipefail` above does not turn that off, so
-          # the expected failure has to be caught here — otherwise the
-          # step dies on this line, before printing the output or
-          # reaching either assertion. status is pre-set because `set -u`
-          # would trip on it in the success case.
-          status=0
-          out=$(docker run --rm -v difmsync-ci-data:/data \
-                  -e DIFMSYNC_LOG_FORMAT=text \
-                  --entrypoint /app/difmsync difm-spotify-sync:ci \
-                  resync --all 2>&1) || status=$?
-          echo "$out"
-
-          if printf '%s' "$out" | grep -q "unable to open database file"; then
-            echo "::error::/data is not writable by the nonroot user (uid 65532)"
-            exit 1
-          fi
-          # `resync --all` on a fresh volume reaches the account lookup,
-          # which is as far as it can get without credentials. Anything
-          # else means the image did not run.
-          if ! printf '%s' "$out" | grep -qE "no account|cleared the watermark"; then
-            echo "::error::image did not run as expected (exit $status); output above"
-            exit 1
-          fi
-
-
-      # Publishing is main-only. A pull_request build must never move a
-      # tag the homelab pulls, and a fork PR could not authenticate to
-      # GHCR anyway.
+      # Versioned releases are tagged by release.yml on a v* tag; this
+      # publishes the moving tags only. `edge` tracks main, `sha-<short>`
+      # is immutable and is what a deployment pins between releases.
+      # `latest` is deliberately NOT set here — it belongs to the newest
+      # release, so that pulling it gets a version someone tagged on
+      # purpose rather than whatever merged an hour ago.
       #
-      # This pushes the image the steps above just smoke-tested, by tag
-      # rather than by rebuilding it. A second `docker build` here would
-      # publish an artifact that nothing in this job ever ran — which is
-      # precisely the gap the smoke test exists to close.
-      #
-      # Plain docker login/push rather than docker/login-action and
-      # docker/build-push-action: two fewer third-party actions in the
-      # supply chain for a couple of lines of shell, and the job already
-      # drives docker directly.
+      # This rebuilds for both architectures from the gha cache the
+      # container job populated, so the amd64 image published is the one
+      # those smoke tests exercised. buildx cannot --load a multi-arch
+      # result, which is why the test build and this are separate.
       - name: publish to ghcr.io
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           # Passed through the environment rather than interpolated into
           # the script body, so nothing from the event context is ever
@@ -141,14 +103,10 @@ jobs:
           printf '%s' "$GHCR_TOKEN" \
             | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-          # Two tags, and the immutable one is the point. `latest` is the
-          # convenience tag; `sha-<short>` is what makes a rollback a tag
-          # change rather than a rebuild of an older checkout, which is
-          # most of the reason to run a registry for a one-host deploy at
-          # all. docs/deploy.md tells the homelab to pin the sha.
-          docker tag difm-spotify-sync:ci "$IMAGE:latest"
-          docker tag difm-spotify-sync:ci "$IMAGE:sha-${GITHUB_SHA::7}"
-          docker push "$IMAGE:latest"
-          docker push "$IMAGE:sha-${GITHUB_SHA::7}"
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            --cache-from type=gha \
+            --build-arg "VERSION=sha-${GITHUB_SHA::7}" \
+            -t "$IMAGE:edge" \
+            -t "$IMAGE:sha-${GITHUB_SHA::7}" .
 
-          echo "published $IMAGE:sha-${GITHUB_SHA::7}"
+          echo "published $IMAGE:sha-${GITHUB_SHA::7} (amd64, arm64)"

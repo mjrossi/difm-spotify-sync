@@ -19,5 +19,19 @@ UPDATE accounts SET spotify_refresh_token = ? WHERE id = ?;
 -- name: SetWatermark :exec
 UPDATE accounts SET watermark_liked_at = ? WHERE id = ?;
 
+-- Counts rather than returning the token. The only caller is the poll on
+-- the daemon consent wait, which needs to know whether consent has landed,
+-- not what it was: reading a refresh token into memory every ten seconds
+-- is a wider read than the question being asked.
+--
+-- Keep quote characters out of comments in this file. sqlc v1.28 lexes
+-- them as string literals even inside a comment, which shifts every
+-- offset after it and silently truncates the generated SQL of this query
+-- and the next one. The symptom is a runtime SQL logic error: incomplete
+-- input, raised from generated code nobody reads.
+-- name: CountSpotifyRefreshToken :one
+SELECT COUNT(*) FROM accounts WHERE spotify_refresh_token != '' AND id = ?;
+
 -- name: ClearWatermark :exec
 UPDATE accounts SET watermark_liked_at = '' WHERE id = ?;
+

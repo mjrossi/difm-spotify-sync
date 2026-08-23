@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/mjrossi/difm-spotify-sync/security/advisories/new
+    about: Report privately rather than in a public issue. See SECURITY.md.
+  - name: DI.fm API behaviour
+    url: https://github.com/mjrossi/difm-spotify-sync/blob/main/docs/difm-api.md
+    about: The reverse-engineered reference. It is the only record of that API.
