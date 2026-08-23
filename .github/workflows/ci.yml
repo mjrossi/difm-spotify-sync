@@ -49,135 +49,33 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
-  docker:
-    name: container image builds
+  # The behavioural gate over the built image lives in its own reusable
+  # workflow, because release.yml has to run the identical one. Duplicated,
+  # the copy that matters — the one guarding `latest` — is the copy that
+  # silently falls behind.
+  container:
+    uses: ./.github/workflows/container-tests.yml
+
+  publish:
+    name: publish the moving tags
+    needs: [check, container]
+    # Publishing is main-only. A pull_request build must never move a tag
+    # a deployment pulls, and a fork PR could not authenticate to GHCR
+    # anyway. `needs` is the other half of that: nothing reaches GHCR
+    # until the Go gate and the container gate have both passed.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Overrides the workflow-level block rather than adding to it, so
     # `contents: read` has to be restated. `packages: write` is scoped to
-    # this job alone — the check job has no reason to hold it.
+    # this job alone — no other job here has reason to hold it.
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
-
-      # buildx, because the published image is multi-arch. QEMU is not
-      # set up and is not needed: the build stage stays on the build
-      # platform and cross-compiles by TARGETARCH, which only works
-      # because CGO_ENABLED=0 holds.
       - uses: docker/setup-buildx-action@v3
 
-      # The image is the deployment artifact, so a Dockerfile that stops
-      # building is a release blocker even when the Go build is fine.
-      #
-      # Built for the runner's own architecture and loaded locally so the
-      # smoke test below can actually run it. The multi-arch push later
-      # reuses this cache, so the amd64 image that ships is the one these
-      # steps exercised rather than a rebuild of it.
-      - name: docker build
-        run: |
-          docker buildx build --platform linux/amd64 --load \
-            --cache-to type=gha,mode=max --cache-from type=gha \
-            -t difm-spotify-sync:ci .
-
-      # Building proves the Dockerfile parses; it does not prove the
-      # image runs. The failure this catches is a /config the service
-      # cannot write, which otherwise first appears as a crash loop on
-      # someone's homelab. `status` opens the database on the volume, so
-      # it exercises exactly that path.
-      - name: image runs and can write its volume
-        run: |
-          set -uo pipefail
-          docker volume create difmsync-ci-data
-
-          # A *positive* assertion. Grepping for the failure string meant
-          # an image that could not start at all — bad entrypoint, missing
-          # binary, exec format error — produced an empty log, matched
-          # nothing, and passed the gate green. So require the specific
-          # output that proves the binary ran, opened the database on the
-          # volume, and applied its migrations.
-          #
-          # `resync --all` on a fresh volume exits non-zero by design:
-          # there is no account row yet, which is exactly the state
-          # asserted on below. GitHub runs this step as `bash -e {0}`,
-          # and the `set -uo pipefail` above does not turn that off, so
-          # the expected failure has to be caught here — otherwise the
-          # step dies on this line, before printing the output or
-          # reaching either assertion. status is pre-set because `set -u`
-          # would trip on it in the success case.
-          status=0
-          out=$(docker run --rm -v difmsync-ci-data:/config \
-                  -e PUID=1234 -e PGID=1234 \
-                  -e DIFMSYNC_LOG_FORMAT=text \
-                  difm-spotify-sync:ci resync --all 2>&1) || status=$?
-          echo "$out"
-
-          if printf '%s' "$out" | grep -q "unable to open database file"; then
-            echo "::error::/config is not writable by the service"
-            exit 1
-          fi
-          # `resync --all` on a fresh volume reaches the account lookup,
-          # which is as far as it can get without credentials. Anything
-          # else means the image did not run.
-          if ! printf '%s' "$out" | grep -qE "no account|cleared the watermark"; then
-            echo "::error::image did not run as expected (exit $status); output above"
-            exit 1
-          fi
-
-      # The two things the entrypoint rewrite introduced, both of which
-      # fail silently in production if they regress.
-      - name: PUID/PGID is applied and the healthcheck drops privileges
-        run: |
-          set -euo pipefail
-
-          # The database must belong to PUID, not to root. If it does
-          # not, the daemon crash-loops on a bind mount.
-          owner=$(docker run --rm -v difmsync-ci-data:/config alpine \
-                    stat -c '%u:%g' /config/difmsync.db)
-          if [ "$owner" != "1234:1234" ]; then
-            echo "::error::difmsync.db is owned by $owner, want 1234:1234"
-            exit 1
-          fi
-
-          # The healthcheck runs as root under `docker exec`. It must not
-          # leave anything root-owned behind in a directory the service
-          # is not root in — see docker/healthcheck.sh.
-          docker run --rm -v difmsync-ci-data:/config \
-            -e PUID=1234 -e PGID=1234 \
-            --entrypoint /healthcheck.sh difm-spotify-sync:ci || true
-          rooted=$(docker run --rm -v difmsync-ci-data:/config alpine \
-                     find /config -user root -print)
-          if [ -n "$rooted" ]; then
-            echo "::error::the healthcheck left root-owned files in /config:"
-            echo "$rooted"
-            exit 1
-          fi
-
-      # Upgrading from the /data layout must refuse rather than start
-      # clean. A fresh database beside the real one looks like a working
-      # first run and is not one — the refresh token is in the old file.
-      - name: the legacy /data layout is refused, not silently replaced
-        run: |
-          set -uo pipefail
-          docker volume create difmsync-ci-legacy
-          docker run --rm -v difmsync-ci-legacy:/data alpine touch /data/difmsync.db
-          status=0
-          out=$(docker run --rm -v difmsync-ci-legacy:/data difm-spotify-sync:ci status 2>&1) || status=$?
-          echo "$out"
-          if [ "$status" -eq 0 ]; then
-            echo "::error::started against a legacy /data mount instead of refusing"
-            exit 1
-          fi
-          if ! printf '%s' "$out" | grep -q "/data/difmsync.db"; then
-            echo "::error::refused, but without naming the old database; the message is the fix"
-            exit 1
-          fi
-
-      # Publishing is main-only. A pull_request build must never move a
-      # tag a deployment pulls, and a fork PR could not authenticate to
-      # GHCR anyway.
-      #
       # Versioned releases are tagged by release.yml on a v* tag; this
       # publishes the moving tags only. `edge` tracks main, `sha-<short>`
       # is immutable and is what a deployment pins between releases.
@@ -185,12 +83,11 @@ jobs:
       # release, so that pulling it gets a version someone tagged on
       # purpose rather than whatever merged an hour ago.
       #
-      # The push rebuilds for both architectures from the gha cache
-      # populated above, so the amd64 image published is the one the
-      # smoke tests just exercised. buildx cannot --load a multi-arch
+      # This rebuilds for both architectures from the gha cache the
+      # container job populated, so the amd64 image published is the one
+      # those smoke tests exercised. buildx cannot --load a multi-arch
       # result, which is why the test build and this are separate.
       - name: publish to ghcr.io
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           # Passed through the environment rather than interpolated into
           # the script body, so nothing from the event context is ever

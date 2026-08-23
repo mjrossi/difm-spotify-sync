@@ -27,8 +27,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The same behavioural gate ci.yml runs, over the tagged tree. A tag can
+  # point at any commit, including one that never went through a PR, so
+  # without this an entrypoint regression ships straight to `latest` — the
+  # tag every unattended deployment pulls — having passed the Go suite and
+  # nothing that ever started the image.
+  container:
+    uses: ./.github/workflows/container-tests.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+
   release:
     name: publish the image and open the release
+    needs: container
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -96,9 +107,14 @@ jobs:
           printf '%s' "$GHCR_TOKEN" \
             | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-          # Unquoted on purpose: TAG_ARGS is a list of -t flags built
-          # above from a string this workflow already refused unless it
-          # matched semver, so there is nothing in it to split badly.
+          # Unquoted on purpose: TAG_ARGS is a list of -t flags that has
+          # to word-split to be flags at all. Safe because a git ref name
+          # cannot contain the characters that would make that dangerous —
+          # `*`, `?` and `[` are illegal in one, so there is nothing to
+          # glob — and because word splitting does not perform command
+          # substitution regardless. Note it is NOT safe merely because
+          # the semver check ran: the non-semver branch emits TAG_ARGS
+          # too.
           # shellcheck disable=SC2086
           docker buildx build --platform linux/amd64,linux/arm64 --push \
             --cache-from type=gha \
@@ -112,14 +128,34 @@ jobs:
           PRERELEASE: ${{ steps.tags.outputs.prerelease }}
         run: |
           set -euo pipefail
-          flags=""
-          [ "$PRERELEASE" = "true" ] && flags="--prerelease"
+          # Always non-empty, for two reasons: `gh release edit` with no
+          # field to change is an error, and stating which of the two a
+          # release is beats leaving it to gh's date-and-version guess.
+          # It mirrors the image tags — a pre-release moves neither
+          # `latest` here nor `:latest` on the registry.
+          if [ "$PRERELEASE" = "true" ]; then
+            flags="--prerelease"
+          else
+            flags="--latest"
+          fi
           # --generate-notes rather than a hand-written body: the commit
           # log is the record, and a release note nobody writes is worse
           # than one nobody edited.
+          #
+          # Falling back to `edit` because the workflow_dispatch input is
+          # documented as "(re)publish". `create` fails outright on a tag
+          # that already has a release, and it fails *here* — after the
+          # images have been pushed — so a re-run left the registry
+          # updated and the workflow red, which reads as a failed release
+          # rather than a completed one.
           # shellcheck disable=SC2086
-          gh release create "$RAW_TAG" \
-            --title "$RAW_TAG" \
-            --generate-notes \
-            --verify-tag \
-            $flags
+          if gh release view "$RAW_TAG" >/dev/null 2>&1; then
+            echo "::notice::$RAW_TAG already has a release; updating it"
+            gh release edit "$RAW_TAG" --verify-tag $flags
+          else
+            gh release create "$RAW_TAG" \
+              --title "$RAW_TAG" \
+              --generate-notes \
+              --verify-tag \
+              $flags
+          fi
