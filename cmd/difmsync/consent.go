@@ -86,6 +86,18 @@ func (f *consentFlow) Complete(ctx context.Context, q url.Values) error {
 	return f.store.SetSpotifyRefreshToken(ctx, f.accountID, tok.RefreshToken)
 }
 
+// tokenStored reports whether a refresh token has landed for this
+// account, by any route.
+//
+// The daemon's consent wait polls this so consent given somewhere else —
+// `difmsync auth --manual` in a sidecar, a restored database — ends the
+// wait. It reads the store rather than tracking a flag on the flow
+// precisely because the write it is looking for may not have come from
+// this flow at all.
+func (f *consentFlow) tokenStored(ctx context.Context) (bool, error) {
+	return f.store.HasSpotifyRefreshToken(ctx, f.accountID)
+}
+
 // randomToken returns 16 bytes of hex, used for both the OAuth state and
 // the consent server's start nonce.
 func randomToken() (string, error) {

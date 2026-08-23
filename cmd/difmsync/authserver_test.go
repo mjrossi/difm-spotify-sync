@@ -457,3 +457,71 @@ func TestSyncExitsCleanWhenCanceledAwaitingConsent(t *testing.T) {
 		t.Fatal("sync --loop did not return after the context was canceled")
 	}
 }
+
+// TestAwaitConsentReturnsWhenATokenIsStoredElsewhere covers the reason
+// the wait polls the store at all.
+//
+// The daemon's listener is not the only way consent can happen: `difmsync
+// auth --manual` run in a sidecar writes to the same database, and so
+// does restoring a backup. Before the poll existed, awaitConsent returned
+// only on its own callback, so any of those stored a working refresh
+// token and left the daemon waiting forever on a URL nobody was going to
+// open — with the account row already authorized, which is what made it
+// hard to see.
+func TestAwaitConsentReturnsWhenATokenIsStoredElsewhere(t *testing.T) {
+	const redirect = "http://127.0.0.1:3437/callback"
+	flow, store := newConsentFixture(t)
+
+	restore := consentPollInterval
+	consentPollInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	addrs := make(chan string, 1)
+	log := slog.New(&listenAddrLogger{Handler: slog.DiscardHandler, addrs: addrs})
+
+	done := make(chan error, 1)
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		done <- awaitConsent(ctx, "127.0.0.1:0", redirect, flow, log)
+	}()
+
+	// Restore only once awaitConsent has returned. It reads the interval
+	// after publishing its address, which is what unblocks the test below
+	// — so restoring on the way out of a *failing* test would race that
+	// read and report a data race on top of the real failure. The deferred
+	// cancel above runs first (t.Fatal unwinds defers, then cleanups), so
+	// this cannot hang.
+	t.Cleanup(func() {
+		<-returned
+		consentPollInterval = restore
+	})
+
+	addr := <-addrs
+	waitForListener(t, addr)
+
+	// The write another process would have made. Deliberately not through
+	// flow.Complete: the point is that the wait ends on evidence it did
+	// not produce itself.
+	if err := store.SetSpotifyRefreshToken(context.Background(), flow.accountID, "rt-elsewhere"); err != nil {
+		t.Fatalf("SetSpotifyRefreshToken: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("awaitConsent: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("awaitConsent never noticed a token stored outside its own flow")
+	}
+
+	// Same obligation as the callback path: the listener goes away for
+	// the life of the process once there is a token, however it arrived.
+	if conn, err := net.DialTimeout("tcp", addr, 2*time.Second); err == nil {
+		_ = conn.Close()
+		t.Errorf("consent listener still accepting connections on %s after consent", addr)
+	}
+}

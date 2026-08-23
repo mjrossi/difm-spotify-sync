@@ -89,6 +89,23 @@ func (s *Store) SetSpotifyRefreshToken(ctx context.Context, accountID int64, tok
 	return nil
 }
 
+// HasSpotifyRefreshToken reports whether consent has been stored for the
+// account, without reading the token itself.
+//
+// The caller is the daemon's consent wait, which polls this so that a
+// token written by any other entry point — `difmsync auth`, `auth
+// --manual` in a sidecar, a restored database — ends the wait. Before
+// this existed the daemon only ever noticed consent completed through
+// its own listener, so authorizing out of band stored the token and left
+// the daemon waiting on a URL nobody was going to open.
+func (s *Store) HasSpotifyRefreshToken(ctx context.Context, accountID int64) (bool, error) {
+	n, err := s.q.CountSpotifyRefreshToken(ctx, accountID)
+	if err != nil {
+		return false, fmt.Errorf("sqlite.HasSpotifyRefreshToken: %w", err)
+	}
+	return n > 0, nil
+}
+
 // SetWatermark advances the incremental-sync high-water mark. Callers must
 // only do this after a fully successful pass, so an interrupted run
 // re-reads rather than skipping likes it never processed.

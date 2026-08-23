@@ -1,0 +1,51 @@
+name: Bug report
+description: Something does not work the way it says it does
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check the "Things that look like bugs and are
+        not" section of [CONTRIBUTING.md](https://github.com/mjrossi/difm-spotify-sync/blob/main/CONTRIBUTING.md) — the
+        add-only sync direction and the held-back watermark are both deliberate
+        and both look like bugs.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        `docker logs <container>`, or the output of the command that failed.
+        **Check them for secrets first** — a DI.fm request URL contains your
+        member id, and the redacted things are worth redacting.
+      render: text
+  - type: textarea
+    id: status
+    attributes:
+      label: difmsync status
+      description: Output of `difmsync status` (it carries no secrets).
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Image tag, or `git rev-parse --short HEAD` for a build from source.
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How are you running it?
+      options:
+        - Docker (published image)
+        - Docker (built from source)
+        - Binary directly / CLI
+        - Other
+    validations:
+      required: true

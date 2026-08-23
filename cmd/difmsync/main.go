@@ -374,7 +374,7 @@ func syncCommand() *cli.Command {
 						"addr", c.String("http-addr"))
 				}
 				// The same warning for the same reason, and it matters
-				// more here: .env.defaults sets this for the whole
+				// more here: the image's ENV block sets this for every
 				// container, so `docker compose run connector sync`
 				// inherits a consent server it will never start and
 				// fails with ErrNoCredentials instead.

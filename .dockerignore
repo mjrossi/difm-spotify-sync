@@ -5,11 +5,11 @@ bin/
 *.db
 *.db-shm
 *.db-wal
-# Credentials. `.env` alone matched only the literal name, which stopped
-# covering anything once the secrets moved into .env.local — the glob is
-# what keeps them out of the builder stage and the local BuildKit cache.
-# The committed, secret-free layers (.env.defaults, .env.<env>) are
-# excluded too; the build does not read them.
+# Credentials. The glob rather than the literal name: secrets live in
+# .env.local, and keeping them out of the build context keeps them out of
+# the builder stage and the local BuildKit cache. Non-secret defaults are
+# ENV lines in the Dockerfile now, so there is nothing here the build
+# wants.
 .env*
 mise.local.toml
 mise.*.local.toml

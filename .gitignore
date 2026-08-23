@@ -1,10 +1,10 @@
 # machine-specific overrides (may contain credentials).
 #
-# The dotenv family mirrors the mise one: .env.defaults and .env.<env> are
-# committed and hold no secrets; the .local layers are yours alone. A bare
-# .env is ignored too — nothing reads it as a layer, but Compose picks one
-# up automatically for ${...} interpolation, so a stray file should never
-# reach the repo.
+# There is no committed dotenv layer any more — non-secret defaults live in
+# the Dockerfile's ENV block, and .env.local is the only dotenv file, held
+# by a checkout and holding secrets alone. A bare .env is ignored too:
+# nothing reads it, but Compose picks one up automatically for ${...}
+# interpolation, so a stray file should never reach the repo.
 mise.local.toml
 mise.*.local.toml
 .env

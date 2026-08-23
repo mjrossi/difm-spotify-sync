@@ -1,0 +1,161 @@
+name: release
+
+# Tagged releases. `git tag v0.2.0 && git push --tags` publishes the
+# image and opens a GitHub release.
+#
+# The division of labour with ci.yml: that workflow publishes the moving
+# tags (`edge`, `sha-<short>`) on every push to main, and this one owns
+# `latest` and the version tags. So `docker pull ...:latest` gets a
+# version someone tagged deliberately rather than whatever merged an hour
+# ago — which is the one thing an unattended homelab deployment should
+# never do.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The same behavioural gate ci.yml runs, over the tagged tree. A tag can
+  # point at any commit, including one that never went through a PR, so
+  # without this an entrypoint regression ships straight to `latest` — the
+  # tag every unattended deployment pulls — having passed the Go suite and
+  # nothing that ever started the image.
+  container:
+    uses: ./.github/workflows/container-tests.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+
+  release:
+    name: publish the image and open the release
+    needs: container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # to create the GitHub release
+      packages: write # to push to GHCR
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Tag messages and the full history, for the release notes.
+          fetch-depth: 0
+
+      - uses: jdx/mise-action@v4
+
+      # The gate has to run here too, not only on main. A tag can point
+      # at any commit, including one that never went through a PR, and
+      # publishing `latest` off an unverified tree is exactly the
+      # accident this costs three minutes to prevent.
+      - name: just check
+        env:
+          MISE_ENV: ci
+        run: just check
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: derive the version tags
+        id: tags
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${RAW_TAG#v}"
+
+          # Refuse anything that is not plain semver. A pre-release like
+          # v1.0.0-rc1 must not move `latest` or the 1 / 1.0 aliases, and
+          # deciding that by pattern here beats discovering it after a
+          # release candidate landed on every homelab pulling latest.
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::notice::$RAW_TAG is not plain semver; publishing the exact version only"
+            {
+              echo "tags=-t $IMAGE:$version"
+              echo "version=$version"
+              echo "prerelease=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          major="${version%%.*}"
+          minor="${version%.*}"
+          {
+            echo "tags=-t $IMAGE:$version -t $IMAGE:$minor -t $IMAGE:$major -t $IMAGE:latest"
+            echo "version=$version"
+            echo "prerelease=false"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: publish to ghcr.io
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          TAG_ARGS: ${{ steps.tags.outputs.tags }}
+          VERSION: ${{ steps.tags.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" \
+            | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+          # Unquoted on purpose: TAG_ARGS is a list of -t flags that has
+          # to word-split to be flags at all. Safe because a git ref name
+          # cannot contain the characters that would make that dangerous —
+          # `*`, `?` and `[` are illegal in one, so there is nothing to
+          # glob — and because word splitting does not perform command
+          # substitution regardless. Note it is NOT safe merely because
+          # the semver check ran: the non-semver branch emits TAG_ARGS
+          # too.
+          # shellcheck disable=SC2086
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            --cache-from type=gha \
+            --build-arg "VERSION=$VERSION" \
+            $TAG_ARGS .
+
+      - name: open the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          PRERELEASE: ${{ steps.tags.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Always non-empty, for two reasons: `gh release edit` with no
+          # field to change is an error, and stating which of the two a
+          # release is beats leaving it to gh's date-and-version guess.
+          # It mirrors the image tags — a pre-release moves neither
+          # `latest` here nor `:latest` on the registry.
+          if [ "$PRERELEASE" = "true" ]; then
+            flags="--prerelease"
+          else
+            flags="--latest"
+          fi
+          # --generate-notes rather than a hand-written body: the commit
+          # log is the record, and a release note nobody writes is worse
+          # than one nobody edited.
+          #
+          # Falling back to `edit` because the workflow_dispatch input is
+          # documented as "(re)publish". `create` fails outright on a tag
+          # that already has a release, and it fails *here* — after the
+          # images have been pushed — so a re-run left the registry
+          # updated and the workflow red, which reads as a failed release
+          # rather than a completed one.
+          # shellcheck disable=SC2086
+          if gh release view "$RAW_TAG" >/dev/null 2>&1; then
+            echo "::notice::$RAW_TAG already has a release; updating it"
+            gh release edit "$RAW_TAG" --verify-tag $flags
+          else
+            gh release create "$RAW_TAG" \
+              --title "$RAW_TAG" \
+              --generate-notes \
+              --verify-tag \
+              $flags
+          fi

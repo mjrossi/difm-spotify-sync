@@ -1,0 +1,268 @@
+name: container tests
+
+# Builds the image and runs the behavioural gate over it.
+#
+# Reusable rather than a job inside ci.yml, because release.yml has to run
+# exactly the same gate. A tag can point at any commit, so publishing
+# `latest` — the tag every unattended deployment pulls — off a tree these
+# assertions never touched is precisely the accident worth spending three
+# minutes to prevent.
+#
+# What is asserted here is chosen for failures that are SILENT in
+# production: a crash loop behind `restart: unless-stopped`, a root-owned
+# file the service cannot write, a container that never receives SIGTERM.
+# A build that fails is loud and needs no test.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Ref to check out; defaults to the triggering ref"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    name: image builds and behaves
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # buildx, because the published image is multi-arch. QEMU is needed
+      # only by the arm64 smoke test at the end: the build stage stays on
+      # the build platform and cross-compiles by TARGETARCH, so producing
+      # an arm64 image needs no emulation — running one does.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v3
+
+      # The image is the deployment artifact, so a Dockerfile that stops
+      # building is a release blocker even when the Go build is fine.
+      #
+      # Built for the runner's own architecture and loaded locally so the
+      # smoke tests below can actually run it. The multi-arch push later
+      # reuses this cache, so the amd64 image that ships is the one these
+      # steps exercised rather than a rebuild of it.
+      - name: docker build
+        run: |
+          docker buildx build --platform linux/amd64 --load \
+            --cache-to type=gha,mode=max --cache-from type=gha \
+            -t difm-spotify-sync:ci .
+
+      # Building proves the Dockerfile parses; it does not prove the
+      # image runs. The failure this catches is a /config the service
+      # cannot write, which otherwise first appears as a crash loop on
+      # someone's homelab. `status` opens the database on the volume, so
+      # it exercises exactly that path.
+      - name: image runs and can write its volume
+        run: |
+          set -uo pipefail
+          docker volume create difmsync-ci-data
+
+          # A *positive* assertion. Grepping for the failure string meant
+          # an image that could not start at all — bad entrypoint, missing
+          # binary, exec format error — produced an empty log, matched
+          # nothing, and passed the gate green. So require the specific
+          # output that proves the binary ran, opened the database on the
+          # volume, and applied its migrations.
+          #
+          # `resync --all` on a fresh volume exits non-zero by design:
+          # there is no account row yet, which is exactly the state
+          # asserted on below. GitHub runs this step as `bash -e {0}`,
+          # and the `set -uo pipefail` above does not turn that off, so
+          # the expected failure has to be caught here — otherwise the
+          # step dies on this line, before printing the output or
+          # reaching either assertion. status is pre-set because `set -u`
+          # would trip on it in the success case.
+          status=0
+          out=$(docker run --rm -v difmsync-ci-data:/config \
+                  -e PUID=1234 -e PGID=1234 \
+                  -e DIFMSYNC_LOG_FORMAT=text \
+                  difm-spotify-sync:ci resync --all 2>&1) || status=$?
+          echo "$out"
+
+          if printf '%s' "$out" | grep -q "unable to open database file"; then
+            echo "::error::/config is not writable by the service"
+            exit 1
+          fi
+          # `resync --all` on a fresh volume reaches the account lookup,
+          # which is as far as it can get without credentials. Anything
+          # else means the image did not run.
+          if ! printf '%s' "$out" | grep -qE "no account|cleared the watermark"; then
+            echo "::error::image did not run as expected (exit $status); output above"
+            exit 1
+          fi
+
+      - name: PUID/PGID is applied to the database
+        run: |
+          set -euo pipefail
+
+          # The database must belong to PUID, not to root. If it does
+          # not, the daemon crash-loops on a bind mount.
+          owner=$(docker run --rm -v difmsync-ci-data:/config alpine \
+                    stat -c '%u:%g' /config/difmsync.db)
+          if [ "$owner" != "1234:1234" ]; then
+            echo "::error::difmsync.db is owned by $owner, want 1234:1234"
+            exit 1
+          fi
+
+      # Deliberately NOT reusing difmsync-ci-data. That volume already
+      # holds a cleanly-closed, PUID-owned database, and against one of
+      # those a root-run check creates no new file and SQLite deletes its
+      # sidecars on close — so the assertion passed whether or not the
+      # privilege drop was there at all.
+      #
+      # The state that distinguishes them is a /config the daemon has not
+      # populated yet: first start, a restored volume, a mount that came
+      # up late. Without the drop, root creates the database itself and it
+      # lands root-owned; the entrypoint will not repair a file it did not
+      # expect, and the daemon cannot open its own database.
+      - name: a root-run healthcheck leaves nothing root-owned
+        run: |
+          set -euo pipefail
+          docker volume create difmsync-ci-hc
+          docker run --rm -v difmsync-ci-hc:/config alpine chown 1234:1234 /config
+
+          docker run --rm -v difmsync-ci-hc:/config \
+            -e PUID=1234 -e PGID=1234 \
+            --entrypoint /healthcheck.sh difm-spotify-sync:ci || true
+
+          rooted=$(docker run --rm -v difmsync-ci-hc:/config alpine \
+                     find /config -user root -print)
+          if [ -n "$rooted" ]; then
+            echo "::error::the healthcheck left root-owned files in /config:"
+            echo "$rooted"
+            exit 1
+          fi
+
+          # And prove the assertion above can fail, so a future change
+          # that drops the privilege drop is caught rather than passing
+          # green on a test that never had teeth. Same volume state, same
+          # command, without the wrapper.
+          docker volume create difmsync-ci-hc-neg
+          docker run --rm -v difmsync-ci-hc-neg:/config alpine chown 1234:1234 /config
+          docker run --rm -v difmsync-ci-hc-neg:/config \
+            -e PUID=1234 -e PGID=1234 \
+            --entrypoint /app/difmsync difm-spotify-sync:ci status --check || true
+          if ! docker run --rm -v difmsync-ci-hc-neg:/config alpine \
+                 find /config -user root -print | grep -q .; then
+            echo "::error::the negative control left nothing root-owned either;"
+            echo "::error::this test can no longer tell the two apart"
+            exit 1
+          fi
+
+      # A restore arrives root-owned: `docker cp` chowns to the container
+      # user, and `difmsync backup` wrote the file 0600. The directory
+      # chown does not reach it — /config itself is already correct — so
+      # the entrypoint repairs the database by name. Without that, the
+      # documented restore procedure ends in a crash loop.
+      - name: a root-owned database is repaired on start
+        run: |
+          set -uo pipefail
+          docker volume create difmsync-ci-restore
+          docker run --rm -v difmsync-ci-restore:/config alpine sh -c '
+            chown 1234:1234 /config
+            cp /etc/hostname /config/difmsync.db
+            chown 0:0 /config/difmsync.db
+            chmod 600 /config/difmsync.db'
+
+          docker run --rm -v difmsync-ci-restore:/config \
+            -e PUID=1234 -e PGID=1234 difm-spotify-sync:ci status >/dev/null 2>&1 || true
+
+          owner=$(docker run --rm -v difmsync-ci-restore:/config alpine \
+                    stat -c '%u:%g' /config/difmsync.db)
+          if [ "$owner" != "1234:1234" ]; then
+            echo "::error::a restored database stayed owned by $owner, want 1234:1234"
+            echo "::error::the documented restore procedure ends in a crash loop"
+            exit 1
+          fi
+
+      # Upgrading from the /data layout must refuse rather than start
+      # clean. A fresh database beside the real one looks like a working
+      # first run and is not one — the refresh token is in the old file.
+      - name: the legacy /data layout is refused, not silently replaced
+        run: |
+          set -uo pipefail
+          docker volume create difmsync-ci-legacy
+          docker run --rm -v difmsync-ci-legacy:/data alpine touch /data/difmsync.db
+          status=0
+          out=$(docker run --rm -v difmsync-ci-legacy:/data difm-spotify-sync:ci status 2>&1) || status=$?
+          echo "$out"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::started against a legacy /data mount instead of refusing"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "/data/difmsync.db"; then
+            echo "::error::refused, but without naming the old database; the message is the fix"
+            exit 1
+          fi
+
+      # The engine's clean-stop path — finish the pass in flight, leave
+      # the watermark where it was — depends on difmsync being pid 1 and
+      # receiving SIGTERM directly. Lose the `exec` in the entrypoint and
+      # the shell swallows it: `docker stop` waits out the full grace
+      # period and SIGKILLs, which nobody watches and which no other
+      # assertion here would notice.
+      - name: difmsync is pid 1 and exits 0 on SIGTERM
+        run: |
+          set -euo pipefail
+          docker volume create difmsync-ci-sig
+          cid=$(docker run -d -v difmsync-ci-sig:/config \
+                  -e PUID=1234 -e PGID=1234 \
+                  -e DIFMSYNC_API_KEY=x -e DIFMSYNC_MEMBER_ID=1 \
+                  -e DIFMSYNC_PLAYLIST_ID=p \
+                  -e DIFMSYNC_SPOTIFY_CLIENT_ID=x \
+                  -e DIFMSYNC_SPOTIFY_CLIENT_SECRET=x \
+                  difm-spotify-sync:ci sync --loop)
+          sleep 10
+
+          pid1=$(docker exec "$cid" ps -o pid,user,args | awk '$1 == 1 {print $2, $3}')
+          echo "pid 1: $pid1"
+          case "$pid1" in
+            "1234 /app/difmsync") ;;
+            *)
+              echo "::error::pid 1 is '$pid1', want '1234 /app/difmsync'"
+              docker logs "$cid" || true
+              exit 1
+              ;;
+          esac
+
+          docker stop -t 20 "$cid" >/dev/null
+          code=$(docker inspect -f '{{.State.ExitCode}}' "$cid")
+          if [ "$code" != "0" ]; then
+            echo "::error::SIGTERM produced exit $code, want 0 (the signal is not reaching difmsync)"
+            docker logs "$cid" || true
+            exit 1
+          fi
+          docker rm -f "$cid" >/dev/null
+
+      # arm64 is published, so it has to be run at least once. A Pi and an
+      # ARM NAS are a large share of who this is for, and the failures
+      # that are arm64-only — an exec format error, a package missing on
+      # that arch — reach them and nobody else. Under QEMU, which is why
+      # this is one `status` invocation rather than the suite above.
+      - name: the arm64 image runs
+        run: |
+          set -uo pipefail
+          docker buildx build --platform linux/arm64 --load \
+            --cache-from type=gha \
+            -t difm-spotify-sync:ci-arm64 .
+          docker volume create difmsync-ci-arm64
+          status=0
+          out=$(docker run --rm --platform linux/arm64 \
+                  -v difmsync-ci-arm64:/config \
+                  -e PUID=1234 -e PGID=1234 \
+                  -e DIFMSYNC_LOG_FORMAT=text \
+                  difm-spotify-sync:ci-arm64 resync --all 2>&1) || status=$?
+          echo "$out"
+          if ! printf '%s' "$out" | grep -qE "no account|cleared the watermark"; then
+            echo "::error::the arm64 image did not run as expected (exit $status)"
+            exit 1
+          fi
