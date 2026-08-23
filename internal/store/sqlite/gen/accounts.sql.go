@@ -18,6 +18,27 @@ func (q *Queries) ClearWatermark(ctx context.Context, id int64) error {
 	return err
 }
 
+const countSpotifyRefreshToken = `-- name: CountSpotifyRefreshToken :one
+SELECT COUNT(*) FROM accounts WHERE spotify_refresh_token != '' AND id = ?
+`
+
+// Counts rather than returning the token. The only caller is the poll on
+// the daemon consent wait, which needs to know whether consent has landed,
+// not what it was: reading a refresh token into memory every ten seconds
+// is a wider read than the question being asked.
+//
+// Keep quote characters out of comments in this file. sqlc v1.28 lexes
+// them as string literals even inside a comment, which shifts every
+// offset after it and silently truncates the generated SQL of this query
+// and the next one. The symptom is a runtime SQL logic error: incomplete
+// input, raised from generated code nobody reads.
+func (q *Queries) CountSpotifyRefreshToken(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countSpotifyRefreshToken, id)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getAccountByLabel = `-- name: GetAccountByLabel :one
 SELECT id, label, difm_member_id, spotify_playlist_id,
        spotify_refresh_token, watermark_liked_at, created_at

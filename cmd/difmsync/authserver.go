@@ -221,6 +221,19 @@ func (s *consentServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// consentPollInterval is how often the consent wait re-checks the store
+// for a token it did not write itself.
+//
+// Ten seconds because the thing being waited on is a human with a
+// browser: the cost of a miss is that much extra staring at a terminal,
+// and the cost of the poll is one indexed row read against a database
+// nothing else is touching yet.
+//
+// A var rather than a const only so the test that proves the poll works
+// does not have to take ten seconds to do it. It is read once, when the
+// ticker is created.
+var consentPollInterval = 10 * time.Second
+
 // awaitConsent serves the consent routes until a refresh token is stored
 // or ctx is canceled, then shuts the listener down for the lifetime of
 // the process.
@@ -230,6 +243,13 @@ func (s *consentServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 // is a daemon whose entire job is blocked until consent happens, and an
 // operator who deploys on Friday and clicks the link on Monday should
 // find it still waiting rather than a container that gave up quietly.
+//
+// It also returns when a token appears in the store by some other route,
+// which is what makes every out-of-band path work — `difmsync auth
+// --manual` run in a sidecar, or a database restored from backup. The
+// listener is not the only way consent can happen, and a daemon that
+// only ever noticed its own callback would sit waiting on a URL nobody
+// was going to open.
 func awaitConsent(ctx context.Context, addr, redirect string, flow *consentFlow, log *slog.Logger) error {
 	start, callback, err := consentRoutes(redirect)
 	if err != nil {
@@ -298,16 +318,37 @@ func awaitConsent(ctx context.Context, addr, redirect string, flow *consentFlow,
 	log.Info("spotify consent required — open this URL to authorize",
 		"url", s.startURL(redirect), "listening", ln.Addr().String())
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-serveErr:
-		if err != nil {
-			return fmt.Errorf("consent server: %w", err)
+	poll := time.NewTicker(consentPollInterval)
+	defer poll.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-serveErr:
+			if err != nil {
+				return fmt.Errorf("consent server: %w", err)
+			}
+			return errors.New("consent server stopped before consent completed")
+		case <-s.done:
+			log.Info("spotify consent stored; starting sync")
+			return nil
+		case <-poll.C:
+			// A read failure is logged and the wait continues. The
+			// database is the same one the daemon is about to sync
+			// against, so a persistent failure will resurface loudly
+			// there; killing the consent wait over one transient error
+			// would discard a listener an operator may be seconds away
+			// from using.
+			stored, err := flow.tokenStored(ctx)
+			if err != nil {
+				log.Warn("consent server: could not check for a stored token", "err", err)
+				continue
+			}
+			if stored {
+				log.Info("spotify consent was stored elsewhere; starting sync")
+				return nil
+			}
 		}
-		return errors.New("consent server stopped before consent completed")
-	case <-s.done:
-		log.Info("spotify consent stored; starting sync")
-		return nil
 	}
 }
