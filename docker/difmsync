@@ -1,0 +1,26 @@
+#!/bin/sh
+# The privilege-dropping way to run difmsync inside a running container.
+#
+# `docker exec` runs as the image USER, which is root here, while the
+# daemon runs as PUID:PGID. Any root-run command that opens the database
+# leaves root-owned files behind that the entrypoint will not repair on
+# the next restart — its chown covers the database and its sidecars, not
+# an arbitrary path some other root process created:
+#
+#   - `backup --to=/config/backups/...` creates /config/backups itself,
+#     root-owned 0750, and every snapshot written into it after that.
+#   - `auth --manual` waits on a paste from a human. Abandoned at that
+#     prompt — the browser is on another machine, which is the whole
+#     reason that flow exists — it leaves the WAL sidecars behind.
+#   - `review --approve` and `resync --forget` hold a write transaction
+#     for longer than a `status --check` does.
+#
+# So the documented form is `docker exec difmsync /difmsync <command>`.
+# /app/difmsync is the binary and stays where the entrypoint expects it;
+# this is the door.
+set -eu
+
+if [ "$(id -u)" != "0" ]; then
+    exec /app/difmsync "$@"
+fi
+exec su-exec "${PUID:-1000}:${PGID:-1000}" /app/difmsync "$@"

@@ -52,8 +52,8 @@ WORKDIR /app
 RUN apk add --no-cache su-exec tzdata ca-certificates
 
 COPY --from=build /out/difmsync /app/difmsync
-COPY docker/entrypoint.sh docker/healthcheck.sh /
-RUN chmod +x /entrypoint.sh /healthcheck.sh
+COPY docker/entrypoint.sh docker/healthcheck.sh docker/difmsync /
+RUN chmod +x /entrypoint.sh /healthcheck.sh /difmsync
 
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="difm-spotify-sync" \
@@ -99,6 +99,18 @@ ENV DIFMSYNC_DB_PATH=/config/difmsync.db \
 # 9000, 9090, 9100) and to sit below Linux's default ephemeral range,
 # where a listener can collide with an outbound connection's source port.
 EXPOSE 3436 3437
+
+# In the image rather than only in compose.yaml, so the `docker run`
+# deployment the README leads with is monitored too. Nothing external
+# triggers a sync pass — the interval is an internal ticker — so an
+# unhealthy container is the only signal that syncing has stopped.
+#
+# start-period is long because the first pass cannot succeed until
+# consent is given, and that is a human step with no deadline. A shorter
+# one would report a container unhealthy for no reason other than that
+# nobody has opened the URL yet.
+HEALTHCHECK --interval=5m --timeout=10s --start-period=30m --retries=3 \
+    CMD /healthcheck.sh
 
 # Root at entry, by design — see the entrypoint. It drops to PUID:PGID
 # with `exec`, so difmsync still becomes pid 1 and receives SIGTERM

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Container healthcheck.
 #
-# It drops privileges before touching the database, and that is the whole
+# It goes through /difmsync, which drops privileges, and that is the whole
 # reason this file exists rather than the healthcheck naming the binary
 # directly. `docker exec` runs as the image USER, which is root here,
 # while the daemon runs as PUID. Two ways that goes wrong, both observed:
@@ -27,7 +27,6 @@
 # rule either way, and this still works when DIFMSYNC_HTTP_ADDR is unset.
 set -eu
 
-if [ "$(id -u)" != "0" ]; then
-    exec /app/difmsync status --check
-fi
-exec su-exec "${PUID:-1000}:${PGID:-1000}" /app/difmsync status --check
+# Through /difmsync rather than repeating the drop, so there is one
+# implementation of it and every exec-based entry point shares it.
+exec /difmsync status --check
