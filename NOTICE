@@ -1,0 +1,17 @@
+difm-spotify-sync
+Copyright 2026 Matt Rossi
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+---
+
+This project is not affiliated with, endorsed by, or connected to
+AudioAddict, Inc., DI.fm, or Spotify AB. "DI.fm", "AudioAddict",
+"RadioTunes", "JazzRadio", "RockRadio", "ClassicalRadio", "ZenRadio" and
+"Spotify" are trademarks of their respective owners, used here only to
+describe what this software interoperates with.
+
+It operates against a private, undocumented AudioAddict API rather than a
+published one. No compatibility is promised by anyone, and access may
+change or be withdrawn at any time. Whether running it is consistent with
+DI.fm's terms of service is a determination for each operator to make.
