@@ -134,7 +134,7 @@ Nothing needs to be reachable. The redirect URI only has to be
 *registered* with Spotify — you carry the callback back by hand.
 
 ```sh
-docker exec -it difmsync /app/difmsync auth --manual
+docker exec -it difmsync /difmsync auth --manual
 ```
 
 It prints the consent URL. Open it in any browser anywhere, approve, and
@@ -237,11 +237,20 @@ Use `exec`, so you reach the container that is already running with the
 volume it already has. `run` starts another one:
 
 ```sh
-docker compose exec connector /app/difmsync status
-docker compose exec connector /app/difmsync review
-docker compose exec connector /app/difmsync review --approve=<difm-track-id>
-docker compose exec connector /app/difmsync resync --forget=<id>
+docker compose exec connector /difmsync status
+docker compose exec connector /difmsync review
+docker compose exec connector /difmsync review --approve=<difm-track-id>
+docker compose exec connector /difmsync resync --forget=<id>
 ```
+
+`/difmsync`, not `/app/difmsync`. `docker exec` runs as the image user,
+which is root, while the service runs as `PUID` — so a command that
+writes leaves root-owned files behind that the service cannot then touch.
+`backup` is the one that lasts: run as root it creates `/config/backups`
+root-owned `0750`, and every snapshot after that. `/difmsync` is the same
+binary with the privilege drop in front, and the entrypoint's own repair
+covers only the database and its sidecars, not an arbitrary path some
+root process created.
 
 If you do use `docker compose run`, do **not** add `-v difmsync-data:/config`.
 Compose namespaces volumes by project, so the real one is
@@ -359,13 +368,18 @@ environment:
 After remapping, confirm before assuming:
 
 ```sh
-docker compose exec connector /app/difmsync status   # ledger totals and watermark intact
+docker compose exec connector /difmsync status   # ledger totals and watermark intact
 ```
 
 The volume's contents are owned by uid 65532 if it was created by a
-distroless-era image. The entrypoint chowns `/config` on start, so this
-resolves itself — but set `PUID`/`PGID` to what you actually want first,
-since that is what it chowns *to*.
+distroless-era image, and that uid no longer exists in this one. Both
+branches above are covered on start: remapping puts the volume at
+`/config`, which the entrypoint chowns, and keeping the old path is
+repaired through `DIFMSYNC_DB_PATH` — the database, its sidecars and the
+`/data` directory itself, which the `/config` chown never reaches.
+
+Set `PUID`/`PGID` to what you actually want *before* the first start
+either way, since that is what it chowns to.
 
 ### Deploying into an existing Compose stack
 
@@ -392,7 +406,7 @@ Always dry-run first. A one-way playlist append is tedious to undo by
 hand.
 
 ```sh
-docker compose exec connector /app/difmsync sync --dry-run
+docker compose exec connector /difmsync sync --dry-run
 ```
 
 Read the report. Confirm the auto-add candidates are actually right, then
@@ -416,7 +430,7 @@ the 15m interval, so one missed pass is tolerated and two are not).
 
 ```sh
 docker compose ps                                            # healthy / unhealthy
-docker compose exec connector /app/difmsync status --check   # the same verdict, with a reason
+docker compose exec connector /difmsync status --check   # the same verdict, with a reason
 curl -s http://<host>:3436/healthz                           # 200 ok, or 503 and the reason
 curl -s http://<host>:3436/status.json | jq                  # the full report
 ```
@@ -439,7 +453,7 @@ docker inspect --format '{{json .State.Health}}' \
 the unhealthy path without waiting 45 minutes for a real stall:
 
 ```sh
-docker compose exec connector /app/difmsync status --check --max-age=1s
+docker compose exec connector /difmsync status --check --max-age=1s
 ```
 
 That should exit non-zero and name how stale the last pass is. Note
@@ -471,7 +485,7 @@ the failure happened to contain (DI.fm request URLs carry the member id,
 for one). The text comes from the CLI, which needs the database anyway:
 
 ```sh
-docker compose exec connector /app/difmsync status
+docker compose exec connector /difmsync status
 ```
 
 A failing pass is not data loss. The watermark only advances after a
@@ -485,7 +499,7 @@ means redoing the one interactive step in the whole system. It also holds
 the ledger, the review queue and the watermark.
 
 ```sh
-docker compose exec connector /app/difmsync backup --to=/config/backups/difmsync-$(date +%F).db
+docker compose exec connector /difmsync backup --to=/config/backups/difmsync-$(date +%F).db
 ```
 
 `$(date)` expands in *your* shell, which is what you want. That writes
@@ -500,7 +514,7 @@ As a nightly cron on the host:
 
 ```cron
 15 4 * * * cd /srv/difm-spotify-sync && docker compose exec -T connector \
-  /app/difmsync backup --to=/config/backups/difmsync-$(date +\%F).db
+  /difmsync backup --to=/config/backups/difmsync-$(date +\%F).db
 ```
 
 `-T` disables TTY allocation, which cron needs. Note the escaped `\%` —
@@ -545,12 +559,20 @@ docker compose run --rm --entrypoint sh connector \
 
 docker compose cp ./difmsync-backup.db connector:/config/difmsync.db
 docker compose start connector
-docker compose exec connector /app/difmsync status
+docker compose exec connector /difmsync status
 ```
 
 Stop first: copying over a database with a live writer attached is how
-you get a corrupt one. The entrypoint chowns `/config` on the next start,
-so a restored file arriving with the wrong owner fixes itself.
+you get a corrupt one.
+
+`docker cp` chowns what it copies to the container's user, which is root,
+and `difmsync backup` wrote the snapshot `0600` — so the restored file
+lands root-owned and unreadable by the service. The entrypoint repairs
+the database, its sidecars and its parent directory by name on the next
+start, which is what makes the copy above safe. Note that it repairs
+*those* paths: the directory chown alone would not, because it re-runs
+only when `/config` itself has the wrong owner, and after a normal first
+run it does not.
 
 **The `rm` is not optional, and skipping it fails silently.** The
 database runs in WAL mode, so committed pages can live in the `-wal` file
@@ -580,8 +602,8 @@ rebuilds the ledger without duplicating anything.
 The sync never re-adds what you deleted from Spotify. To override that:
 
 ```sh
-docker compose exec connector /app/difmsync resync --forget=<difm-track-id>
-docker compose exec connector /app/difmsync sync
+docker compose exec connector /difmsync resync --forget=<difm-track-id>
+docker compose exec connector /difmsync sync
 ```
 
 `--forget` on its own is the whole instruction. Two things suppress a

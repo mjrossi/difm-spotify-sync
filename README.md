@@ -141,7 +141,7 @@ the first row that describes you:
 | You can SSH to the host | `ssh -L 3437:127.0.0.1:3437 <host>`, then open the same URL locally. A tunnelled `127.0.0.1` is still a loopback literal, which is what Spotify requires over plain HTTP. |
 | You use Tailscale | `tailscale serve --bg --set-path /difmsync 3437`, then set `DIFMSYNC_SPOTIFY_REDIRECT_URL` to the resulting HTTPS URL and register it. |
 | You run a reverse proxy | Same idea — proxy to port 3437, set the redirect URL to the public HTTPS origin, register it. |
-| None of the above | `docker exec -it difmsync /app/difmsync auth --manual`. It prints a URL, you approve it in any browser anywhere, and paste back the address you land on. Nothing has to be reachable. |
+| None of the above | `docker exec -it difmsync /difmsync auth --manual`. It prints a URL, you approve it in any browser anywhere, and paste back the address you land on. Nothing has to be reachable. |
 
 Spotify requires HTTPS for any redirect URI that is not a loopback literal
 (`127.0.0.1` or `[::1]`), and rejects `localhost` outright. That single rule is
@@ -187,6 +187,7 @@ Container-level settings, following the usual self-hosted conventions:
 | `PGID` | `1000` | gid, likewise |
 | `UMASK` | `022` | umask for files the service creates |
 | `TZ` | `UTC` | timezone for log timestamps and `difmsync status` output |
+| `CONFIG_DIR` | `/config` | where the volume is mounted; the entrypoint chowns it |
 
 `PUID`/`PGID` matter most with a bind mount, which arrives with whatever
 ownership the host directory already has. Set them to `id -u` / `id -g` for
@@ -232,7 +233,12 @@ difmsync status    # ledger totals, pending count, watermark, recent runs
 difmsync backup    # consistent snapshot of the database
 ```
 
-In a container, reach them with `docker exec difmsync /app/difmsync <command>`.
+In a container, reach them with `docker exec difmsync /difmsync <command>`.
+
+Use `/difmsync`, not `/app/difmsync`. `docker exec` runs as root while the
+service runs as `PUID`, so the wrapper drops privileges first — without it a
+command that writes leaves root-owned files in `/config` that the service then
+cannot touch.
 
 ## Operating it
 
@@ -247,8 +253,9 @@ difmsync status --check    # exit 0 if healthy, non-zero with the reason
 difmsync status --json     # the same report, machine-readable
 ```
 
-`--check` is the container healthcheck. The daemon also serves the same verdict
-over HTTP, for a dashboard:
+`--check` is the container healthcheck — the image declares it, so `docker run`
+and Compose both report health without configuring anything. The daemon also
+serves the same verdict over HTTP, for a dashboard:
 
 | Endpoint | Answer |
 |---|---|

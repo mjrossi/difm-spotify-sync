@@ -17,7 +17,7 @@
 # While there is no refresh token the daemon serves the Spotify consent
 # flow and logs a URL carrying a nonce. Open it, approve, and syncing
 # starts on the next tick. If you cannot reach that port from a browser,
-# `docker compose exec -it connector /app/difmsync auth --manual` needs no
+# `docker compose exec -it connector /difmsync auth --manual` needs no
 # networking at all. See docs/deploy.md.
 services:
   connector:

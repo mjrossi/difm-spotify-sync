@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Before filing, please check the "Things that look like bugs and are
-        not" section of [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) — the
+        not" section of [CONTRIBUTING.md](https://github.com/mjrossi/difm-spotify-sync/blob/main/CONTRIBUTING.md) — the
         add-only sync direction and the held-back watermark are both deliberate
         and both look like bugs.
   - type: textarea
