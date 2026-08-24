@@ -12,17 +12,22 @@
 #   cp .env.local.example .env.local   # then fill it in
 #   chmod 600 .env.local
 #   docker compose up -d
-#   docker compose logs -f connector   # -> the consent URL, once
+#   docker compose logs -f difmsync   # -> the consent URL, once
 #
 # While there is no refresh token the daemon serves the Spotify consent
 # flow and logs a URL carrying a nonce. Open it, approve, and syncing
 # starts on the next tick. If you cannot reach that port from a browser,
-# `docker compose exec -it connector /difmsync auth --manual` needs no
+# `docker compose exec -it difmsync /difmsync auth --manual` needs no
 # networking at all. See docs/deploy.md.
 services:
-  connector:
+  difmsync:
     build: .
     image: difm-spotify-sync:dev
+    # Pinned so `docker exec difmsync ...` works here exactly as it does for
+    # the `docker run` deployment in the README. Without it Compose derives
+    # <project>-difmsync-1, and every day-2 command in docs/deploy.md that a
+    # reader copies from the README half of the docs fails to resolve.
+    container_name: difmsync
     restart: unless-stopped
     env_file:
       # Secrets only. Everything else is an image default or an override

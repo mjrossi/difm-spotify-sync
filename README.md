@@ -48,7 +48,7 @@ There is no hosted service and no account to make here.
 
 ```sh
 docker run -d --name difmsync \
-  -v difmsync-config:/config \
+  -v difmsync-data:/config \
   -p 127.0.0.1:3437:3437 \
   -p 3436:3436 \
   -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
@@ -79,7 +79,7 @@ services:
       DIFMSYNC_SPOTIFY_CLIENT_SECRET: ...
       DIFMSYNC_PLAYLIST_ID: ...
     volumes:
-      - difmsync-config:/config
+      - difmsync-data:/config
     ports:
       - "127.0.0.1:3437:3437"   # one-time consent; inert afterwards
       - "3436:3436"             # /healthz and /status.json
@@ -91,7 +91,7 @@ services:
       start_period: 30m
 
 volumes:
-  difmsync-config:
+  difmsync-data:
 ```
 
 Then authorize once — the container waits for it rather than crash-looping:

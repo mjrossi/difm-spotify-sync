@@ -116,7 +116,7 @@ never calling back. Anything that reaches neither is logged with the path
 it asked for:
 
 ```sh
-docker compose logs connector | grep unrouted
+docker compose logs difmsync | grep unrouted
 ```
 
 ### Behind your own reverse proxy
@@ -198,7 +198,7 @@ what you want if you are changing the code:
 cp .env.local.example .env.local   # then fill in the five secrets
 chmod 600 .env.local               # nothing does this for you
 docker compose up -d
-docker compose logs -f connector   # -> the consent URL, once
+docker compose logs -f difmsync   # -> the consent URL, once
 ```
 
 The first build prints `pull access denied for difm-spotify-sync` before
@@ -237,10 +237,10 @@ Use `exec`, so you reach the container that is already running with the
 volume it already has. `run` starts another one:
 
 ```sh
-docker compose exec connector /difmsync status
-docker compose exec connector /difmsync review
-docker compose exec connector /difmsync review --approve=<difm-track-id>
-docker compose exec connector /difmsync resync --forget=<id>
+docker compose exec difmsync /difmsync status
+docker compose exec difmsync /difmsync review
+docker compose exec difmsync /difmsync review --approve=<difm-track-id>
+docker compose exec difmsync /difmsync resync --forget=<id>
 ```
 
 `/difmsync`, not `/app/difmsync`. `docker exec` runs as the image user,
@@ -371,7 +371,7 @@ environment:
 After remapping, confirm before assuming:
 
 ```sh
-docker compose exec connector /difmsync status   # ledger totals and watermark intact
+docker compose exec difmsync /difmsync status   # ledger totals and watermark intact
 ```
 
 The volume's contents are owned by uid 65532 if it was created by a
@@ -409,7 +409,7 @@ Always dry-run first. A one-way playlist append is tedious to undo by
 hand.
 
 ```sh
-docker compose exec connector /difmsync sync --dry-run
+docker compose exec difmsync /difmsync sync --dry-run
 ```
 
 Read the report. Confirm the auto-add candidates are actually right, then
@@ -433,7 +433,7 @@ the 15m interval, so one missed pass is tolerated and two are not).
 
 ```sh
 docker compose ps                                            # healthy / unhealthy
-docker compose exec connector /difmsync status --check   # the same verdict, with a reason
+docker compose exec difmsync /difmsync status --check   # the same verdict, with a reason
 curl -s http://<host>:3436/healthz                           # 200 ok, or 503 and the reason
 curl -s http://<host>:3436/status.json | jq                  # the full report
 ```
@@ -449,14 +449,14 @@ it:
 
 ```sh
 docker inspect --format '{{json .State.Health}}' \
-  $(docker compose ps -q connector) | jq
+  $(docker compose ps -q difmsync) | jq
 ```
 
 `--max-age` is a flag, so shrinking it is the cheapest way to exercise
 the unhealthy path without waiting 45 minutes for a real stall:
 
 ```sh
-docker compose exec connector /difmsync status --check --max-age=1s
+docker compose exec difmsync /difmsync status --check --max-age=1s
 ```
 
 That should exit non-zero and name how stale the last pass is. Note
@@ -478,7 +478,7 @@ what makes them safe to expose on a LAN without authentication.
 | `no account "default" yet` | Nothing has ever run against this volume | Start the container; it creates the row |
 | `no sync pass has run yet` | The container started but has not completed a pass | Wait one interval; then read the logs |
 | `newest run errored — run …` | A pass failed and the watermark was held back | `difmsync status` for the error text |
-| `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 connector` |
+| `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 difmsync` |
 | `newest run is still in flight` | A pass is running, or was killed mid-run | Wait; if it persists, restart the container |
 
 For the errored case, `/status.json` marks which passes failed, but **not
@@ -488,7 +488,7 @@ the failure happened to contain (DI.fm request URLs carry the member id,
 for one). The text comes from the CLI, which needs the database anyway:
 
 ```sh
-docker compose exec connector /difmsync status
+docker compose exec difmsync /difmsync status
 ```
 
 A failing pass is not data loss. The watermark only advances after a
@@ -502,7 +502,7 @@ means redoing the one interactive step in the whole system. It also holds
 the ledger, the review queue and the watermark.
 
 ```sh
-docker compose exec connector /difmsync backup --to=/config/backups/difmsync-$(date +%F).db
+docker compose exec difmsync /difmsync backup --to=/config/backups/difmsync-$(date +%F).db
 ```
 
 `$(date)` expands in *your* shell, which is what you want. That writes
@@ -510,13 +510,13 @@ into the volume — either let whatever backs up your Docker volumes pick
 it up, or pull it onto the host:
 
 ```sh
-docker compose cp connector:/config/backups/difmsync-$(date +%F).db ./difmsync-backup.db
+docker compose cp difmsync:/config/backups/difmsync-$(date +%F).db ./difmsync-backup.db
 ```
 
 As a nightly cron on the host:
 
 ```cron
-15 4 * * * cd /srv/difm-spotify-sync && docker compose exec -T connector \
+15 4 * * * cd /srv/difm-spotify-sync && docker compose exec -T difmsync \
   /difmsync backup --to=/config/backups/difmsync-$(date +\%F).db
 ```
 
@@ -532,7 +532,7 @@ only means the *backup* fails cleanly; the database it shares the volume
 with still has nowhere to write.
 
 ```cron
-30 4 * * * docker compose exec -T connector \
+30 4 * * * docker compose exec -T difmsync \
   find /config/backups -name 'difmsync-*.db' -mtime +14 -delete
 ```
 
@@ -554,15 +554,15 @@ means writing it *over* the live database:
 ### Restoring
 
 ```sh
-docker compose stop connector
+docker compose stop difmsync
 
 # Both sidecars must go. See below — this step is not optional.
-docker compose run --rm --entrypoint sh connector \
+docker compose run --rm --entrypoint sh difmsync \
   -c 'rm -f /config/difmsync.db-wal /config/difmsync.db-shm'
 
-docker compose cp ./difmsync-backup.db connector:/config/difmsync.db
-docker compose start connector
-docker compose exec connector /difmsync status
+docker compose cp ./difmsync-backup.db difmsync:/config/difmsync.db
+docker compose start difmsync
+docker compose exec difmsync /difmsync status
 ```
 
 Stop first: copying over a database with a live writer attached is how
@@ -605,8 +605,8 @@ rebuilds the ledger without duplicating anything.
 The sync never re-adds what you deleted from Spotify. To override that:
 
 ```sh
-docker compose exec connector /difmsync resync --forget=<difm-track-id>
-docker compose exec connector /difmsync sync
+docker compose exec difmsync /difmsync resync --forget=<difm-track-id>
+docker compose exec difmsync /difmsync sync
 ```
 
 `--forget` on its own is the whole instruction. Two things suppress a
