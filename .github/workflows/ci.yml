@@ -38,16 +38,11 @@ jobs:
       # Runs golangci-lint (which bundles govet, staticcheck, and the
       # gofumpt/goimports format-drift check), the race-enabled test
       # suite, a check that the committed sqlc output still matches the
-      # schema and queries, and a DIFMSYNC_* config-drift check.
+      # schema and queries, a go.mod/go.sum drift check, and a DIFMSYNC_*
+      # config-drift check. One gate, so a contributor running it locally
+      # sees exactly what CI sees.
       - name: just check
         run: just check
-
-      # `just check` does not cover go.mod drift, and a stale go.sum
-      # breaks the container build rather than the Go build.
-      - name: go mod tidy is a no-op
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
 
   # The behavioural gate over the built image lives in its own reusable
   # workflow, because release.yml has to run the identical one. Duplicated,

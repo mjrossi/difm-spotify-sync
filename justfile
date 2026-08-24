@@ -20,11 +20,6 @@ default:
 
 # ── build & verify ────────────────────────────────────
 
-# build the binary to bin/difmsync
-[group('build')]
-build:
-    mkdir -p bin && go build -o bin/difmsync ./cmd/difmsync
-
 # format Go code (gofumpt + goimports, configured in .golangci.yml)
 [group('build')]
 fmt:
@@ -36,11 +31,6 @@ fmt:
 [group('build')]
 lint:
     mise exec -- golangci-lint run
-
-# apply every auto-fixable finding, including formatting
-[group('build')]
-lint-fix:
-    mise exec -- golangci-lint run --fix
 
 # go test ./... with race detector, no cache (matches CI)
 [group('build')]
@@ -59,15 +49,7 @@ gen-check: gen
 
 # the full CI gate — run locally before pushing
 [group('build')]
-check: lint test gen-check verify-config
-
-# Migrations are applied by the binary at boot through goose's library,
-# not this CLI — but the CLI is the way to inspect what actually ran on a
-# database, which is the first question when a deploy misbehaves.
-[group('ops')]
-[doc('show which migrations have been applied to the local database')]
-migrate-status:
-    @mise exec -- goose -dir migrations-sqlite sqlite3 "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}" status
+check: lint test gen-check tidy-check verify-config
 
 # Four of fifteen variables had drifted between the code and the files
 # that set them — a dead DIFMSYNC_NETWORK in mise.toml, a DIFM_* prefix in
@@ -113,10 +95,16 @@ verify-config:
     [ "$status" -eq 0 ] || exit 1
     echo "config consistent: $(echo "$code" | wc -l | tr -d ' ') variable(s), no orphans, all documented"
 
-# go mod tidy
+# Mirrors gen-check: regenerate, then fail if the tree moved. `tidy` on its
+# own enforced nothing — it just ran the command — so the actual gate lived
+# inline in ci.yml, where a contributor running `just check` never saw it. A
+# stale go.sum breaks the container build rather than the Go build, which is
+# the kind of failure that should not wait for CI to find.
 [group('build')]
-tidy:
+[doc('fail if go.mod or go.sum is stale')]
+tidy-check:
     mise exec -- go mod tidy
+    git diff --exit-code -- go.mod go.sum
 
 # ── run ───────────────────────────────────────────────
 
@@ -160,6 +148,14 @@ status:
 
 # ── ops ───────────────────────────────────────────────
 
+# Migrations are applied by the binary at boot through goose's library,
+# not this CLI — but the CLI is the way to inspect what actually ran on a
+# database, which is the first question when a deploy misbehaves.
+[group('ops')]
+[doc('show which migrations have been applied to the local database')]
+migrate-status:
+    @mise exec -- goose -dir migrations-sqlite sqlite3 "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}" status
+
 [group('ops')]
 [doc('list synced tracks with their DI.fm ids (needed by resync-track)')]
 ledger:
@@ -167,14 +163,6 @@ ledger:
         "select difm_track_id, artist, substr(title,1,40) as title, \
                 round(match_score,3) as score, substr(added_at,1,10) as added \
          from synced_tracks order by liked_at desc;"
-
-# `status` reads the same sync_runs table this used to query by hand, and
-# it also answers the question the raw rows only imply: whether a clean
-# pass has happened recently enough to call the sync working.
-[group('ops')]
-[doc('recent sync passes including failures — is it actually working?')]
-runs:
-    @mise exec -- go run ./cmd/difmsync status --limit=10
 
 # Clears the track's ledger row AND rewinds the watermark. Both suppress a
 # re-add, and clearing only the ledger is a silent no-op — the watermark
@@ -225,17 +213,3 @@ backup DEST="":
 [group('ops')]
 db:
     mise exec -- sqlite3 "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}"
-
-# build the container image
-[group('ops')]
-docker-build:
-    docker build -t difm-spotify-sync:dev .
-
-# Both architectures the release publishes. The build stage
-# cross-compiles rather than emulating, so this is not appreciably slower
-# than building one — worth running before tagging a release, since an
-# arm64 break is otherwise found by whoever pulls it onto a Pi.
-[group('ops')]
-[doc('check the image builds for both published architectures')]
-docker-build-multi:
-    docker buildx build --platform linux/amd64,linux/arm64 -t difm-spotify-sync:multi .
