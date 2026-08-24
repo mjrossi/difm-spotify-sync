@@ -60,27 +60,6 @@ repair_owner() {
     fi
 }
 
-# The /data -> /config migration, caught rather than papered over.
-#
-# Deployments before this change mounted the database at /data. If that
-# volume is still mounted and the configured path is empty, starting
-# would create a *fresh* database beside the real one: a daemon with no
-# account row, no ledger and no refresh token, reporting itself as a
-# clean first run. Nothing about that looks like a mistake until the
-# Spotify consent prompt reappears for a deployment that was authorized
-# months ago.
-if [ -f /data/difmsync.db ] && [ ! -f "${DIFMSYNC_DB_PATH:-$CONFIG_DIR/difmsync.db}" ]; then
-    log "found a database at /data/difmsync.db, but DIFMSYNC_DB_PATH points at ${DIFMSYNC_DB_PATH:-$CONFIG_DIR/difmsync.db}, which does not exist."
-    log "This image mounts its database at ${CONFIG_DIR} instead of /data. Refusing to start"
-    log "with a fresh database while the old one is still mounted, because that looks"
-    log "like a working first run and is not one — the refresh token and the whole sync"
-    log "ledger are in the file at /data."
-    log ""
-    log "Either remap the volume:      - difmsync-data:${CONFIG_DIR}"
-    log "or keep the old path:         -e DIFMSYNC_DB_PATH=/data/difmsync.db"
-    exit 1
-fi
-
 umask "$UMASK"
 
 # Already unprivileged: the operator set `user:` in compose, or docker
@@ -116,9 +95,8 @@ fi
 #     user, which is root here, and `difmsync backup` wrote it 0600. The
 #     daemon cannot even read the result.
 #   - A root-run command killed mid-write, leaving root-owned -wal/-shm.
-#   - An upgrade that kept DIFMSYNC_DB_PATH=/data/difmsync.db. The old
-#     distroless image owned that volume as 65532, and CONFIG_DIR chown
-#     never touches /data. The parent goes first for this case: SQLite
+#   - A DIFMSYNC_DB_PATH pointed outside CONFIG_DIR, which the chown
+#     above never reaches. The parent goes first for this case: SQLite
 #     creates the sidecars next to the database, so the directory has to
 #     be writable even when the file itself is already right.
 #

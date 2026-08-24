@@ -62,10 +62,9 @@ LABEL org.opencontainers.image.title="difm-spotify-sync" \
       org.opencontainers.image.version="$VERSION" \
       org.opencontainers.image.source="https://github.com/mjrossi/difm-spotify-sync"
 
-# /config, not /data: the convention self-hosters already have a mount
-# for. The entrypoint refuses to start against an empty /config while a
-# database is still mounted at the old /data path, so upgrading cannot
-# silently begin with a fresh, unauthorized database.
+# /config, the convention self-hosters already have a mount for. The
+# entrypoint chowns it to PUID:PGID on start, so a bind mount whose
+# ownership does not match works without the operator pre-chowning it.
 VOLUME ["/config"]
 
 # Image-level defaults. These live here rather than in a dotenv file the

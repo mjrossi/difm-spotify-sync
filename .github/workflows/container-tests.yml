@@ -184,26 +184,6 @@ jobs:
             exit 1
           fi
 
-      # Upgrading from the /data layout must refuse rather than start
-      # clean. A fresh database beside the real one looks like a working
-      # first run and is not one — the refresh token is in the old file.
-      - name: the legacy /data layout is refused, not silently replaced
-        run: |
-          set -uo pipefail
-          docker volume create difmsync-ci-legacy
-          docker run --rm -v difmsync-ci-legacy:/data alpine touch /data/difmsync.db
-          status=0
-          out=$(docker run --rm -v difmsync-ci-legacy:/data difm-spotify-sync:ci status 2>&1) || status=$?
-          echo "$out"
-          if [ "$status" -eq 0 ]; then
-            echo "::error::started against a legacy /data mount instead of refusing"
-            exit 1
-          fi
-          if ! printf '%s' "$out" | grep -q "/data/difmsync.db"; then
-            echo "::error::refused, but without naming the old database; the message is the fix"
-            exit 1
-          fi
-
       # The engine's clean-stop path — finish the pass in flight, leave
       # the watermark where it was — depends on difmsync being pid 1 and
       # receiving SIGTERM directly. Lose the `exec` in the entrypoint and

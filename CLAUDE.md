@@ -196,10 +196,9 @@ larger instruction than the operator gave.
   production**: that the database ends up owned by `PUID` rather than
   root, that a root-run healthcheck leaves nothing root-owned behind,
   that a root-owned restored database is repaired rather than
-  crash-looping, that difmsync is pid 1 and exits 0 on SIGTERM, that the
-  arm64 image runs at all, and that a legacy `/data` mount is refused
-  rather than replaced with a fresh database. Add to that list when a new
-  startup behaviour can fail quietly.
+  crash-looping, that difmsync is pid 1 and exits 0 on SIGTERM, and that
+  the arm64 image runs at all. Add to that list when a new startup
+  behaviour can fail quietly.
 
   They live in `.github/workflows/container-tests.yml`, which `ci.yml`
   and `release.yml` both call. Both, because a tag can point at any
@@ -258,13 +257,12 @@ wrong:
 - **The entrypoint repairs the database, not just its directory.** The
   conditional chown covers `/config`; the database, its `-wal`/`-shm`
   sidecars and its parent directory are repaired by name, derived from
-  `DIFMSYNC_DB_PATH`. That is what makes two documented procedures work
-  at all — a restore, where `docker cp` lands the file root-owned `0600`
-  inside a correctly-owned `/config`, and an upgrade that keeps
-  `DIFMSYNC_DB_PATH=/data/difmsync.db`, where the volume is owned by the
-  distroless-era 65532 and the `/config` chown never reaches it. Four
-  named paths rather than a recursive walk, so it stays cheap with a year
-  of backups in `/config`.
+  `DIFMSYNC_DB_PATH`. That is what makes the documented restore work at
+  all: `docker cp` lands the file root-owned `0600` inside a correctly-
+  owned `/config`, which the conditional chown skips. It also covers a
+  `DIFMSYNC_DB_PATH` pointed outside `/config` entirely. Four named paths
+  rather than a recursive walk, so it stays cheap with a year of backups
+  in `/config`.
 
 - **The image declares its own `HEALTHCHECK`.** It lived only in
   `compose.yaml`, which left the `docker run` deployment the README leads

@@ -9,7 +9,7 @@ user at startup, and everything it keeps lives in the database mounted at
 - [Authorizing](#authorizing) — the one interactive step
 - [Running it](#running-it)
 - [Volume ownership](#volume-ownership) — read this if it crash-loops
-- [Upgrading](#upgrading), including from the `/data` layout
+- [Upgrading](#upgrading)
 - [Is it still working?](#is-it-still-working)
 - [Backups](#backups) and [restoring](#restoring)
 
@@ -336,53 +336,6 @@ compose pull` gets a version tagged on purpose.
 
 Until v1.0.0 is tagged, only `edge` and `sha-<short>` exist — the release
 tags in the first two rows appear with that release.
-
-### Upgrading from the `/data` layout
-
-Deployments predating the `/config` change mounted the database at
-`/data`. The entrypoint **refuses to start** if it finds a database there
-while the configured path is empty, rather than creating a fresh one
-beside it:
-
-```
-difmsync-init: found a database at /data/difmsync.db, but DIFMSYNC_DB_PATH points at
-/config/difmsync.db, which does not exist.
-```
-
-That refusal is the point. A fresh database looks exactly like a working
-first run — a clean startup, a consent prompt, an empty ledger — and the
-refresh token and the entire sync history are in the file it ignored.
-
-Fix it by remapping the volume, which is a one-line edit and keeps all
-your state:
-
-```yaml
-volumes:
-  - difmsync-data:/config      # was: difmsync-data:/data
-```
-
-Or keep the old path if you would rather not touch it:
-
-```yaml
-environment:
-  DIFMSYNC_DB_PATH: /data/difmsync.db
-```
-
-After remapping, confirm before assuming:
-
-```sh
-docker compose exec difmsync /difmsync status   # ledger totals and watermark intact
-```
-
-The volume's contents are owned by uid 65532 if it was created by a
-distroless-era image, and that uid no longer exists in this one. Both
-branches above are covered on start: remapping puts the volume at
-`/config`, which the entrypoint chowns, and keeping the old path is
-repaired through `DIFMSYNC_DB_PATH` — the database, its sidecars and the
-`/data` directory itself, which the `/config` chown never reaches.
-
-Set `PUID`/`PGID` to what you actually want *before* the first start
-either way, since that is what it chowns to.
 
 ### Deploying into an existing Compose stack
 
