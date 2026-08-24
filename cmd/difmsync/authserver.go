@@ -48,12 +48,9 @@ type consentServer struct {
 // /difmsync/start rather than claiming /start at the root of a hostname
 // that may front several services.
 func consentRoutes(redirect string) (start, callback string, err error) {
-	u, err := url.Parse(redirect)
+	u, err := parseRedirect(redirect)
 	if err != nil {
-		return "", "", fmt.Errorf("parse redirect url %q: %w", redirect, err)
-	}
-	if u.Host == "" {
-		return "", "", fmt.Errorf("redirect url %q has no host", redirect)
+		return "", "", err
 	}
 	callback = u.Path
 	if callback == "" || callback == "/" {
@@ -198,23 +195,18 @@ func (s *consentServer) handleStart(w http.ResponseWriter, r *http.Request) {
 // extra parameter — so the OAuth state is what guards it, which is the
 // standard protection and the same one the `auth` subcommand relies on.
 func (s *consentServer) handleCallback(w http.ResponseWriter, r *http.Request) {
-	// WithoutCancel because a browser that closes the tab the instant the
-	// callback lands would otherwise cancel the token exchange mid-flight,
-	// losing a consent the operator has already given — and the daemon
-	// would go back to waiting with no sign of why.
-	err := s.flow.Complete(context.WithoutCancel(r.Context()), r.URL.Query())
+	err := completeConsentRequest(w, r, s.flow,
+		"Authorized. difmsync will begin syncing on its next tick; you can close this tab.",
+		"\n\nStart the flow again from the URL in the container logs.")
 	if err != nil {
 		// Left running on failure: a mistyped consent, a denied grant or a
 		// transient exchange error should be retryable by clicking the
-		// start URL again, not require restarting the container.
+		// start URL again, not require restarting the container. The
+		// listener therefore narrows only on success, below — the same
+		// condition as `done`, not a second one.
 		s.log.Error("consent server: flow failed", "err", err)
-		http.Error(w, "Consent failed: "+err.Error()+
-			"\n\nStart the flow again from the URL in the container logs.",
-			http.StatusBadRequest)
 		return
 	}
-	fmt.Fprintln(w, "Authorized. difmsync will begin syncing on its next tick; "+
-		"you can close this tab.")
 	select {
 	case s.done <- struct{}{}:
 	default:
@@ -265,38 +257,16 @@ func awaitConsent(ctx context.Context, addr, redirect string, flow *consentFlow,
 		done: make(chan struct{}, 1),
 	}
 
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", addr)
+	srv, err := serveHTTP(ctx, addr, "the consent endpoints", s.handler())
 	if err != nil {
-		return fmt.Errorf("listen on %s for the consent endpoints: %w", addr, err)
+		return err
 	}
-	srv := &http.Server{
-		Handler: s.handler(),
-		// Request contexts derive from the daemon's, so a shutdown that
-		// cancels ctx also unblocks anything in flight here. The exchange
-		// itself opts out with WithoutCancel — a consent already given
-		// must still be stored — and keeps ctx's values either way.
-		BaseContext:       func(net.Listener) context.Context { return ctx },
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-	serveErr := make(chan error, 1)
-	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr <- err
-			return
-		}
-		serveErr <- nil
-	}()
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Warn("consent server shutdown", "err", err)
-		}
-	}()
+	// Deferred at this scope deliberately: the listener must die when
+	// awaitConsent returns, which is what makes the consent server exist
+	// only while there is no refresh token. Moving this anywhere wider
+	// leaves an unauthenticated token-writing endpoint up for the life of
+	// the process. TestAwaitConsentCompletesAndClosesTheListener pins it.
+	defer srv.stop(log)
 
 	// A loopback redirect whose port is not this listener's cannot
 	// complete: the browser connects straight to the redirect's port, so
@@ -316,7 +286,7 @@ func awaitConsent(ctx context.Context, addr, redirect string, flow *consentFlow,
 	// place the nonce is ever emitted, and an operator reading it is by
 	// definition looking at a daemon that cannot sync yet.
 	log.Info("spotify consent required — open this URL to authorize",
-		"url", s.startURL(redirect), "listening", ln.Addr().String())
+		"url", s.startURL(redirect), "listening", srv.Addr.String())
 
 	poll := time.NewTicker(consentPollInterval)
 	defer poll.Stop()
@@ -325,7 +295,7 @@ func awaitConsent(ctx context.Context, addr, redirect string, flow *consentFlow,
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-serveErr:
+		case err := <-srv.Err:
 			if err != nil {
 				return fmt.Errorf("consent server: %w", err)
 			}

@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -237,6 +236,21 @@ func requireFlags(c *cli.Command, names ...string) error {
 	return nil
 }
 
+// withStore opens the database, runs fn against it, and closes it.
+//
+// Only the open and close are shared. Loading the account deliberately is
+// not: `sync` and `auth` call EnsureAccount, which creates the row, and the
+// rest call requireAccount, which demands one. Folding that in would blur a
+// distinction the two exist to keep — see requireAccount below.
+func withStore(ctx context.Context, c *cli.Command, fn func(*sqlite.Store) error) error {
+	store, err := openStore(ctx, c)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+	return fn(store)
+}
+
 // requireAccount loads the configured account, turning the store's bare
 // "no rows" into the one thing the operator can act on.
 //
@@ -251,6 +265,27 @@ func requireAccount(ctx context.Context, c *cli.Command, store *sqlite.Store) (s
 			c.String("account"), err)
 	}
 	return account, nil
+}
+
+// Flags defined on more than one subcommand, built here rather than written
+// out per command. --max-age was two literals with the same env source, which
+// is the shape of drift TestConfigSurfaceIsDocumentedAndConsistent now also
+// guards against; these constructors are what make that guard trivially true
+// rather than merely checked.
+func maxAgeFlag(usage string) cli.Flag {
+	return &cli.DurationFlag{
+		Name: "max-age", Value: 45 * time.Minute,
+		Usage:   usage,
+		Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
+	}
+}
+
+func jsonFlag(usage string) cli.Flag {
+	return &cli.BoolFlag{Name: "json", Usage: usage}
+}
+
+func limitFlag(value int, usage string) cli.Flag {
+	return &cli.IntFlag{Name: "limit", Value: value, Usage: usage}
 }
 
 func syncCommand() *cli.Command {
@@ -283,11 +318,7 @@ func syncCommand() *cli.Command {
 					"only applies with --loop)",
 				Sources: cli.EnvVars("DIFMSYNC_AUTH_HTTP_ADDR"),
 			},
-			&cli.DurationFlag{
-				Name: "max-age", Value: 45 * time.Minute,
-				Usage:   "how stale the last clean pass may be before /healthz reports unhealthy",
-				Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
-			},
+			maxAgeFlag("how stale the last clean pass may be before /healthz reports unhealthy"),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if err := requireFlags(c, "api-key", "member-id", "playlist-id",
@@ -296,162 +327,158 @@ func syncCommand() *cli.Command {
 			}
 			log := newLogger(c)
 
-			store, err := openStore(ctx, c)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = store.Close() }()
-
-			account, err := store.EnsureAccount(ctx, c.String("account"),
-				c.String("member-id"), c.String("playlist-id"))
-			if err != nil {
-				return err
-			}
-
-			auth := spotify.NewAuthenticator(c.String("spotify-client-id"),
-				c.String("spotify-client-secret"), c.String("spotify-redirect-url"))
-
-			difmClient := difm.New(c.String("api-key"), c.String("member-id"))
-			difmClient.Network = c.String("network")
-			difmClient.Logf = func(format string, args ...any) {
-				log.Warn(fmt.Sprintf(format, args...))
-			}
-
-			// Engine construction is behind a closure rather than inline
-			// because the daemon may have to wait for consent before a
-			// Spotify client can exist at all. Both callers below reach it
-			// with a refresh token already in hand, so nothing downstream
-			// has to reason about a half-authenticated engine.
-			newEngine := func(ctx context.Context, account sqlite.Account) (*syncer.Engine, error) {
-				// Persist a rotated refresh token as Spotify issues it. Held
-				// only in memory, a rotation survives until the next restart
-				// and then leaves the daemon presenting a dead token — with
-				// the interactive consent step as the only way back.
-				sp, err := auth.Client(ctx, account.SpotifyRefreshToken, func(tok string) error {
-					log.Info("spotify rotated the refresh token; persisting")
-					return store.SetSpotifyRefreshToken(ctx, account.ID, tok)
-				})
-				if err != nil {
-					return nil, err
-				}
-
-				// Name the playlist in the log before writing to it, so a
-				// misconfigured id is obvious rather than silently wrong.
-				if name, err := sp.PlaylistName(ctx, account.SpotifyPlaylistID); err != nil {
-					// Logged, not swallowed: this is the loudest early signal
-					// that the deployment is pointed at the wrong playlist, or
-					// that the grant lost its scopes. Discarding it defeats
-					// the entire point of the check.
-					log.Warn("could not read target playlist",
-						"id", account.SpotifyPlaylistID, "err", err)
-				} else {
-					log.Info("target playlist", "id", account.SpotifyPlaylistID, "name", name)
-				}
-
-				return &syncer.Engine{
-					DiFM:       difmClient,
-					Spotify:    sp,
-					Store:      store,
-					Account:    account,
-					PlaylistID: account.SpotifyPlaylistID,
-					Thresholds: syncer.Thresholds{
-						Auto:   c.Float("auto-threshold"),
-						Review: c.Float("review-threshold"),
-					},
-					Log: log,
-				}, nil
-			}
-
-			if !c.Bool("loop") {
-				// The endpoints only exist for the lifetime of the process,
-				// so serving them for one pass would mean a listener that
-				// disappears before anything could poll it. Saying so beats
-				// ignoring the flag: a compose file with --http-addr and no
-				// --loop otherwise looks configured and answers nothing.
-				if c.String("http-addr") != "" {
-					log.Warn("--http-addr is ignored without --loop; the status endpoints "+
-						"are served only by the sync loop",
-						"addr", c.String("http-addr"))
-				}
-				// The same warning for the same reason, and it matters
-				// more here: the image's ENV block sets this for every
-				// container, so `docker compose run connector sync`
-				// inherits a consent server it will never start and
-				// fails with ErrNoCredentials instead.
-				if c.String("auth-http-addr") != "" {
-					log.Warn("--auth-http-addr is ignored without --loop; the consent flow "+
-						"is served only by the sync loop (use `difmsync auth` for a one-shot)",
-						"addr", c.String("auth-http-addr"))
-				}
-				engine, err := newEngine(ctx, account)
+			return withStore(ctx, c, func(store *sqlite.Store) error {
+				account, err := store.EnsureAccount(ctx, c.String("account"),
+					c.String("member-id"), c.String("playlist-id"))
 				if err != nil {
 					return err
 				}
-				_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
-				return err
-			}
 
-			loop := func(ctx context.Context) error {
-				// The one step that cannot run headless, handled in-process.
-				//
-				// Returning ErrNoCredentials here is what made a missing
-				// token a crash loop rather than a prompt: the process
-				// exits, `restart: unless-stopped` starts it again, and the
-				// operator sees the same line forever with nothing to act
-				// on. With --auth-http-addr set the daemon instead serves
-				// the consent flow and waits, so the whole deployment is
-				// `up -d` plus one click.
-				//
-				// Unset, the old behavior is preserved exactly, which is
-				// what a workstation running `difmsync sync --loop` wants:
-				// fail loudly and tell the operator to run `difmsync auth`.
-				if account.SpotifyRefreshToken == "" {
-					authAddr := c.String("auth-http-addr")
-					if authAddr == "" {
-						return spotify.ErrNoCredentials
+				auth := spotify.NewAuthenticator(c.String("spotify-client-id"),
+					c.String("spotify-client-secret"), c.String("spotify-redirect-url"))
+
+				difmClient := difm.New(c.String("api-key"), c.String("member-id"))
+				difmClient.Network = c.String("network")
+				difmClient.Logf = func(format string, args ...any) {
+					log.Warn(fmt.Sprintf(format, args...))
+				}
+
+				// Engine construction is behind a closure rather than inline
+				// because the daemon may have to wait for consent before a
+				// Spotify client can exist at all. Both callers below reach it
+				// with a refresh token already in hand, so nothing downstream
+				// has to reason about a half-authenticated engine.
+				newEngine := func(ctx context.Context, account sqlite.Account) (*syncer.Engine, error) {
+					// Persist a rotated refresh token as Spotify issues it. Held
+					// only in memory, a rotation survives until the next restart
+					// and then leaves the daemon presenting a dead token — with
+					// the interactive consent step as the only way back.
+					sp, err := auth.Client(ctx, account.SpotifyRefreshToken, func(tok string) error {
+						log.Info("spotify rotated the refresh token; persisting")
+						return store.SetSpotifyRefreshToken(ctx, account.ID, tok)
+					})
+					if err != nil {
+						return nil, err
 					}
-					flow, err := newConsentFlow(auth, store, account.ID)
+
+					// Name the playlist in the log before writing to it, so a
+					// misconfigured id is obvious rather than silently wrong.
+					if name, err := sp.PlaylistName(ctx, account.SpotifyPlaylistID); err != nil {
+						// Logged, not swallowed: this is the loudest early signal
+						// that the deployment is pointed at the wrong playlist, or
+						// that the grant lost its scopes. Discarding it defeats
+						// the entire point of the check.
+						log.Warn("could not read target playlist",
+							"id", account.SpotifyPlaylistID, "err", err)
+					} else {
+						log.Info("target playlist", "id", account.SpotifyPlaylistID, "name", name)
+					}
+
+					return &syncer.Engine{
+						DiFM:       difmClient,
+						Spotify:    sp,
+						Store:      store,
+						Account:    account,
+						PlaylistID: account.SpotifyPlaylistID,
+						Thresholds: syncer.Thresholds{
+							Auto:   c.Float("auto-threshold"),
+							Review: c.Float("review-threshold"),
+						},
+						Log: log,
+					}, nil
+				}
+
+				if !c.Bool("loop") {
+					// The endpoints only exist for the lifetime of the process,
+					// so serving them for one pass would mean a listener that
+					// disappears before anything could poll it. Saying so beats
+					// ignoring the flag: a compose file with --http-addr and no
+					// --loop otherwise looks configured and answers nothing.
+					if c.String("http-addr") != "" {
+						log.Warn("--http-addr is ignored without --loop; the status endpoints "+
+							"are served only by the sync loop",
+							"addr", c.String("http-addr"))
+					}
+					// The same warning for the same reason, and it matters
+					// more here: the image's ENV block sets this for every
+					// container, so `docker compose run connector sync`
+					// inherits a consent server it will never start and
+					// fails with ErrNoCredentials instead.
+					if c.String("auth-http-addr") != "" {
+						log.Warn("--auth-http-addr is ignored without --loop; the consent flow "+
+							"is served only by the sync loop (use `difmsync auth` for a one-shot)",
+							"addr", c.String("auth-http-addr"))
+					}
+					engine, err := newEngine(ctx, account)
 					if err != nil {
 						return err
 					}
-					if err := awaitConsent(ctx, authAddr,
-						c.String("spotify-redirect-url"), flow, log); err != nil {
-						// A shutdown while waiting is a clean stop, not a
-						// failure — the same verdict Engine.Loop reaches
-						// on a canceled context. Without this the process
-						// contract disagrees with itself: an authorized
-						// daemon exits 0 on SIGTERM and one still waiting
-						// for consent exits 1, which reads as a crash to
-						// anything watching exit codes.
-						if errors.Is(err, context.Canceled) {
-							return nil
+					_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
+					return err
+				}
+
+				loop := func(ctx context.Context) error {
+					// The one step that cannot run headless, handled in-process.
+					//
+					// Returning ErrNoCredentials here is what made a missing
+					// token a crash loop rather than a prompt: the process
+					// exits, `restart: unless-stopped` starts it again, and the
+					// operator sees the same line forever with nothing to act
+					// on. With --auth-http-addr set the daemon instead serves
+					// the consent flow and waits, so the whole deployment is
+					// `up -d` plus one click.
+					//
+					// Unset, the old behavior is preserved exactly, which is
+					// what a workstation running `difmsync sync --loop` wants:
+					// fail loudly and tell the operator to run `difmsync auth`.
+					if account.SpotifyRefreshToken == "" {
+						authAddr := c.String("auth-http-addr")
+						if authAddr == "" {
+							return spotify.ErrNoCredentials
 						}
-						return err
+						flow, err := newConsentFlow(auth, store, account.ID)
+						if err != nil {
+							return err
+						}
+						if err := awaitConsent(ctx, authAddr,
+							c.String("spotify-redirect-url"), flow, log); err != nil {
+							// A shutdown while waiting is a clean stop, not a
+							// failure — the same verdict Engine.Loop reaches
+							// on a canceled context. Without this the process
+							// contract disagrees with itself: an authorized
+							// daemon exits 0 on SIGTERM and one still waiting
+							// for consent exits 1, which reads as a crash to
+							// anything watching exit codes.
+							if errors.Is(err, context.Canceled) {
+								return nil
+							}
+							return err
+						}
+						// Re-read rather than patching the local copy. The token
+						// was written through the store, and everything below
+						// keys off this struct — an in-memory field set by hand
+						// here would work until someone adds a second thing
+						// consent changes.
+						updated, err := store.GetAccount(ctx, c.String("account"))
+						if err != nil {
+							return err
+						}
+						account = updated
 					}
-					// Re-read rather than patching the local copy. The token
-					// was written through the store, and everything below
-					// keys off this struct — an in-memory field set by hand
-					// here would work until someone adds a second thing
-					// consent changes.
-					updated, err := store.GetAccount(ctx, c.String("account"))
+					engine, err := newEngine(ctx, account)
 					if err != nil {
 						return err
 					}
-					account = updated
+					return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
 				}
-				engine, err := newEngine(ctx, account)
-				if err != nil {
-					return err
+				addr := c.String("http-addr")
+				if addr == "" {
+					return loop(ctx)
 				}
-				return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
-			}
-			addr := c.String("http-addr")
-			if addr == "" {
-				return loop(ctx)
-			}
-			return serveWhile(ctx, addr,
-				status.Handler(store, c.String("account"), c.Duration("max-age"), log),
-				log, loop)
+				return serveWhile(ctx, addr,
+					status.Handler(store, c.String("account"), c.Duration("max-age"), log),
+					log, loop)
+			})
 		},
 	}
 }
@@ -481,45 +508,13 @@ func serveWhile(
 	log *slog.Logger,
 	work func(context.Context) error,
 ) error {
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", addr)
+	srv, err := serveHTTP(ctx, addr, "the status endpoints", h)
 	if err != nil {
-		return fmt.Errorf("listen on %s for the status endpoints: %w", addr, err)
+		return err
 	}
-
-	// All four timeouts, not just the one the linter asks for. These
-	// endpoints are reachable by anything on the LAN, and a connection
-	// opened and left idle otherwise occupies the server indefinitely.
-	// WriteTimeout is comfortably above handlerTimeout so a slow database
-	// read still returns its own 503 rather than being cut off mid-body.
-	srv := &http.Server{
-		Handler:           h,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-	serveErr := make(chan error, 1)
-	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr <- err
-			return
-		}
-		serveErr <- nil
-	}()
-	log.Info("status endpoints listening", "addr", ln.Addr().String(),
+	log.Info("status endpoints listening", "addr", srv.Addr.String(),
 		"routes", "/healthz /status.json")
-
-	defer func() {
-		// A fresh context: ctx is already canceled on the shutdown path,
-		// and passing a canceled one makes Shutdown return instantly
-		// without draining anything.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Warn("status server shutdown", "err", err)
-		}
-	}()
+	defer srv.stop(log)
 
 	// Cancelable so the server-died path can stop the sync loop rather
 	// than abandon it. Without this, returning below unwinds into the
@@ -534,7 +529,7 @@ func serveWhile(
 	go func() { workErr <- work(workCtx) }()
 
 	select {
-	case err := <-serveErr:
+	case err := <-srv.Err:
 		// The server died on its own. The sync loop may still be fine,
 		// but it is now unobservable — and an unobservable daemon is the
 		// exact failure this endpoint exists to prevent. Surface it and
@@ -567,65 +562,61 @@ func reviewCommand() *cli.Command {
 		Usage: "list or resolve queued tracks that did not auto-add",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "status", Value: "pending", Usage: "pending|approved|rejected"},
-			&cli.IntFlag{Name: "limit", Value: 50},
+			limitFlag(50, "how many queue items to show"),
 			&cli.IntFlag{Name: "approve", Usage: "approve a DI.fm track id: add its candidate to the playlist"},
 			&cli.IntFlag{Name: "candidate", Value: 1, Usage: "which candidate to approve, 1-based (see --approve)"},
 			&cli.IntFlag{Name: "reject", Usage: "mark a DI.fm track id rejected"},
-			&cli.BoolFlag{Name: "json", Usage: "emit JSON instead of a table"},
+			jsonFlag("emit JSON instead of a table"),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			store, err := openStore(ctx, c)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = store.Close() }()
-
-			account, err := requireAccount(ctx, c, store)
-			if err != nil {
-				return err
-			}
-
-			if id := c.Int("approve"); id != 0 {
-				return approveReview(ctx, c, store, account, int64(id))
-			}
-			if id := c.Int("reject"); id != 0 {
-				ok, err := store.ResolveReview(ctx, account.ID, int64(id), "rejected")
+			return withStore(ctx, c, func(store *sqlite.Store) error {
+				account, err := requireAccount(ctx, c, store)
 				if err != nil {
 					return err
 				}
-				if !ok {
-					return fmt.Errorf("no queued track with DI.fm id %d", id)
-				}
-				fmt.Printf("rejected %d\n", id)
-				return nil
-			}
 
-			items, err := store.ListReview(ctx, account.ID, c.String("status"), c.Int("limit"))
-			if err != nil {
-				return err
-			}
-			if c.Bool("json") {
-				enc := json.NewEncoder(os.Stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(items)
-			}
-			if len(items) == 0 {
-				fmt.Println("review queue is empty")
+				if id := c.Int("approve"); id != 0 {
+					return approveReview(ctx, c, store, account, int64(id))
+				}
+				if id := c.Int("reject"); id != 0 {
+					ok, err := store.ResolveReview(ctx, account.ID, int64(id), "rejected")
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return fmt.Errorf("no queued track with DI.fm id %d", id)
+					}
+					fmt.Printf("rejected %d\n", id)
+					return nil
+				}
+
+				items, err := store.ListReview(ctx, account.ID, c.String("status"), c.Int("limit"))
+				if err != nil {
+					return err
+				}
+				if c.Bool("json") {
+					enc := json.NewEncoder(os.Stdout)
+					enc.SetIndent("", "  ")
+					return enc.Encode(newReviewItemsJSON(items))
+				}
+				if len(items) == 0 {
+					fmt.Println("review queue is empty")
+					return nil
+				}
+				for _, it := range items {
+					fmt.Printf("\n[%d] %s — %s\n", it.DifmTrackID, it.Artist, it.Title)
+					fmt.Printf("    reason=%s best=%.3f duration=%ds\n", it.Reason, it.BestScore, it.DurationSec)
+					for i, cand := range it.Candidates {
+						fmt.Printf("      %d. %.3f  %s — %s  (%ds)  %s\n",
+							i+1, cand.Score, cand.Artist, cand.Title, cand.DurationSec, cand.Why)
+					}
+					if it.DetailsURL != "" {
+						fmt.Printf("    %s\n", it.DetailsURL)
+					}
+				}
+				fmt.Printf("\n%d item(s). Resolve with --approve=<id> or --reject=<id>.\n", len(items))
 				return nil
-			}
-			for _, it := range items {
-				fmt.Printf("\n[%d] %s — %s\n", it.DifmTrackID, it.Artist, it.Title)
-				fmt.Printf("    reason=%s best=%.3f duration=%ds\n", it.Reason, it.BestScore, it.DurationSec)
-				for i, cand := range it.Candidates {
-					fmt.Printf("      %d. %.3f  %s — %s  (%ds)  %s\n",
-						i+1, cand.Score, cand.Artist, cand.Title, cand.DurationSec, cand.Why)
-				}
-				if it.DetailsURL != "" {
-					fmt.Printf("    %s\n", it.DetailsURL)
-				}
-			}
-			fmt.Printf("\n%d item(s). Resolve with --approve=<id> or --reject=<id>.\n", len(items))
-			return nil
+			})
 		},
 	}
 }
@@ -721,51 +712,43 @@ func statusCommand() *cli.Command {
 		Name:  "status",
 		Usage: "show ledger totals, the review backlog and the last sync runs",
 		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "json", Usage: "emit JSON instead of a table"},
+			jsonFlag("emit JSON instead of a table"),
 			&cli.BoolFlag{
 				Name: "check",
 				Usage: "exit non-zero unless a clean sync pass finished within --max-age " +
 					"(this is the container healthcheck)",
 			},
-			&cli.IntFlag{Name: "limit", Value: status.DefaultRunLimit, Usage: "how many recent runs to show"},
-			&cli.DurationFlag{
-				Name: "max-age", Value: 45 * time.Minute,
-				Usage:   "how stale the last clean pass may be before --check fails",
-				Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
-			},
+			limitFlag(status.DefaultRunLimit, "how many recent runs to show"),
+			maxAgeFlag("how stale the last clean pass may be before --check fails"),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			store, err := openStore(ctx, c)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = store.Close() }()
-
-			rep, err := status.Build(ctx, store, c.String("account"),
-				c.Duration("max-age"), c.Int("limit"))
-			if err != nil {
-				return err
-			}
-
-			if c.Bool("check") {
-				// One line, no report: this runs as the container
-				// healthcheck, where the output lands in `docker inspect`
-				// and nothing reads more than the first line of it.
-				if !rep.Healthy {
-					return errors.New(rep.Reason)
+			return withStore(ctx, c, func(store *sqlite.Store) error {
+				rep, err := status.Build(ctx, store, c.String("account"),
+					c.Duration("max-age"), c.Int("limit"))
+				if err != nil {
+					return err
 				}
-				fmt.Println("ok")
+
+				if c.Bool("check") {
+					// One line, no report: this runs as the container
+					// healthcheck, where the output lands in `docker inspect`
+					// and nothing reads more than the first line of it.
+					if !rep.Healthy {
+						return errors.New(rep.Reason)
+					}
+					fmt.Println("ok")
+					return nil
+				}
+
+				if c.Bool("json") {
+					enc := json.NewEncoder(os.Stdout)
+					enc.SetIndent("", "  ")
+					return enc.Encode(rep)
+				}
+
+				printStatus(rep)
 				return nil
-			}
-
-			if c.Bool("json") {
-				enc := json.NewEncoder(os.Stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(rep)
-			}
-
-			printStatus(rep)
-			return nil
+			})
 		},
 	}
 }
