@@ -17,7 +17,6 @@ concurrency:
 
 env:
   # Activates mise.ci.toml's [env] overlay on top of mise.toml.
-  MISE_ENV: ci
 
 jobs:
   check:

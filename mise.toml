@@ -2,10 +2,11 @@
 # (https://mise.jdx.dev), then `mise install` at the repo root provisions
 # everything below.
 #
-# Per-environment overlays:
-#   - mise.development.toml  → MISE_ENV=development (local dev)
-#   - mise.ci.toml           → MISE_ENV=ci (GitHub Actions)
-#   - mise.local.toml        → uncommitted, machine-specific overrides
+# Machine-specific non-secret overrides go in mise.local.toml, which is
+# uncommitted. There are no per-environment overlays: MISE_ENV files for
+# development and ci existed but changed nothing either could observe —
+# every run recipe passed --log-format=text explicitly, and CI runs only
+# `just check`, which reads no DIFMSYNC_* at all.
 #
 # Credentials are NOT here. They live in .env.local, which this file loads
 # below and which compose.yaml also reads — one secrets file for both the
@@ -28,9 +29,12 @@ sqlite = "3.53.4"
 "aqua:golangci/golangci-lint" = "2.12.2"
 
 [env]
-# Defaults that apply everywhere. Per-env files override these.
-DIFMSYNC_LOG_FORMAT = "json"
-DIFMSYNC_LOG_LEVEL = "info"
+# Defaults for a checkout, which is a development environment by
+# definition — hence text logs rather than the image's json. The
+# container carries its own defaults in the Dockerfile's ENV block and
+# does not read this file.
+DIFMSYNC_LOG_FORMAT = "text"
+DIFMSYNC_LOG_LEVEL = "debug"
 DIFMSYNC_INTERVAL = "15m"
 DIFMSYNC_DB_PATH = "./tmp/difmsync.db"
 # Read by --network; DI.fm is the default, but the same API backs

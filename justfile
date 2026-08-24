@@ -67,22 +67,22 @@ tidy-check:
 # one sync pass, writing nothing — the intended first run
 [group('run')]
 dry-run:
-    mise exec -- go run ./cmd/difmsync sync --dry-run --log-format=text
+    mise exec -- go run ./cmd/difmsync sync --dry-run
 
 # one sync pass, writing to the configured playlist
 [group('run')]
 sync:
-    mise exec -- go run ./cmd/difmsync sync --log-format=text
+    mise exec -- go run ./cmd/difmsync sync
 
 # run continuously on DIFMSYNC_INTERVAL
 [group('run')]
 loop:
-    mise exec -- go run ./cmd/difmsync sync --loop --log-format=text
+    mise exec -- go run ./cmd/difmsync sync --loop
 
 # one-time Spotify OAuth consent
 [group('run')]
 auth:
-    mise exec -- go run ./cmd/difmsync auth --log-format=text
+    mise exec -- go run ./cmd/difmsync auth
 
 # Paste-the-URL consent. Nothing listens, so the redirect URI only has to
 # be registered with Spotify, not reachable — which is what makes this the
@@ -90,7 +90,7 @@ auth:
 [group('run')]
 [doc('one-time Spotify consent without a callback listener')]
 auth-manual:
-    mise exec -- go run ./cmd/difmsync auth --manual --log-format=text
+    mise exec -- go run ./cmd/difmsync auth --manual
 
 # list the review queue
 [group('run')]
@@ -163,7 +163,7 @@ backup DEST="":
     # first into an error.
     dest='{{DEST}}'
     [ -n "$dest" ] || dest="./tmp/difmsync-backup-$(date +%Y%m%d-%H%M%S).db"
-    mise exec -- go run ./cmd/difmsync backup --to "$dest" --log-format=text
+    mise exec -- go run ./cmd/difmsync backup --to "$dest"
 
 # open the local SQLite database
 [group('ops')]

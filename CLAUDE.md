@@ -25,10 +25,18 @@ Runtimes and project tools are managed by [mise](https://mise.jdx.dev).
 `mise install` at the repo root provisions everything pinned in
 `mise.toml`: Go, sqlc, goose, just, golangci-lint.
 
-- **`mise.toml`** — base: tool versions + production-default env.
-- **`mise.development.toml`** — local overrides; `MISE_ENV=development`.
-- **`mise.ci.toml`** — CI overrides; `MISE_ENV=ci`.
+- **`mise.toml`** — tool versions plus the env a *checkout* runs with,
+  which is a development environment by definition (text logs, debug
+  level). The container does not read it; its defaults are the
+  Dockerfile's `ENV` block.
 - **`mise.local.toml`** — gitignored, machine-specific non-secret overrides.
+
+  There are no `MISE_ENV` overlays. `mise.development.toml` and
+  `mise.ci.toml` existed and neither could be observed: every `just` run
+  recipe passed `--log-format=text` explicitly, overriding the only
+  setting the dev overlay had, and CI runs `just check`, which reads no
+  `DIFMSYNC_*` at all. Two files that look like configuration and are
+  not cost more than they save.
 - **`.env.local`** — gitignored, and the *only* home for credentials.
   `mise.toml` loads it via `_.file` and `compose.yaml` loads it as its
   only `env_file`, so the host tooling and the container read one file
@@ -399,10 +407,10 @@ green over a daemon that has not completed a real pass in days.
 The row-count clause is a real part of the rule, not an implementation
 detail, so it is stated here rather than left to be discovered. It is
 unreachable at production defaults (20 rows at a 15m interval spans ~5h,
-well past the 45m `--max-age`) but reachable under
-`MISE_ENV=development`, where 20 rows at 2m is 40m — inside the same 45m
-window. There, a clean pass with 20 failures stacked on top of it reports
-unhealthy. That verdict is arguably the better one, which is why the
+well past the 45m `--max-age`) but reachable at any interval short enough
+that 20 rows span less than `--max-age` — a 2m interval, say, where 20
+rows is 40m and the window is 45m. There, a clean pass with 20 failures
+stacked on top of it reports unhealthy. That verdict is arguably the better one, which is why the
 window stays; what is not acceptable is the two disagreeing silently.
 
 The scan window is deliberately decoupled from the caller's display

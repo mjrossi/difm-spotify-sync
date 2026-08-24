@@ -153,21 +153,19 @@ func newLogger(c *cli.Command) *slog.Logger {
 	return log
 }
 
-// openStore opens the database, creating the parent directory if needed,
-// and applies migrations. Every subcommand starts here.
 // mountDiagnostic turns SQLite's "unable to open database file (14)" —
 // which names neither the path nor the reason — into something an
 // operator can act on.
 //
-// This is the first thing a container deployment hits when the data
-// volume is owned by root and the process is not. The image stages /data
-// with --chown, which covers a Docker *named* volume: Docker seeds a
-// fresh named volume from the image's directory, ownership included.
-//
-// It does not cover a bind mount. Pointing /data at a host directory —
-// the obvious move for putting the database on a NAS or in a snapshotted
-// dataset — mounts that directory with the ownership it already has, and
-// nothing in the image can change it. See docs/deploy.md.
+// This is the first thing a container deployment hits when the config
+// volume is owned by root and the process is not. docker/entrypoint.sh
+// covers the cases it can: it chowns CONFIG_DIR when the top level is
+// wrong, and repairs the database and its sidecars by name. What it
+// cannot cover is a bind mount whose interior disagrees with PUID/PGID
+// in some other way — pointing /config at a NAS export or a snapshotted
+// dataset mounts it with the ownership it already has. This message is
+// what turns that into a five-second fix instead of a crash loop under
+// `restart: unless-stopped`. See docs/deploy.md.
 func mountDiagnostic(path string) string {
 	dir := filepath.Dir(path)
 	fi, err := os.Stat(dir)
@@ -184,6 +182,8 @@ func mountDiagnostic(path string) string {
 		dir, fi.Mode().Perm(), owner, os.Getuid(), os.Getgid())
 }
 
+// openStore opens the database, creating the parent directory if needed,
+// and applies migrations. Every subcommand starts here.
 func openStore(ctx context.Context, c *cli.Command) (*sqlite.Store, error) {
 	path := c.String("db-path")
 	if dir := filepath.Dir(path); dir != "" && dir != "." {

@@ -59,8 +59,6 @@ jobs:
       # publishing `latest` off an unverified tree is exactly the
       # accident this costs three minutes to prevent.
       - name: just check
-        env:
-          MISE_ENV: ci
         run: just check
 
       - uses: docker/setup-buildx-action@v3
