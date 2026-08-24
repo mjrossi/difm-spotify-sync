@@ -39,6 +39,21 @@ services:
       # owns whatever you mount at /config; `id -u` and `id -g` on the
       # host. They matter most for a bind mount, which arrives with the
       # ownership the host directory already has.
+      #
+      # Setting them is NOT done in .env.local, and this is the one place
+      # the two dotenv mechanisms differ in a way that bites:
+      #
+      #   env_file:      applied INSIDE the container. .env.local is read
+      #                  here, which is how the credentials arrive.
+      #   ${VAR} below:  interpolated by Compose on the HOST, before the
+      #                  container exists. Compose sources that from your
+      #                  shell or from a file named exactly `.env` — never
+      #                  from an env_file.
+      #
+      # And `environment:` wins over `env_file:`. So PUID=1001 written into
+      # .env.local is read into the container and then immediately
+      # overwritten by the 1000 default below — silently. Export it in your
+      # shell, or edit the value here.
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       TZ: ${TZ:-UTC}

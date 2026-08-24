@@ -110,12 +110,12 @@ status:
 [group('ops')]
 [doc('show which migrations have been applied to the local database')]
 migrate-status:
-    @mise exec -- goose -dir migrations-sqlite sqlite3 "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}" status
+    @mise exec -- goose -dir migrations-sqlite sqlite3 "$DIFMSYNC_DB_PATH" status
 
 [group('ops')]
 [doc('list synced tracks with their DI.fm ids (needed by resync-track)')]
 ledger:
-    @mise exec -- sqlite3 -header -column "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}" \
+    @mise exec -- sqlite3 -header -column "$DIFMSYNC_DB_PATH" \
         "select difm_track_id, artist, substr(title,1,40) as title, \
                 round(match_score,3) as score, substr(added_at,1,10) as added \
          from synced_tracks order by liked_at desc;"
@@ -168,4 +168,4 @@ backup DEST="":
 # open the local SQLite database
 [group('ops')]
 db:
-    mise exec -- sqlite3 "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}"
+    mise exec -- sqlite3 "$DIFMSYNC_DB_PATH"

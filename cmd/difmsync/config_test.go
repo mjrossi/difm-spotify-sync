@@ -201,3 +201,87 @@ func TestConfigSurfaceIsDocumentedAndConsistent(t *testing.T) {
 		}
 	})
 }
+
+// miseEnv matches one assignment in mise.toml's [env] table.
+var miseEnv = regexp.MustCompile(`(?m)^(DIFMSYNC_[A-Z_]+)\s*=\s*"([^"]*)"`)
+
+// shellRef matches $DIFMSYNC_X or ${DIFMSYNC_X...} in the justfile, i.e. a
+// non-Go tool reading the value out of the environment.
+var shellRef = regexp.MustCompile(`\$\{?(DIFMSYNC_[A-Z_]+)`)
+
+// mise.toml's [env] is the checkout's environment, and it drifts the same way
+// the Dockerfile's ENV block did: by accumulating restatements of values the
+// binary already defaults to. DIFMSYNC_INTERVAL and DIFMSYNC_NETWORK were both
+// sitting there set to exactly the flag default, which buys nothing and gives
+// the value a second home that nothing keeps in sync.
+//
+// A variable earns its place by doing one of two jobs:
+//
+//  1. differing from the flag default — a development preference, which is
+//     the point of a checkout having its own environment at all; or
+//  2. being read from the environment by a non-Go tool. goose and sqlite3
+//     cannot see a Go flag default, so `just db` and friends can only open
+//     the same database difmsync uses if the path is exported.
+//
+// Job 2 is detected by looking for the variable in the justfile rather than
+// from a hardcoded list, so this stays true as recipes come and go.
+func TestMiseEnvEarnsItsPlace(t *testing.T) {
+	flags := envFlags(t)
+	mise := repoFile(t, "mise.toml")
+	justfile := repoFile(t, "justfile")
+
+	// [env] only — [tools] and the trailing _.file line are not assignments
+	// this should judge.
+	body := mise
+	if i := strings.Index(body, "\n[env]"); i >= 0 {
+		body = body[i:]
+	}
+
+	shellRead := map[string]bool{}
+	for _, m := range shellRef.FindAllStringSubmatch(justfile, -1) {
+		shellRead[m[1]] = true
+	}
+
+	for _, m := range miseEnv.FindAllStringSubmatch(body, -1) {
+		name, value := m[1], m[2]
+
+		refs, ok := flags[name]
+		if !ok {
+			t.Errorf("mise.toml sets %s but no flag reads it — dead config", name)
+			continue
+		}
+		if !sameValue(value, refs[0].value) {
+			continue // job 1: a genuine development preference
+		}
+		if shellRead[name] {
+			continue // job 2: a non-Go tool reads it from the environment
+		}
+		t.Errorf("mise.toml sets %s=%q, which is already the flag default, "+
+			"and no justfile recipe reads it from the environment. "+
+			"Drop it — a second copy of a default is a second thing to keep in sync.",
+			name, value)
+	}
+}
+
+// Credentials belong in .env.local, which mise.toml loads and compose.yaml
+// also reads as its only env_file. A secret parked in [env] instead would be
+// committed, and would reach the host tooling but not the container — the
+// half-working state that is hardest to diagnose.
+func TestMiseEnvHoldsNoCredentials(t *testing.T) {
+	mise := repoFile(t, "mise.toml")
+	body := mise
+	if i := strings.Index(body, "\n[env]"); i >= 0 {
+		body = body[i:]
+	}
+	for _, m := range miseEnv.FindAllStringSubmatch(body, -1) {
+		switch m[1] {
+		case "DIFMSYNC_API_KEY", "DIFMSYNC_MEMBER_ID", "DIFMSYNC_SPOTIFY_CLIENT_ID",
+			"DIFMSYNC_SPOTIFY_CLIENT_SECRET", "DIFMSYNC_PLAYLIST_ID":
+			t.Errorf("%s is a credential and must live in .env.local, not in committed mise.toml", m[1])
+		}
+	}
+	if !strings.Contains(mise, `_.file = ".env.local"`) {
+		t.Error("mise.toml no longer loads .env.local; the host tooling and the container " +
+			"would stop sharing one copy of the credentials")
+	}
+}

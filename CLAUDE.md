@@ -25,22 +25,56 @@ Runtimes and project tools are managed by [mise](https://mise.jdx.dev).
 `mise install` at the repo root provisions everything pinned in
 `mise.toml`: Go, sqlc, goose, just, golangci-lint.
 
-- **`mise.toml`** — tool versions plus the env a *checkout* runs with,
-  which is a development environment by definition (text logs, debug
-  level). The container does not read it; its defaults are the
-  Dockerfile's `ENV` block.
-- **`mise.local.toml`** — gitignored, machine-specific non-secret overrides.
+Three layers, split by *audience* rather than by environment. Getting
+this wrong is what produced the `.env.defaults`/`.env.<env>` tangle that
+was removed, so the boundary is stated as a rule:
 
-  There are no `MISE_ENV` overlays. `mise.development.toml` and
-  `mise.ci.toml` existed and neither could be observed: every `just` run
-  recipe passed `--log-format=text` explicitly, overriding the only
-  setting the dev overlay had, and CI runs `just check`, which reads no
-  `DIFMSYNC_*` at all. Two files that look like configuration and are
-  not cost more than they save.
-- **`.env.local`** — gitignored, and the *only* home for credentials.
+- **`mise.toml [env]`** — a **checkout's** environment. Committed,
+  non-secret. A variable earns a place here only by (1) differing from
+  the binary's own flag default, making it a deliberate development
+  preference, or (2) being read from the environment by a **non-Go
+  tool** — `goose` and `sqlite3` cannot see a Go flag default, so
+  `DIFMSYNC_DB_PATH` must be exported for `just db` to open the same
+  database `difmsync` writes.
+
+  Restating a flag default earns neither. `DIFMSYNC_INTERVAL` and
+  `DIFMSYNC_NETWORK` both sat here set to exactly the default, which
+  buys nothing and gives the value a second home nothing keeps in sync.
+  `TestMiseEnvEarnsItsPlace` enforces both jobs, detecting (2) by
+  grepping the justfile rather than from a list, so it stays true as
+  recipes change.
+
+- **`.env.local`** — **credentials**, and nothing else. Gitignored.
   `mise.toml` loads it via `_.file` and `compose.yaml` loads it as its
-  only `env_file`, so the host tooling and the container read one file
-  rather than two copies that drift. See `.env.local.example`.
+  only `env_file`, so the host tooling and the container share one copy
+  rather than two that drift. `TestMiseEnvHoldsNoCredentials` fails if a
+  secret appears in committed `mise.toml`, or if that `_.file` line
+  disappears. See `.env.local.example`.
+
+- **`Dockerfile` `ENV`** — the **image's** environment. The container
+  reads neither file above, because `docker run` has no checkout. Same
+  earning rule: only values that differ from the binary's default.
+
+- **`mise.local.toml`** — optional fourth, gitignored, for
+  machine-specific *non-secret* overrides. Not a credential store: a
+  secret parked here reaches the host tooling and never reaches the
+  container, which is the half-working state that takes longest to
+  diagnose.
+
+There are no `MISE_ENV` overlays. `mise.development.toml` and
+`mise.ci.toml` existed and neither could be observed: every `just` run
+recipe passed `--log-format=text` explicitly, overriding the only
+setting the dev overlay had, and CI runs `just check`, which reads no
+`DIFMSYNC_*` at all. Two files that look like configuration and are not
+cost more than they save.
+
+One asymmetry worth knowing, because it looks like a bug: in
+`compose.yaml`, `env_file:` is applied *inside* the container, while
+`${VAR}` interpolation is resolved by Compose *on the host* — from the
+shell or a file named exactly `.env`, never from an `env_file`. Since
+`environment:` also wins over `env_file:`, a `PUID` set in `.env.local`
+is read in and then silently overwritten. Export it or edit
+`compose.yaml`.
 
 Note the scope of that last one. `.env.local` belongs to a **checkout**.
 The published image is configured by environment variables alone, with

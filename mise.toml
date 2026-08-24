@@ -2,15 +2,20 @@
 # (https://mise.jdx.dev), then `mise install` at the repo root provisions
 # everything below.
 #
-# Machine-specific non-secret overrides go in mise.local.toml, which is
-# uncommitted. There are no per-environment overlays: MISE_ENV files for
-# development and ci existed but changed nothing either could observe —
-# every run recipe passed --log-format=text explicitly, and CI runs only
-# `just check`, which reads no DIFMSYNC_* at all.
+# Three layers configure this project, and the split is the whole reason
+# there is no confusion about which file to edit:
 #
-# Credentials are NOT here. They live in .env.local, which this file loads
-# below and which compose.yaml also reads — one secrets file for both the
-# host toolchain and the container. Copy .env.local.example to start.
+#   mise.toml [env]  a CHECKOUT's environment. Committed, non-secret.
+#   .env.local       CREDENTIALS. Gitignored, loaded by this file AND by
+#                    compose.yaml, so there is exactly one copy of them.
+#   Dockerfile ENV   the IMAGE's environment. The container reads neither
+#                    file above; `docker run` needs no checkout.
+#
+# mise.local.toml is the fourth, optional: gitignored, for machine-specific
+# non-secret overrides. It is NOT a place for credentials — those go in
+# .env.local, or the container half of the split silently gets nothing.
+#
+# There are no MISE_ENV overlays. See CLAUDE.md for why they were removed.
 
 [tools]
 # Patch-pinned so reproducibility > convenience.
@@ -29,21 +34,28 @@ sqlite = "3.53.4"
 "aqua:golangci/golangci-lint" = "2.12.2"
 
 [env]
-# Defaults for a checkout, which is a development environment by
-# definition — hence text logs rather than the image's json. The
-# container carries its own defaults in the Dockerfile's ENV block and
-# does not read this file.
+# A variable belongs here only if it earns one of two jobs. Restating a
+# value the binary already defaults to earns neither, and creates a second
+# copy with nothing keeping it honest — DIFMSYNC_INTERVAL and
+# DIFMSYNC_NETWORK both did exactly that. TestMiseEnvEarnsItsPlace
+# enforces this, the same way the Dockerfile's ENV block is enforced.
+#
+# 1. A development preference: a value deliberately different from the
+#    binary's own default, because a checkout is a dev environment and the
+#    image is not.
 DIFMSYNC_LOG_FORMAT = "text"
 DIFMSYNC_LOG_LEVEL = "debug"
-DIFMSYNC_INTERVAL = "15m"
-DIFMSYNC_DB_PATH = "./tmp/difmsync.db"
-# Read by --network; DI.fm is the default, but the same API backs
-# RadioTunes, JazzRadio, RockRadio, ClassicalRadio and ZenRadio.
-DIFMSYNC_NETWORK = "di"
 
-# The five secrets, shared with the container so there is exactly one copy
-# of them. compose.yaml reads the same file as its `.env.local` layer; see
-# .env.local.example for what belongs in it.
+# 2. Something a NON-Go tool needs. goose and sqlite3 cannot read a Go
+#    flag default, so `just db`, `just ledger` and `just migrate-status`
+#    can only find the same database difmsync uses if it is exported.
+#    That it matches the flag default is the point, not a duplicate of it.
+DIFMSYNC_DB_PATH = "./tmp/difmsync.db"
+
+# The five secrets. compose.yaml reads this same file as its only env_file,
+# so the host toolchain and the container share one copy; see
+# .env.local.example for what belongs in it. Keep it to credentials — a
+# non-secret parked here is invisible to anyone reading [env] above.
 #
 # Deliberately last: entries in this block are applied in document order,
 # so a value here beats the defaults above — which is the same precedence
