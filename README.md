@@ -83,12 +83,6 @@ services:
     ports:
       - "127.0.0.1:3437:3437"   # one-time consent; inert afterwards
       - "3436:3436"             # /healthz and /status.json
-    healthcheck:
-      test: ["CMD", "/healthcheck.sh"]
-      interval: 5m
-      timeout: 10s
-      retries: 3
-      start_period: 30m
 
 volumes:
   difmsync-data:
