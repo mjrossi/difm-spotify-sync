@@ -191,8 +191,10 @@ Container-level settings, following the usual self-hosted conventions:
 ownership the host directory already has. Set them to `id -u` / `id -g` for
 whoever owns it. Alternatively set Docker's own `user:` and they are ignored.
 
-`just verify-config` checks this table against the code and runs as part of
-`just check`, so a variable cannot quietly stop being documented.
+`just check` verifies this table against the real command tree — that every
+variable has a row, that no row is dead, and that the defaults stated here are
+the ones the image actually ships. So a variable cannot quietly stop being
+documented, and a default cannot quietly stop being true.
 
 ## How matching works
 

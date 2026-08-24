@@ -189,8 +189,14 @@ larger instruction than the operator gave.
   below the auto bar, and genuine matches stay above it.
 - The DI.fm client tests run against a recorded fixture
   (`pkg/difm/testdata/`), never the live API.
-- `just check` (lint + race tests + codegen drift + config drift) is the
-  gate before pushing.
+- `just check` (lint + race tests + codegen drift + go.mod drift + config
+  drift) is the gate before pushing. The config-drift check is
+  `TestConfigSurfaceIsDocumentedAndConsistent`, a Go test rather than a
+  shell recipe: it walks the real command tree, so it compares default
+  *values* against the README table and the Dockerfile `ENV` block, not
+  just variable names. Each of its four assertions has a verified
+  negative control — a name-only check passed while exactly the drift it
+  existed to catch walked through.
 - The container's own behaviour is gated in CI rather than by hand, and
   the assertions are chosen for failures that are **silent in
   production**: that the database ends up owned by `PUID` rather than

@@ -49,51 +49,7 @@ gen-check: gen
 
 # the full CI gate — run locally before pushing
 [group('build')]
-check: lint test gen-check tidy-check verify-config
-
-# Four of fifteen variables had drifted between the code and the files
-# that set them — a dead DIFMSYNC_NETWORK in mise.toml, a DIFM_* prefix in
-# the docs, a redirect URL missing from the example. That ratio does not
-# improve by hand.
-#
-# Both directions are checked. An orphan (set, read by nothing) is dead
-# config; an undocumented variable (read, in no README table row) is a
-# knob nobody can discover. A gate that only looks one way passes while
-# half the drift it exists to catch walks straight through.
-[group('build')]
-[doc('check DIFMSYNC_* variables agree across code, config and docs')]
-verify-config:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # Tests are excluded: a variable named only in a test is not read by
-    # the binary, and counting it would satisfy the orphan check falsely.
-    code=$(grep -oh 'DIFMSYNC_[A-Z_]\+' \
-             $(find cmd/difmsync -name '*.go' -not -name '*_test.go') | sort -u)
-    refs=$(grep -roh 'DIFMSYNC_[A-Z_]\+' \
-             mise.toml mise.development.toml mise.ci.toml \
-             .env.local.example compose.yaml Dockerfile docker/ justfile \
-             README.md docs/ .github/workflows/ \
-           | sort -u)
-    # The README table is the documented surface, so it is compared on
-    # its own rather than folded into the union above — otherwise a
-    # variable set in mise.toml and absent from the table passes.
-    documented=$(grep -oh 'DIFMSYNC_[A-Z_]\+' README.md | sort -u)
-
-    status=0
-    orphans=$(comm -13 <(echo "$code") <(echo "$refs"))
-    if [ -n "$orphans" ]; then
-        echo "set somewhere but read by nothing in cmd/difmsync:" >&2
-        echo "$orphans" >&2
-        status=1
-    fi
-    undocumented=$(comm -23 <(echo "$code") <(echo "$documented"))
-    if [ -n "$undocumented" ]; then
-        echo "read by cmd/difmsync but missing from the README table:" >&2
-        echo "$undocumented" >&2
-        status=1
-    fi
-    [ "$status" -eq 0 ] || exit 1
-    echo "config consistent: $(echo "$code" | wc -l | tr -d ' ') variable(s), no orphans, all documented"
+check: lint test gen-check tidy-check
 
 # Mirrors gen-check: regenerate, then fail if the tree moved. `tidy` on its
 # own enforced nothing — it just ran the command — so the actual gate lived

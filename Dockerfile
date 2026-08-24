@@ -67,31 +67,41 @@ LABEL org.opencontainers.image.title="difm-spotify-sync" \
 # ownership does not match works without the operator pre-chowning it.
 VOLUME ["/config"]
 
-# Image-level defaults. These live here rather than in a dotenv file the
-# operator has to copy, which is what makes `docker run` with nothing but
-# the five secrets a working deployment.
+# Image-level defaults, so `docker run` with nothing but the five secrets
+# is a working deployment and there is no dotenv file to copy.
 #
-# Two of them are facts about running in a container rather than
-# preferences. DIFMSYNC_DB_PATH must be inside the volume or the database
-# lands in the container's ephemeral filesystem, where it is lost on the
-# next `up` — silently, because SQLite will happily create a fresh one.
-# DIFMSYNC_AUTH_BIND must be 0.0.0.0 because a published port forwards to
-# the container's eth0 address, not its loopback, so a consent listener
-# on 127.0.0.1 is unreachable from the host no matter how it is
-# published. Both are still overridable; both are wrong to override
-# without a specific reason.
-# BuildKit warns SecretsUsedInArgOrEnv for the two names containing
-# AUTH. Both are addresses to listen on, not credentials, and the check
-# matches on the name alone. There is nothing to fix here.
+# The rule for this block: it holds only values that DIFFER from the
+# binary's own default. Restating a default here creates a second copy
+# with nothing keeping it honest — log format, log level, interval and
+# max-age were all duplicated exactly, so editing one and not the other
+# gave an image whose documented behaviour was not its real behaviour.
+# Everything below is a fact about running in a container:
+#
+#   DB_PATH          must be inside the volume, or the database lands in
+#                    the ephemeral layer and is lost on the next `up` —
+#                    silently, because SQLite creates a fresh one.
+#   AUTH_BIND        must be 0.0.0.0: a published port forwards to eth0,
+#                    not loopback, so a consent listener on 127.0.0.1 is
+#                    unreachable from the host however it is published.
+#   HTTP_ADDR        both endpoints are off by default in the binary; a
+#   AUTH_HTTP_ADDR   container is the deployment that wants them on.
+#   REDIRECT_URL     points at the consent port this image publishes,
+#                    rather than the CLI's :8888.
+#
+# All are overridable, and all are wrong to override without a reason.
+#
+# BuildKit warns SecretsUsedInArgOrEnv for the two names containing AUTH.
+# Both are addresses to listen on, not credentials, and the check matches
+# on the name alone. There is nothing to fix here.
+#
+# TestConfigSurfaceIsDocumentedAndConsistent enforces both halves: that
+# what is here matches the README table, and that what is absent falls
+# through to the flag default the table also states.
 ENV DIFMSYNC_DB_PATH=/config/difmsync.db \
     DIFMSYNC_AUTH_BIND=0.0.0.0 \
-    DIFMSYNC_LOG_FORMAT=json \
-    DIFMSYNC_LOG_LEVEL=info \
-    DIFMSYNC_INTERVAL=15m \
     DIFMSYNC_HTTP_ADDR=0.0.0.0:3436 \
     DIFMSYNC_AUTH_HTTP_ADDR=0.0.0.0:3437 \
-    DIFMSYNC_SPOTIFY_REDIRECT_URL=http://127.0.0.1:3437/callback \
-    DIFMSYNC_STATUS_MAX_AGE=45m
+    DIFMSYNC_SPOTIFY_REDIRECT_URL=http://127.0.0.1:3437/callback
 
 # 3436 is "DIFM" on a phone keypad, chosen to stay clear of the ports a
 # homelab usually has spoken for (3000, 8080/8081, 8096, 8123, 8384,
