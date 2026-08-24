@@ -32,6 +32,16 @@ fmt:
 lint:
     mise exec -- golangci-lint run
 
+# A broken workflow fails before any step runs, and Actions rejects the
+# whole file rather than the offending key — so the run reports "likely
+# failed because of a workflow file issue" and produces no logs to read.
+# That is the worst shape a CI failure can take, and it is the one thing
+# the rest of this gate cannot see: nothing else here parses YAML.
+[group('build')]
+[doc('validate .github/workflows against the Actions schema')]
+lint-workflows:
+    mise exec -- actionlint
+
 # go test ./... with race detector, no cache (matches CI)
 [group('build')]
 test:
@@ -49,7 +59,7 @@ gen-check: gen
 
 # the full CI gate — run locally before pushing
 [group('build')]
-check: lint test gen-check tidy-check
+check: lint lint-workflows test gen-check tidy-check
 
 # Mirrors gen-check: regenerate, then fail if the tree moved. `tidy` on its
 # own enforced nothing — it just ran the command — so the actual gate lived

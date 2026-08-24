@@ -29,9 +29,16 @@ go = "1.26.5"
 # sqlite3; without it here, `mise install` leaves them failing with
 # "command not found".
 sqlite = "3.53.4"
-# golangci-lint v2 is the single lint + format gate (govet + staticcheck +
-# gofumpt + goimports all bundled). Config lives in .golangci.yml.
+# golangci-lint v2 is the single lint + format gate for Go (govet +
+# staticcheck + gofumpt + goimports all bundled). Config lives in
+# .golangci.yml.
 "aqua:golangci/golangci-lint" = "2.12.2"
+# Workflow YAML is the one thing `just check` could not see, and a broken
+# workflow fails in a way that produces no logs — Actions rejects the file
+# rather than the step, so there is nothing to read. Deleting a MISE_ENV
+# entry once left an `env:` key with only a comment under it and did
+# exactly that.
+"aqua:rhysd/actionlint" = "1.7.7"
 
 [env]
 # A variable belongs here only if it earns one of two jobs. Restating a

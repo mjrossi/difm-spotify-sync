@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   check:
-    name: lint + test + codegen drift
+    name: lint + test + drift checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -32,11 +32,12 @@ jobs:
         run: go build ./...
 
       # Runs golangci-lint (which bundles govet, staticcheck, and the
-      # gofumpt/goimports format-drift check), the race-enabled test
-      # suite, a check that the committed sqlc output still matches the
-      # schema and queries, a go.mod/go.sum drift check, and a DIFMSYNC_*
-      # config-drift check. One gate, so a contributor running it locally
-      # sees exactly what CI sees.
+      # gofumpt/goimports format-drift check), actionlint over these
+      # workflow files, the race-enabled test suite, a check that the
+      # committed sqlc output still matches the schema and queries, a
+      # go.mod/go.sum drift check, and a DIFMSYNC_* config-drift check.
+      # One gate, so a contributor running it locally sees exactly what
+      # CI sees — including, now, a mistake in this file.
       - name: just check
         run: just check
 

@@ -231,8 +231,18 @@ larger instruction than the operator gave.
   below the auto bar, and genuine matches stay above it.
 - The DI.fm client tests run against a recorded fixture
   (`pkg/difm/testdata/`), never the live API.
-- `just check` (lint + race tests + codegen drift + go.mod drift + config
-  drift) is the gate before pushing. The config-drift check is
+- `just check` (lint + workflow lint + race tests + codegen, go.mod and
+  config drift) is the gate before pushing.
+
+  **`lint-workflows` runs `actionlint` over `.github/workflows/`**, and it
+  is there because a broken workflow is the worst-shaped CI failure
+  available: Actions rejects the whole *file* rather than the offending
+  key, so no step runs, nothing is logged, and the only feedback is
+  "this run likely failed because of a workflow file issue". Nothing else
+  in the gate parses YAML, so this was invisible locally — deleting a
+  `MISE_ENV` entry once left an `env:` key with only a comment under it
+  and cost a red push to discover. It also pins action refs and checks
+  `${{ }}` expressions, both verified against deliberate breaks. The config-drift check is
   `TestConfigSurfaceIsDocumentedAndConsistent`, a Go test rather than a
   shell recipe: it walks the real command tree, so it compares default
   *values* against the README table and the Dockerfile `ENV` block, not

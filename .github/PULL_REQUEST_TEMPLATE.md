@@ -4,7 +4,7 @@
 
 ## Checklist
 
-- [ ] `just check` passes (lint, race tests, codegen drift, config drift)
+- [ ] `just check` passes (lint, workflow lint, race tests, codegen/go.mod/config drift)
 - [ ] Read [`CLAUDE.md`](https://github.com/mjrossi/difm-spotify-sync/blob/main/CLAUDE.md) if this touches the sync
       ordering, the matching thresholds, the DI.fm client, or the status
       endpoints — each has invariants that are easy to break invisibly
