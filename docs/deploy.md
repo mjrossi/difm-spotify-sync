@@ -334,6 +334,9 @@ separate migration step. The build needs BuildKit — the Dockerfile uses
 `latest` follows releases rather than `main`, so an unattended `docker
 compose pull` gets a version tagged on purpose.
 
+Until v1.0.0 is tagged, only `edge` and `sha-<short>` exist — the release
+tags in the first two rows appear with that release.
+
 ### Upgrading from the `/data` layout
 
 Deployments predating the `/config` change mounted the database at
