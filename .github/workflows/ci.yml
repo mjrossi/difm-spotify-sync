@@ -15,9 +15,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Activates mise.ci.toml's [env] overlay on top of mise.toml.
-
 jobs:
   check:
     name: lint + test + codegen drift
