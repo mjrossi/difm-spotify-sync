@@ -124,33 +124,16 @@ func Build(
 		runLimit = DefaultRunLimit
 	}
 
-	account, err := store.GetAccount(ctx, label)
+	account, counts, runs, err := read(ctx, store, label, max(runLimit, healthScanLimit))
 	if err != nil {
-		return Report{}, fmt.Errorf("no account %q yet — run `difmsync auth` first: %w", label, err)
+		return Report{}, err
 	}
 
-	synced, err := store.CountSynced(ctx, account.ID)
-	if err != nil {
-		return Report{}, err
-	}
-	// COUNT(*), not len() of a capped listing: a queue past the cap
-	// previously reported the cap as its size.
-	pending, err := store.CountReview(ctx, account.ID, "pending")
-	if err != nil {
-		return Report{}, err
-	}
-	actionable, err := store.CountActionableReview(ctx, account.ID)
-	if err != nil {
-		return Report{}, err
-	}
-	scan := max(runLimit, healthScanLimit)
-	runs, err := store.ListRuns(ctx, account.ID, scan)
-	if err != nil {
-		return Report{}, err
-	}
-	// Decide first, over the whole scan window, then trim to what the
-	// caller asked to see.
+	// Decide over the whole scan window, then trim to what the caller
+	// asked to see — so two callers wanting different amounts of detail
+	// cannot disagree about whether the sync is working.
 	healthy, reason := health(runs, maxAge, time.Now())
+
 	// Checked after health() rather than inside it, because health() is
 	// about whether passes are completing and this is about whether the
 	// daemon has been given the credentials to run one at all. It wins
@@ -162,9 +145,68 @@ func Build(
 		healthy = false
 		reason = "awaiting Spotify consent — open the authorization URL from the daemon log"
 	}
+
 	if len(runs) > runLimit {
 		runs = runs[:runLimit]
 	}
+	return assemble(account, counts, runs, authorized, healthy, reason), nil
+}
+
+// counts holds the three totals the report carries, read together because
+// they are always read together.
+type counts struct {
+	synced     int64
+	pending    int64
+	actionable int64
+}
+
+// read gathers everything Build reports on. Split out so Build reads as the
+// three decisions it makes rather than as five sequential store calls with
+// the decisions buried among them.
+func read(ctx context.Context, store *sqlite.Store, label string, scan int) (
+	sqlite.Account, counts, []sqlite.SyncRun, error,
+) {
+	account, err := store.GetAccount(ctx, label)
+	if err != nil {
+		return sqlite.Account{}, counts{}, nil, fmt.Errorf(
+			"no account %q yet — run `difmsync auth` first: %w", label, err)
+	}
+
+	var c counts
+	if c.synced, err = store.CountSynced(ctx, account.ID); err != nil {
+		return sqlite.Account{}, counts{}, nil, err
+	}
+	// COUNT(*), not len() of a capped listing: a queue past the cap
+	// previously reported the cap as its size.
+	if c.pending, err = store.CountReview(ctx, account.ID, "pending"); err != nil {
+		return sqlite.Account{}, counts{}, nil, err
+	}
+	if c.actionable, err = store.CountActionableReview(ctx, account.ID); err != nil {
+		return sqlite.Account{}, counts{}, nil, err
+	}
+
+	runs, err := store.ListRuns(ctx, account.ID, scan)
+	if err != nil {
+		return sqlite.Account{}, counts{}, nil, err
+	}
+	return account, c, runs, nil
+}
+
+// assemble builds the report field by field from typed values.
+//
+// Never by serializing a store struct, and that is a rule rather than a
+// description: accounts carries the Spotify refresh token on the same row as
+// the label and the watermark, and structural exclusion is the only thing
+// keeping it out of the JSON. Runs was briefly []sqlite.SyncRun, which
+// published sync_runs.error — carrying the DI.fm member id, since *url.Error
+// embeds the request URL. TestReportCarriesNoSecrets is what keeps this true.
+func assemble(
+	account sqlite.Account,
+	c counts,
+	runs []sqlite.SyncRun,
+	authorized, healthy bool,
+	reason string,
+) Report {
 	// make, not a nil slice: an account with no runs should encode as
 	// "runs": [] rather than "runs": null.
 	reported := make([]Run, 0, len(runs))
@@ -176,16 +218,17 @@ func Build(
 		Account:    account.Label,
 		Playlist:   account.SpotifyPlaylistID,
 		Authorized: authorized,
-		Synced:     synced,
-		Pending:    actionable,
-		Skipped:    pending - actionable,
+		Synced:     c.synced,
+		Pending:    c.actionable,
+		Skipped:    c.pending - c.actionable,
 		Runs:       reported,
+		Healthy:    healthy,
+		Reason:     reason,
 	}
 	if !account.WatermarkLikedAt.IsZero() {
 		r.Watermark = account.WatermarkLikedAt.UTC().Format(time.RFC3339)
 	}
-	r.Healthy, r.Reason = healthy, reason
-	return r, nil
+	return r
 }
 
 // health decides whether syncing is actually happening, and says why not
