@@ -25,14 +25,56 @@ Runtimes and project tools are managed by [mise](https://mise.jdx.dev).
 `mise install` at the repo root provisions everything pinned in
 `mise.toml`: Go, sqlc, goose, just, golangci-lint.
 
-- **`mise.toml`** — base: tool versions + production-default env.
-- **`mise.development.toml`** — local overrides; `MISE_ENV=development`.
-- **`mise.ci.toml`** — CI overrides; `MISE_ENV=ci`.
-- **`mise.local.toml`** — gitignored, machine-specific non-secret overrides.
-- **`.env.local`** — gitignored, and the *only* home for credentials.
+Three layers, split by *audience* rather than by environment. Getting
+this wrong is what produced the `.env.defaults`/`.env.<env>` tangle that
+was removed, so the boundary is stated as a rule:
+
+- **`mise.toml [env]`** — a **checkout's** environment. Committed,
+  non-secret. A variable earns a place here only by (1) differing from
+  the binary's own flag default, making it a deliberate development
+  preference, or (2) being read from the environment by a **non-Go
+  tool** — `goose` and `sqlite3` cannot see a Go flag default, so
+  `DIFMSYNC_DB_PATH` must be exported for `just db` to open the same
+  database `difmsync` writes.
+
+  Restating a flag default earns neither. `DIFMSYNC_INTERVAL` and
+  `DIFMSYNC_NETWORK` both sat here set to exactly the default, which
+  buys nothing and gives the value a second home nothing keeps in sync.
+  `TestMiseEnvEarnsItsPlace` enforces both jobs, detecting (2) by
+  grepping the justfile rather than from a list, so it stays true as
+  recipes change.
+
+- **`.env.local`** — **credentials**, and nothing else. Gitignored.
   `mise.toml` loads it via `_.file` and `compose.yaml` loads it as its
-  only `env_file`, so the host tooling and the container read one file
-  rather than two copies that drift. See `.env.local.example`.
+  only `env_file`, so the host tooling and the container share one copy
+  rather than two that drift. `TestMiseEnvHoldsNoCredentials` fails if a
+  secret appears in committed `mise.toml`, or if that `_.file` line
+  disappears. See `.env.local.example`.
+
+- **`Dockerfile` `ENV`** — the **image's** environment. The container
+  reads neither file above, because `docker run` has no checkout. Same
+  earning rule: only values that differ from the binary's default.
+
+- **`mise.local.toml`** — optional fourth, gitignored, for
+  machine-specific *non-secret* overrides. Not a credential store: a
+  secret parked here reaches the host tooling and never reaches the
+  container, which is the half-working state that takes longest to
+  diagnose.
+
+There are no `MISE_ENV` overlays. `mise.development.toml` and
+`mise.ci.toml` existed and neither could be observed: every `just` run
+recipe passed `--log-format=text` explicitly, overriding the only
+setting the dev overlay had, and CI runs `just check`, which reads no
+`DIFMSYNC_*` at all. Two files that look like configuration and are not
+cost more than they save.
+
+One asymmetry worth knowing, because it looks like a bug: in
+`compose.yaml`, `env_file:` is applied *inside* the container, while
+`${VAR}` interpolation is resolved by Compose *on the host* — from the
+shell or a file named exactly `.env`, never from an `env_file`. Since
+`environment:` also wins over `env_file:`, a `PUID` set in `.env.local`
+is read in and then silently overwritten. Export it or edit
+`compose.yaml`.
 
 Note the scope of that last one. `.env.local` belongs to a **checkout**.
 The published image is configured by environment variables alone, with
@@ -189,17 +231,32 @@ larger instruction than the operator gave.
   below the auto bar, and genuine matches stay above it.
 - The DI.fm client tests run against a recorded fixture
   (`pkg/difm/testdata/`), never the live API.
-- `just check` (lint + race tests + codegen drift + config drift) is the
-  gate before pushing.
+- `just check` (lint + workflow lint + race tests + codegen, go.mod and
+  config drift) is the gate before pushing.
+
+  **`lint-workflows` runs `actionlint` over `.github/workflows/`**, and it
+  is there because a broken workflow is the worst-shaped CI failure
+  available: Actions rejects the whole *file* rather than the offending
+  key, so no step runs, nothing is logged, and the only feedback is
+  "this run likely failed because of a workflow file issue". Nothing else
+  in the gate parses YAML, so this was invisible locally — deleting a
+  `MISE_ENV` entry once left an `env:` key with only a comment under it
+  and cost a red push to discover. It also pins action refs and checks
+  `${{ }}` expressions, both verified against deliberate breaks. The config-drift check is
+  `TestConfigSurfaceIsDocumentedAndConsistent`, a Go test rather than a
+  shell recipe: it walks the real command tree, so it compares default
+  *values* against the README table and the Dockerfile `ENV` block, not
+  just variable names. Each of its four assertions has a verified
+  negative control — a name-only check passed while exactly the drift it
+  existed to catch walked through.
 - The container's own behaviour is gated in CI rather than by hand, and
   the assertions are chosen for failures that are **silent in
   production**: that the database ends up owned by `PUID` rather than
   root, that a root-run healthcheck leaves nothing root-owned behind,
   that a root-owned restored database is repaired rather than
-  crash-looping, that difmsync is pid 1 and exits 0 on SIGTERM, that the
-  arm64 image runs at all, and that a legacy `/data` mount is refused
-  rather than replaced with a fresh database. Add to that list when a new
-  startup behaviour can fail quietly.
+  crash-looping, that difmsync is pid 1 and exits 0 on SIGTERM, and that
+  the arm64 image runs at all. Add to that list when a new startup
+  behaviour can fail quietly.
 
   They live in `.github/workflows/container-tests.yml`, which `ci.yml`
   and `release.yml` both call. Both, because a tag can point at any
@@ -258,13 +315,12 @@ wrong:
 - **The entrypoint repairs the database, not just its directory.** The
   conditional chown covers `/config`; the database, its `-wal`/`-shm`
   sidecars and its parent directory are repaired by name, derived from
-  `DIFMSYNC_DB_PATH`. That is what makes two documented procedures work
-  at all — a restore, where `docker cp` lands the file root-owned `0600`
-  inside a correctly-owned `/config`, and an upgrade that keeps
-  `DIFMSYNC_DB_PATH=/data/difmsync.db`, where the volume is owned by the
-  distroless-era 65532 and the `/config` chown never reaches it. Four
-  named paths rather than a recursive walk, so it stays cheap with a year
-  of backups in `/config`.
+  `DIFMSYNC_DB_PATH`. That is what makes the documented restore work at
+  all: `docker cp` lands the file root-owned `0600` inside a correctly-
+  owned `/config`, which the conditional chown skips. It also covers a
+  `DIFMSYNC_DB_PATH` pointed outside `/config` entirely. Four named paths
+  rather than a recursive walk, so it stays cheap with a year of backups
+  in `/config`.
 
 - **The image declares its own `HEALTHCHECK`.** It lived only in
   `compose.yaml`, which left the `docker run` deployment the README leads
@@ -395,10 +451,10 @@ green over a daemon that has not completed a real pass in days.
 The row-count clause is a real part of the rule, not an implementation
 detail, so it is stated here rather than left to be discovered. It is
 unreachable at production defaults (20 rows at a 15m interval spans ~5h,
-well past the 45m `--max-age`) but reachable under
-`MISE_ENV=development`, where 20 rows at 2m is 40m — inside the same 45m
-window. There, a clean pass with 20 failures stacked on top of it reports
-unhealthy. That verdict is arguably the better one, which is why the
+well past the 45m `--max-age`) but reachable at any interval short enough
+that 20 rows span less than `--max-age` — a 2m interval, say, where 20
+rows is 40m and the window is 45m. There, a clean pass with 20 failures
+stacked on top of it reports unhealthy. That verdict is arguably the better one, which is why the
 window stays; what is not acceptable is the two disagreeing silently.
 
 The scan window is deliberately decoupled from the caller's display

@@ -37,8 +37,11 @@ func (s *Store) EnsureAccount(ctx context.Context, label, memberID, playlistID s
 		DifmMemberID:      memberID,
 		SpotifyPlaylistID: playlistID,
 	})
+	// Explicit rather than mapping the zero row: toAccount on a failed read
+	// happens to be harmless today only because an empty watermark string
+	// skips its parse. That is a coincidence, not a guarantee.
 	if err != nil {
-		return Account{}, fmt.Errorf("sqlite.EnsureAccount: %w", err)
+		return Account{}, opErr("EnsureAccount", err)
 	}
 	return s.toAccount(row), nil
 }
@@ -80,13 +83,10 @@ func (s *Store) toAccount(row sqlitegen.Account) Account {
 
 // SetSpotifyRefreshToken persists the token from the one-time consent flow.
 func (s *Store) SetSpotifyRefreshToken(ctx context.Context, accountID int64, token string) error {
-	if err := s.q.SetSpotifyRefreshToken(ctx, sqlitegen.SetSpotifyRefreshTokenParams{
+	return opErr("SetSpotifyRefreshToken", s.q.SetSpotifyRefreshToken(ctx, sqlitegen.SetSpotifyRefreshTokenParams{
 		SpotifyRefreshToken: token,
 		ID:                  accountID,
-	}); err != nil {
-		return fmt.Errorf("sqlite.SetSpotifyRefreshToken: %w", err)
-	}
-	return nil
+	}))
 }
 
 // HasSpotifyRefreshToken reports whether consent has been stored for the
@@ -100,23 +100,17 @@ func (s *Store) SetSpotifyRefreshToken(ctx context.Context, accountID int64, tok
 // the daemon waiting on a URL nobody was going to open.
 func (s *Store) HasSpotifyRefreshToken(ctx context.Context, accountID int64) (bool, error) {
 	n, err := s.q.CountSpotifyRefreshToken(ctx, accountID)
-	if err != nil {
-		return false, fmt.Errorf("sqlite.HasSpotifyRefreshToken: %w", err)
-	}
-	return n > 0, nil
+	return n > 0, opErr("HasSpotifyRefreshToken", err)
 }
 
 // SetWatermark advances the incremental-sync high-water mark. Callers must
 // only do this after a fully successful pass, so an interrupted run
 // re-reads rather than skipping likes it never processed.
 func (s *Store) SetWatermark(ctx context.Context, accountID int64, at time.Time) error {
-	if err := s.q.SetWatermark(ctx, sqlitegen.SetWatermarkParams{
+	return opErr("SetWatermark", s.q.SetWatermark(ctx, sqlitegen.SetWatermarkParams{
 		WatermarkLikedAt: at.UTC().Format(TimeFormat),
 		ID:               accountID,
-	}); err != nil {
-		return fmt.Errorf("sqlite.SetWatermark: %w", err)
-	}
-	return nil
+	}))
 }
 
 // IsSynced reports whether a track already landed in the playlist.
@@ -126,10 +120,7 @@ func (s *Store) IsSynced(ctx context.Context, accountID, trackID int64, playlist
 		DifmTrackID: trackID,
 		PlaylistID:  playlistID,
 	})
-	if err != nil {
-		return false, fmt.Errorf("sqlite.IsSynced: %w", err)
-	}
-	return n != 0, nil
+	return n != 0, opErr("IsSynced", err)
 }
 
 // SyncedTrack describes a completed add.
@@ -147,7 +138,7 @@ type SyncedTrack struct {
 // RecordSynced writes the idempotency ledger entry. The unique constraint
 // makes a repeated call a no-op rather than an error.
 func (s *Store) RecordSynced(ctx context.Context, t SyncedTrack) error {
-	if err := s.q.RecordSyncedTrack(ctx, sqlitegen.RecordSyncedTrackParams{
+	return opErr("RecordSynced", s.q.RecordSyncedTrack(ctx, sqlitegen.RecordSyncedTrackParams{
 		AccountID:      t.AccountID,
 		DifmTrackID:    t.DifmTrackID,
 		DifmVoteID:     t.DifmVoteID,
@@ -157,19 +148,23 @@ func (s *Store) RecordSynced(ctx context.Context, t SyncedTrack) error {
 		Title:          t.Title,
 		MatchScore:     t.MatchScore,
 		LikedAt:        t.LikedAt.UTC().Format(TimeFormat),
-	}); err != nil {
-		return fmt.Errorf("sqlite.RecordSynced: %w", err)
-	}
-	return nil
+	}))
 }
 
 // CountSynced returns how many tracks have been added for an account.
 func (s *Store) CountSynced(ctx context.Context, accountID int64) (int64, error) {
 	n, err := s.q.CountSyncedTracks(ctx, accountID)
-	if err != nil {
-		return 0, fmt.Errorf("sqlite.CountSynced: %w", err)
+	return n, opErr("CountSynced", err)
+}
+
+// opErr tags a generated query's error with the store method that ran it.
+// sqlc errors name neither, so without this a failure reads as a bare
+// "sql: no rows in result set" with nothing to locate it by.
+func opErr(op string, err error) error {
+	if err == nil {
+		return nil
 	}
-	return n, nil
+	return fmt.Errorf("sqlite.%s: %w", op, err)
 }
 
 // ReviewItem is a like that needs a human decision.
@@ -225,7 +220,7 @@ func (s *Store) Enqueue(ctx context.Context, item ReviewItem) error {
 	if err != nil {
 		return fmt.Errorf("sqlite.Enqueue: encode candidates: %w", err)
 	}
-	if err := s.q.EnqueueReview(ctx, sqlitegen.EnqueueReviewParams{
+	return opErr("Enqueue", s.q.EnqueueReview(ctx, sqlitegen.EnqueueReviewParams{
 		AccountID:      item.AccountID,
 		DifmTrackID:    item.DifmTrackID,
 		DifmVoteID:     item.DifmVoteID,
@@ -237,10 +232,7 @@ func (s *Store) Enqueue(ctx context.Context, item ReviewItem) error {
 		BestScore:      item.BestScore,
 		Reason:         item.Reason,
 		LikedAt:        item.LikedAt.UTC().Format(TimeFormat),
-	}); err != nil {
-		return fmt.Errorf("sqlite.Enqueue: %w", err)
-	}
-	return nil
+	}))
 }
 
 // ListReview returns queued items with the given status, best-scoring first.
@@ -271,10 +263,7 @@ func (s *Store) ResolveReview(ctx context.Context, accountID, trackID int64, sta
 		AccountID:   accountID,
 		DifmTrackID: trackID,
 	})
-	if err != nil {
-		return false, fmt.Errorf("sqlite.ResolveReview: %w", err)
-	}
-	return n > 0, nil
+	return n > 0, opErr("ResolveReview", err)
 }
 
 // GetReviewItem returns a single queued item by DI.fm track id.
@@ -297,10 +286,7 @@ func (s *Store) CountReview(ctx context.Context, accountID int64, status string)
 		AccountID: accountID,
 		Status:    status,
 	})
-	if err != nil {
-		return 0, fmt.Errorf("sqlite.CountReview: %w", err)
-	}
-	return n, nil
+	return n, opErr("CountReview", err)
 }
 
 // CountActionableReview counts pending items a human could actually act
@@ -308,10 +294,7 @@ func (s *Store) CountReview(ctx context.Context, accountID int64, status string)
 // lost, but nobody will ever approve a DJ mix.
 func (s *Store) CountActionableReview(ctx context.Context, accountID int64) (int64, error) {
 	n, err := s.q.CountReviewQueueActionable(ctx, accountID)
-	if err != nil {
-		return 0, fmt.Errorf("sqlite.CountActionableReview: %w", err)
-	}
-	return n, nil
+	return n, opErr("CountActionableReview", err)
 }
 
 // RunStats is the outcome of one sync pass.
@@ -331,10 +314,7 @@ func (s *Store) StartRun(ctx context.Context, accountID int64, dryRun bool) (int
 		StartedAt: s.now(),
 		DryRun:    dry,
 	})
-	if err != nil {
-		return 0, fmt.Errorf("sqlite.StartRun: %w", err)
-	}
-	return row.ID, nil
+	return row.ID, opErr("StartRun", err)
 }
 
 // FinishRun closes the sync_runs row. A failed pass is recorded, not
@@ -344,7 +324,7 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, st RunStats) error {
 	if st.Err != nil {
 		msg = st.Err.Error()
 	}
-	if err := s.q.FinishSyncRun(ctx, sqlitegen.FinishSyncRunParams{
+	return opErr("FinishRun", s.q.FinishSyncRun(ctx, sqlitegen.FinishSyncRunParams{
 		FinishedAt: sql.NullString{String: s.now(), Valid: true},
 		Fetched:    int64(st.Fetched),
 		Added:      int64(st.Added),
@@ -352,10 +332,7 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, st RunStats) error {
 		Skipped:    int64(st.Skipped),
 		Error:      msg,
 		ID:         runID,
-	}); err != nil {
-		return fmt.Errorf("sqlite.FinishRun: %w", err)
-	}
-	return nil
+	}))
 }
 
 // ForgetTrack drops a single ledger row so the track becomes eligible to
@@ -370,10 +347,7 @@ func (s *Store) ForgetTrack(ctx context.Context, accountID, trackID int64) (bool
 		AccountID:   accountID,
 		DifmTrackID: trackID,
 	})
-	if err != nil {
-		return false, fmt.Errorf("sqlite.ForgetTrack: %w", err)
-	}
-	return n > 0, nil
+	return n > 0, opErr("ForgetTrack", err)
 }
 
 // SyncedTrackLikedAt returns when a ledger row's like was recorded, and
@@ -405,10 +379,7 @@ func (s *Store) SyncedTrackLikedAt(ctx context.Context, accountID, trackID int64
 // not duplicate anything: the sync pass also reconciles against the live
 // playlist contents before adding.
 func (s *Store) ForgetAllTracks(ctx context.Context, accountID int64) error {
-	if err := s.q.ForgetAllSyncedTracks(ctx, accountID); err != nil {
-		return fmt.Errorf("sqlite.ForgetAllTracks: %w", err)
-	}
-	return nil
+	return opErr("ForgetAllTracks", s.q.ForgetAllSyncedTracks(ctx, accountID))
 }
 
 // ClearWatermark resets the incremental-sync mark so the next pass reads
@@ -418,10 +389,7 @@ func (s *Store) ForgetAllTracks(ctx context.Context, accountID int64) error {
 // watermark filters at *fetch* time, so clearing ledger rows alone is not
 // enough to resurrect an old like — it would never be retrieved.
 func (s *Store) ClearWatermark(ctx context.Context, accountID int64) error {
-	if err := s.q.ClearWatermark(ctx, accountID); err != nil {
-		return fmt.Errorf("sqlite.ClearWatermark: %w", err)
-	}
-	return nil
+	return opErr("ClearWatermark", s.q.ClearWatermark(ctx, accountID))
 }
 
 // BackupTo writes a consistent snapshot of the database to dest.

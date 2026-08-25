@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/urfave/cli/v3"
+
+	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 )
 
 // resyncCommand is the recovery escape hatch.
@@ -47,95 +49,91 @@ func resyncCommand() *cli.Command {
 			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			store, err := openStore(ctx, c)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = store.Close() }()
-
-			account, err := requireAccount(ctx, c, store)
-			if err != nil {
-				return err
-			}
-
-			forget := c.IntSlice("forget")
-			forgetAll := c.Bool("forget-all")
-			clearMark := c.Bool("all") || forgetAll
-
-			if !clearMark && len(forget) == 0 {
-				return errors.New("nothing to do: pass --all, --forget=<track-id>, or --forget-all")
-			}
-
-			switch {
-			case forgetAll:
-				if err := store.ForgetAllTracks(ctx, account.ID); err != nil {
+			return withStore(ctx, c, func(store *sqlite.Store) error {
+				account, err := requireAccount(ctx, c, store)
+				if err != nil {
 					return err
 				}
-				fmt.Println("cleared the entire sync ledger")
-			case len(forget) > 0:
-				var missed int
-				// The earliest like among the forgotten tracks. The
-				// watermark is rewound to just before it, because
-				// clearing the ledger row alone is a no-op once the
-				// watermark has moved past the like — and by the time
-				// anyone reaches for --forget, it has.
-				var earliest time.Time
-				for _, id := range forget {
-					at, ok, err := store.SyncedTrackLikedAt(ctx, account.ID, int64(id))
-					if err != nil {
-						return err
-					}
-					if ok && (earliest.IsZero() || at.Before(earliest)) {
-						earliest = at
-					}
-					found, err := store.ForgetTrack(ctx, account.ID, int64(id))
-					if err != nil {
-						return err
-					}
-					if found {
-						fmt.Printf("forgot DI.fm track %d\n", id)
-						continue
-					}
-					missed++
-					fmt.Printf("no ledger row for DI.fm track %d — nothing to forget\n", id)
-				}
-				if missed == len(forget) && !clearMark {
-					// Only bail when there is nothing else left to do. An
-					// explicit --all is a separate instruction, and
-					// returning here would silently drop it.
-					return fmt.Errorf("none of the %d track id(s) were in the ledger; "+
-						"check `difmsync status` or the synced_tracks table for the right ids", missed)
-				}
-				if missed == len(forget) {
-					fmt.Printf("none of the %d track id(s) were in the ledger; "+
-						"continuing because --all was given\n", missed)
+
+				forget := c.IntSlice("forget")
+				forgetAll := c.Bool("forget-all")
+				clearMark := c.Bool("all") || forgetAll
+
+				if !clearMark && len(forget) == 0 {
+					return errors.New("nothing to do: pass --all, --forget=<track-id>, or --forget-all")
 				}
 
-				// Rewind rather than clear: --all resets to the beginning
-				// of history, which is a much bigger instruction than the
-				// operator gave. One second before the like is the
-				// smallest rewind that lets the next pass see it again.
-				// Everything between there and now is already in the
-				// ledger, so it is re-read cheaply and not re-added.
-				if !clearMark && !earliest.IsZero() && !account.WatermarkLikedAt.Before(earliest) {
-					rewind := earliest.Add(-time.Second)
-					if err := store.SetWatermark(ctx, account.ID, rewind); err != nil {
+				switch {
+				case forgetAll:
+					if err := store.ForgetAllTracks(ctx, account.ID); err != nil {
 						return err
 					}
-					fmt.Printf("rewound the watermark to %s so the forgotten like is re-read\n",
-						rewind.Format(time.RFC3339))
-				}
-			}
+					fmt.Println("cleared the entire sync ledger")
+				case len(forget) > 0:
+					var missed int
+					// The earliest like among the forgotten tracks. The
+					// watermark is rewound to just before it, because
+					// clearing the ledger row alone is a no-op once the
+					// watermark has moved past the like — and by the time
+					// anyone reaches for --forget, it has.
+					var earliest time.Time
+					for _, id := range forget {
+						at, ok, err := store.SyncedTrackLikedAt(ctx, account.ID, int64(id))
+						if err != nil {
+							return err
+						}
+						if ok && (earliest.IsZero() || at.Before(earliest)) {
+							earliest = at
+						}
+						found, err := store.ForgetTrack(ctx, account.ID, int64(id))
+						if err != nil {
+							return err
+						}
+						if found {
+							fmt.Printf("forgot DI.fm track %d\n", id)
+							continue
+						}
+						missed++
+						fmt.Printf("no ledger row for DI.fm track %d — nothing to forget\n", id)
+					}
+					if missed == len(forget) && !clearMark {
+						// Only bail when there is nothing else left to do. An
+						// explicit --all is a separate instruction, and
+						// returning here would silently drop it.
+						return fmt.Errorf("none of the %d track id(s) were in the ledger; "+
+							"check `difmsync status` or the synced_tracks table for the right ids", missed)
+					}
+					if missed == len(forget) {
+						fmt.Printf("none of the %d track id(s) were in the ledger; "+
+							"continuing because --all was given\n", missed)
+					}
 
-			if clearMark {
-				if err := store.ClearWatermark(ctx, account.ID); err != nil {
-					return err
+					// Rewind rather than clear: --all resets to the beginning
+					// of history, which is a much bigger instruction than the
+					// operator gave. One second before the like is the
+					// smallest rewind that lets the next pass see it again.
+					// Everything between there and now is already in the
+					// ledger, so it is re-read cheaply and not re-added.
+					if !clearMark && !earliest.IsZero() && !account.WatermarkLikedAt.Before(earliest) {
+						rewind := earliest.Add(-time.Second)
+						if err := store.SetWatermark(ctx, account.ID, rewind); err != nil {
+							return err
+						}
+						fmt.Printf("rewound the watermark to %s so the forgotten like is re-read\n",
+							rewind.Format(time.RFC3339))
+					}
 				}
-				fmt.Println("cleared the watermark — next sync reads the full history")
-			}
 
-			fmt.Println("\nrun `difmsync sync --dry-run` to preview, then `difmsync sync`.")
-			return nil
+				if clearMark {
+					if err := store.ClearWatermark(ctx, account.ID); err != nil {
+						return err
+					}
+					fmt.Println("cleared the watermark — next sync reads the full history")
+				}
+
+				fmt.Println("\nrun `difmsync sync --dry-run` to preview, then `difmsync sync`.")
+				return nil
+			})
 		},
 	}
 }

@@ -11,6 +11,15 @@ set shell := ["bash", "-cu"]
 # contributor who ran `mise install` but has not shell-activated mise
 # still gets the pinned versions — and the DIFMSYNC_* defaults from
 # mise.toml's [env], which the run recipes depend on.
+#
+# That holds for a Go tool, which reads the variable itself. It does not
+# hold for the three recipes below that need $DIFMSYNC_DB_PATH in the
+# *shell*: this shell expands the recipe line before mise exec runs, so a
+# bare "$DIFMSYNC_DB_PATH" is unbound there — with `-u`, a hard error —
+# on a machine without mise activated. They wrap the command in `bash -cu`
+# so the expansion happens inside mise's environment instead. Do not
+# unwrap them, and do not paper over it with a `:-` default either: that
+# is a second copy of a value mise.toml already owns.
 
 # ── default ───────────────────────────────────────────
 
@@ -19,11 +28,6 @@ default:
     @just --list --unsorted
 
 # ── build & verify ────────────────────────────────────
-
-# build the binary to bin/difmsync
-[group('build')]
-build:
-    mkdir -p bin && go build -o bin/difmsync ./cmd/difmsync
 
 # format Go code (gofumpt + goimports, configured in .golangci.yml)
 [group('build')]
@@ -37,10 +41,15 @@ fmt:
 lint:
     mise exec -- golangci-lint run
 
-# apply every auto-fixable finding, including formatting
+# A broken workflow fails before any step runs, and Actions rejects the
+# whole file rather than the offending key — so the run reports "likely
+# failed because of a workflow file issue" and produces no logs to read.
+# That is the worst shape a CI failure can take, and it is the one thing
+# the rest of this gate cannot see: nothing else here parses YAML.
 [group('build')]
-lint-fix:
-    mise exec -- golangci-lint run --fix
+[doc('validate .github/workflows against the Actions schema')]
+lint-workflows:
+    mise exec -- actionlint
 
 # go test ./... with race detector, no cache (matches CI)
 [group('build')]
@@ -59,86 +68,40 @@ gen-check: gen
 
 # the full CI gate — run locally before pushing
 [group('build')]
-check: lint test gen-check verify-config
+check: lint lint-workflows test gen-check tidy-check
 
-# Migrations are applied by the binary at boot through goose's library,
-# not this CLI — but the CLI is the way to inspect what actually ran on a
-# database, which is the first question when a deploy misbehaves.
-[group('ops')]
-[doc('show which migrations have been applied to the local database')]
-migrate-status:
-    @mise exec -- goose -dir migrations-sqlite sqlite3 "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}" status
-
-# Four of fifteen variables had drifted between the code and the files
-# that set them — a dead DIFMSYNC_NETWORK in mise.toml, a DIFM_* prefix in
-# the docs, a redirect URL missing from the example. That ratio does not
-# improve by hand.
-#
-# Both directions are checked. An orphan (set, read by nothing) is dead
-# config; an undocumented variable (read, in no README table row) is a
-# knob nobody can discover. A gate that only looks one way passes while
-# half the drift it exists to catch walks straight through.
+# Mirrors gen-check: regenerate, then fail if the tree moved. `tidy` on its
+# own enforced nothing — it just ran the command — so the actual gate lived
+# inline in ci.yml, where a contributor running `just check` never saw it. A
+# stale go.sum breaks the container build rather than the Go build, which is
+# the kind of failure that should not wait for CI to find.
 [group('build')]
-[doc('check DIFMSYNC_* variables agree across code, config and docs')]
-verify-config:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # Tests are excluded: a variable named only in a test is not read by
-    # the binary, and counting it would satisfy the orphan check falsely.
-    code=$(grep -oh 'DIFMSYNC_[A-Z_]\+' \
-             $(find cmd/difmsync -name '*.go' -not -name '*_test.go') | sort -u)
-    refs=$(grep -roh 'DIFMSYNC_[A-Z_]\+' \
-             mise.toml mise.development.toml mise.ci.toml \
-             .env.local.example compose.yaml Dockerfile docker/ justfile \
-             README.md docs/ .github/workflows/ \
-           | sort -u)
-    # The README table is the documented surface, so it is compared on
-    # its own rather than folded into the union above — otherwise a
-    # variable set in mise.toml and absent from the table passes.
-    documented=$(grep -oh 'DIFMSYNC_[A-Z_]\+' README.md | sort -u)
-
-    status=0
-    orphans=$(comm -13 <(echo "$code") <(echo "$refs"))
-    if [ -n "$orphans" ]; then
-        echo "set somewhere but read by nothing in cmd/difmsync:" >&2
-        echo "$orphans" >&2
-        status=1
-    fi
-    undocumented=$(comm -23 <(echo "$code") <(echo "$documented"))
-    if [ -n "$undocumented" ]; then
-        echo "read by cmd/difmsync but missing from the README table:" >&2
-        echo "$undocumented" >&2
-        status=1
-    fi
-    [ "$status" -eq 0 ] || exit 1
-    echo "config consistent: $(echo "$code" | wc -l | tr -d ' ') variable(s), no orphans, all documented"
-
-# go mod tidy
-[group('build')]
-tidy:
+[doc('fail if go.mod or go.sum is stale')]
+tidy-check:
     mise exec -- go mod tidy
+    git diff --exit-code -- go.mod go.sum
 
 # ── run ───────────────────────────────────────────────
 
 # one sync pass, writing nothing — the intended first run
 [group('run')]
 dry-run:
-    mise exec -- go run ./cmd/difmsync sync --dry-run --log-format=text
+    mise exec -- go run ./cmd/difmsync sync --dry-run
 
 # one sync pass, writing to the configured playlist
 [group('run')]
 sync:
-    mise exec -- go run ./cmd/difmsync sync --log-format=text
+    mise exec -- go run ./cmd/difmsync sync
 
 # run continuously on DIFMSYNC_INTERVAL
 [group('run')]
 loop:
-    mise exec -- go run ./cmd/difmsync sync --loop --log-format=text
+    mise exec -- go run ./cmd/difmsync sync --loop
 
 # one-time Spotify OAuth consent
 [group('run')]
 auth:
-    mise exec -- go run ./cmd/difmsync auth --log-format=text
+    mise exec -- go run ./cmd/difmsync auth
 
 # Paste-the-URL consent. Nothing listens, so the redirect URI only has to
 # be registered with Spotify, not reachable — which is what makes this the
@@ -146,7 +109,7 @@ auth:
 [group('run')]
 [doc('one-time Spotify consent without a callback listener')]
 auth-manual:
-    mise exec -- go run ./cmd/difmsync auth --manual --log-format=text
+    mise exec -- go run ./cmd/difmsync auth --manual
 
 # list the review queue
 [group('run')]
@@ -160,21 +123,21 @@ status:
 
 # ── ops ───────────────────────────────────────────────
 
+# Migrations are applied by the binary at boot through goose's library,
+# not this CLI — but the CLI is the way to inspect what actually ran on a
+# database, which is the first question when a deploy misbehaves.
+[group('ops')]
+[doc('show which migrations have been applied to the local database')]
+migrate-status:
+    @mise exec -- bash -cu 'goose -dir migrations-sqlite sqlite3 "$DIFMSYNC_DB_PATH" status'
+
 [group('ops')]
 [doc('list synced tracks with their DI.fm ids (needed by resync-track)')]
 ledger:
-    @mise exec -- sqlite3 -header -column "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}" \
+    @mise exec -- bash -cu 'sqlite3 -header -column "$DIFMSYNC_DB_PATH" "$1"' -- \
         "select difm_track_id, artist, substr(title,1,40) as title, \
                 round(match_score,3) as score, substr(added_at,1,10) as added \
          from synced_tracks order by liked_at desc;"
-
-# `status` reads the same sync_runs table this used to query by hand, and
-# it also answers the question the raw rows only imply: whether a clean
-# pass has happened recently enough to call the sync working.
-[group('ops')]
-[doc('recent sync passes including failures — is it actually working?')]
-runs:
-    @mise exec -- go run ./cmd/difmsync status --limit=10
 
 # Clears the track's ledger row AND rewinds the watermark. Both suppress a
 # re-add, and clearing only the ledger is a silent no-op — the watermark
@@ -219,23 +182,9 @@ backup DEST="":
     # first into an error.
     dest='{{DEST}}'
     [ -n "$dest" ] || dest="./tmp/difmsync-backup-$(date +%Y%m%d-%H%M%S).db"
-    mise exec -- go run ./cmd/difmsync backup --to "$dest" --log-format=text
+    mise exec -- go run ./cmd/difmsync backup --to "$dest"
 
 # open the local SQLite database
 [group('ops')]
 db:
-    mise exec -- sqlite3 "${DIFMSYNC_DB_PATH:-./tmp/difmsync.db}"
-
-# build the container image
-[group('ops')]
-docker-build:
-    docker build -t difm-spotify-sync:dev .
-
-# Both architectures the release publishes. The build stage
-# cross-compiles rather than emulating, so this is not appreciably slower
-# than building one — worth running before tagging a release, since an
-# arm64 break is otherwise found by whoever pulls it onto a Pi.
-[group('ops')]
-[doc('check the image builds for both published architectures')]
-docker-build-multi:
-    docker buildx build --platform linux/amd64,linux/arm64 -t difm-spotify-sync:multi .
+    mise exec -- bash -cu 'sqlite3 "$DIFMSYNC_DB_PATH"'

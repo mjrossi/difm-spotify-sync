@@ -15,13 +15,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Activates mise.ci.toml's [env] overlay on top of mise.toml.
-  MISE_ENV: ci
-
 jobs:
   check:
-    name: lint + test + codegen drift
+    name: lint + test + drift checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -36,18 +32,14 @@ jobs:
         run: go build ./...
 
       # Runs golangci-lint (which bundles govet, staticcheck, and the
-      # gofumpt/goimports format-drift check), the race-enabled test
-      # suite, a check that the committed sqlc output still matches the
-      # schema and queries, and a DIFMSYNC_* config-drift check.
+      # gofumpt/goimports format-drift check), actionlint over these
+      # workflow files, the race-enabled test suite, a check that the
+      # committed sqlc output still matches the schema and queries, a
+      # go.mod/go.sum drift check, and a DIFMSYNC_* config-drift check.
+      # One gate, so a contributor running it locally sees exactly what
+      # CI sees — including, now, a mistake in this file.
       - name: just check
         run: just check
-
-      # `just check` does not cover go.mod drift, and a stale go.sum
-      # breaks the container build rather than the Go build.
-      - name: go mod tidy is a no-op
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
 
   # The behavioural gate over the built image lives in its own reusable
   # workflow, because release.yml has to run the identical one. Duplicated,

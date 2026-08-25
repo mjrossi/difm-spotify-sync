@@ -1,4 +1,0 @@
-# CI overrides. The workflow sets MISE_ENV=ci.
-[env]
-DIFMSYNC_LOG_FORMAT = "text"
-DIFMSYNC_LOG_LEVEL = "warn"

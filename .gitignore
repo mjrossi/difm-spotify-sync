@@ -19,3 +19,6 @@ tmp/
 
 # build output
 bin/
+
+# Claude Code machine-local settings.
+.claude/settings.local.json

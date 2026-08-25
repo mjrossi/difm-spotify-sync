@@ -112,6 +112,31 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		}
 	}
 
+	// record queues a like that is not being added to Spotify — skipped,
+	// low-confidence, or unmatched — and reports whether the pass may count
+	// it. Three arms of the switch below did this identically.
+	//
+	// fail and advance stay closures in this function's scope and are only
+	// captured here, never returned through. That is deliberate: the
+	// ordering they encode is the invariant, and putting either behind a
+	// return value is how a later edit reorders them without noticing.
+	//
+	// The caller increments its own counter on true, after the write rather
+	// than before it, so a pass whose queue writes all failed does not
+	// report them as recorded.
+	record := func(like difm.Track, candidates []match.Scored, reason, failMsg string) bool {
+		if dryRun {
+			return true
+		}
+		if err := e.enqueue(ctx, like, candidates, reason); err != nil {
+			e.Log.Error(failMsg, "track", like.Artist+" - "+like.Title, "err", err)
+			fail(err)
+			return false
+		}
+		advance(like.LikedAt)
+		return true
+	}
+
 	likes, err := e.DiFM.ListLikedTracks(ctx, account.WatermarkLikedAt)
 	switch {
 	case errors.Is(err, difm.ErrDropped):
@@ -160,19 +185,9 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		// unrelated track — so record and move on.
 		if like.Skip {
 			e.Log.Debug("skipping non-track", "title", like.Title, "reason", like.SkipReason)
-			if dryRun {
+			if record(like, nil, sqlite.ReasonSkipped, "could not queue skipped track") {
 				stats.Skipped++
-				continue
 			}
-			if err := e.enqueue(ctx, like, nil, sqlite.ReasonSkipped); err != nil {
-				e.Log.Error("could not queue skipped track", "track", like.Title, "err", err)
-				fail(err)
-				continue
-			}
-			// Counted after the write, not before: a pass whose queue
-			// writes all failed must not report them as recorded.
-			stats.Skipped++
-			advance(like.LikedAt)
 			continue
 		}
 
@@ -242,31 +257,15 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 			e.Log.Info("queued for review",
 				"track", like.Artist+" - "+like.Title,
 				"best", roundTo(best.Score, 3), "why", best.Why)
-			if dryRun {
+			if record(like, candidates, sqlite.ReasonLowConfidence, "could not queue for review") {
 				stats.Queued++
-				continue
 			}
-			if err := e.enqueue(ctx, like, candidates, sqlite.ReasonLowConfidence); err != nil {
-				e.Log.Error("could not queue for review", "err", err)
-				fail(err)
-				continue
-			}
-			stats.Queued++
-			advance(like.LikedAt)
 
 		default:
 			e.Log.Info("no usable match", "track", like.Artist+" - "+like.Title)
-			if dryRun {
+			if record(like, candidates, sqlite.ReasonNoMatch, "could not record unmatched track") {
 				stats.Queued++
-				continue
 			}
-			if err := e.enqueue(ctx, like, candidates, sqlite.ReasonNoMatch); err != nil {
-				e.Log.Error("could not record unmatched track", "err", err)
-				fail(err)
-				continue
-			}
-			stats.Queued++
-			advance(like.LikedAt)
 		}
 	}
 

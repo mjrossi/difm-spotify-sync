@@ -15,6 +15,8 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
+
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
 )
 
@@ -63,93 +65,73 @@ func authCommand() *cli.Command {
 				}
 			}
 
-			store, err := openStore(ctx, c)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = store.Close() }()
-
-			account, err := store.EnsureAccount(ctx, c.String("account"),
-				c.String("member-id"), c.String("playlist-id"))
-			if err != nil {
-				return err
-			}
-
-			auth := spotify.NewAuthenticator(c.String("spotify-client-id"),
-				c.String("spotify-client-secret"), redirect)
-
-			flow, err := newConsentFlow(auth, store, account.ID)
-			if err != nil {
-				return err
-			}
-
-			if c.Bool("manual") {
-				return runManualConsent(ctx, flow, redirect, os.Stdin, os.Stdout)
-			}
-
-			results := make(chan error, 1)
-
-			mux := http.NewServeMux()
-			mux.HandleFunc(target.Path, func(w http.ResponseWriter, r *http.Request) {
-				// Completed here rather than by handing the code back to
-				// the select below, so the state check, the exchange and
-				// the token write stay in one place shared with the
-				// daemon's consent server. Splitting them across the two
-				// entry points is how the two drift.
-				//
-				// WithoutCancel because a browser that closes the tab the
-				// instant the callback lands would otherwise cancel the
-				// token exchange mid-flight, losing a consent the operator
-				// has already given.
-				if err := flow.Complete(context.WithoutCancel(r.Context()), r.URL.Query()); err != nil {
-					http.Error(w, "Consent failed: "+err.Error(), http.StatusBadRequest)
-					results <- err
-					return
-				}
-				fmt.Fprintln(w, "Authorized. You can close this tab and return to the terminal.")
-				results <- nil
-			})
-
-			srv := &http.Server{
-				Addr:              target.Addr,
-				Handler:           mux,
-				ReadHeaderTimeout: 10 * time.Second,
-			}
-			var lc net.ListenConfig
-			ln, err := lc.Listen(ctx, "tcp", target.Addr)
-			if err != nil {
-				return fmt.Errorf("listen on %s for the OAuth callback: %w", target.Addr, err)
-			}
-			go func() {
-				if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					results <- err
-				}
-			}()
-			defer func() {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = srv.Shutdown(shutdownCtx)
-			}()
-
-			fmt.Println("Open this URL to authorize Spotify access:")
-			fmt.Println()
-			fmt.Println("   ", flow.AuthURL())
-			fmt.Println()
-			fmt.Printf("Waiting for the callback on %s (listening on %s, timeout %s)...\n",
-				redirect, target.Addr, authCallbackTimeout)
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(authCallbackTimeout):
-				return errAuthTimeout
-			case err := <-results:
+			return withStore(ctx, c, func(store *sqlite.Store) error {
+				account, err := store.EnsureAccount(ctx, c.String("account"),
+					c.String("member-id"), c.String("playlist-id"))
 				if err != nil {
 					return err
 				}
-				fmt.Println("Refresh token stored. `difmsync sync` can now run unattended.")
-				return nil
-			}
+
+				auth := spotify.NewAuthenticator(c.String("spotify-client-id"),
+					c.String("spotify-client-secret"), redirect)
+
+				flow, err := newConsentFlow(auth, store, account.ID)
+				if err != nil {
+					return err
+				}
+
+				if c.Bool("manual") {
+					return runManualConsent(ctx, flow, redirect, os.Stdin, os.Stdout)
+				}
+
+				results := make(chan error, 1)
+
+				mux := http.NewServeMux()
+				mux.HandleFunc(target.Path, func(w http.ResponseWriter, r *http.Request) {
+					// Completed in the handler rather than by handing the code
+					// back to the select below, so the state check, the
+					// exchange and the token write stay in one place shared
+					// with the daemon's consent server. Splitting them across
+					// the two entry points is how the two drift.
+					results <- completeConsentRequest(w, r, flow,
+						"Authorized. You can close this tab and return to the terminal.", "")
+				})
+
+				srv, err := serveHTTP(ctx, target.Addr, "the OAuth callback", mux)
+				if err != nil {
+					return err
+				}
+				// nil logger: this is a foreground command, and a drain warning
+				// belongs in the operator's terminal only if it changes what they
+				// do — it does not, since the outcome is already reported below.
+				defer srv.stop(nil)
+
+				printConsentURL(os.Stdout, flow)
+				fmt.Printf("Waiting for the callback on %s (listening on %s, timeout %s)...\n",
+					redirect, target.Addr, authCallbackTimeout)
+
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(authCallbackTimeout):
+					return errAuthTimeout
+				case err := <-srv.Err:
+					// Kept separate from results: a listener that died and a
+					// consent that was refused need different fixes, and
+					// reporting one as the other sends the operator to the
+					// wrong half of the problem.
+					if err != nil {
+						return fmt.Errorf("callback listener: %w", err)
+					}
+					return errors.New("callback listener stopped before the callback arrived")
+				case err := <-results:
+					if err != nil {
+						return err
+					}
+					fmt.Println(consentStoredMsg)
+					return nil
+				}
+			})
 		},
 	}
 }
@@ -174,13 +156,29 @@ type callback struct {
 // matter how the port is published. Setting DIFMSYNC_AUTH_BIND=0.0.0.0
 // is what makes `docker compose run --service-ports connector auth`
 // work.
+// Written once because both consent flows print them and the two had already
+// been edited independently. The listening flow writes to stdout and the
+// manual flow to an injected writer, which is the only reason these take one.
+const consentStoredMsg = "Refresh token stored. `difmsync sync` can now run unattended."
+
+// errNoCallbackPasted is returned when the manual flow gets an empty paste,
+// from either the scanner or the parser.
+var errNoCallbackPasted = errors.New("no callback URL was pasted")
+
+// printConsentURL writes the authorize URL an operator has to open. Indented
+// and surrounded by blank lines so it survives being copied out of a terminal
+// that has wrapped it.
+func printConsentURL(out io.Writer, flow *consentFlow) {
+	fmt.Fprintln(out, "Open this URL to authorize Spotify access:")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "   ", flow.AuthURL())
+	fmt.Fprintln(out)
+}
+
 func callbackTarget(redirect, bind string) (callback, error) {
-	u, err := url.Parse(redirect)
+	u, err := parseRedirect(redirect)
 	if err != nil {
-		return callback{}, fmt.Errorf("parse redirect url %q: %w", redirect, err)
-	}
-	if u.Host == "" {
-		return callback{}, fmt.Errorf("redirect url %q has no host", redirect)
+		return callback{}, err
 	}
 	// Checked before anything is derived from it: the listener serves
 	// plain HTTP and cannot terminate TLS, so an https redirect would
@@ -264,7 +262,7 @@ func runManualConsent(ctx context.Context, flow *consentFlow, redirect string,
 		if err := sc.Err(); err != nil {
 			return fmt.Errorf("read the pasted callback URL: %w", err)
 		}
-		return errors.New("no callback URL was pasted")
+		return errNoCallbackPasted
 	}
 
 	q, err := manualCallbackQuery(sc.Text())
@@ -274,7 +272,7 @@ func runManualConsent(ctx context.Context, flow *consentFlow, redirect string,
 	if err := flow.Complete(ctx, q); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "\nRefresh token stored. `difmsync sync` can now run unattended.")
+	fmt.Fprintln(out, "\n"+consentStoredMsg)
 	return nil
 }
 
@@ -293,7 +291,7 @@ func manualCallbackQuery(pasted string) (url.Values, error) {
 	in := strings.TrimSpace(pasted)
 	in = strings.Trim(in, `"'`)
 	if in == "" {
-		return nil, errors.New("no callback URL was pasted")
+		return nil, errNoCallbackPasted
 	}
 
 	raw := in

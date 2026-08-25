@@ -42,9 +42,13 @@ You need a Spotify app of your own (free, two minutes) and two values captured
 from a DI.fm page. Both are described under [Credentials](#credentials) below.
 There is no hosted service and no account to make here.
 
+> **Pre-release.** There is no tagged version yet, so `:latest` does not exist.
+> `:edge` tracks `main` and is published on every push. It will become
+> `:latest` at v1.0.0 — see [Which tag to pull](docs/deploy.md#which-tag-to-pull).
+
 ```sh
 docker run -d --name difmsync \
-  -v difmsync-config:/config \
+  -v difmsync-data:/config \
   -p 127.0.0.1:3437:3437 \
   -p 3436:3436 \
   -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
@@ -54,7 +58,7 @@ docker run -d --name difmsync \
   -e DIFMSYNC_SPOTIFY_CLIENT_SECRET=... \
   -e DIFMSYNC_PLAYLIST_ID=... \
   --restart unless-stopped \
-  ghcr.io/mjrossi/difm-spotify-sync:latest
+  ghcr.io/mjrossi/difm-spotify-sync:edge
 ```
 
 or with Compose:
@@ -62,7 +66,7 @@ or with Compose:
 ```yaml
 services:
   difmsync:
-    image: ghcr.io/mjrossi/difm-spotify-sync:latest
+    image: ghcr.io/mjrossi/difm-spotify-sync:edge
     container_name: difmsync
     restart: unless-stopped
     environment:
@@ -75,19 +79,13 @@ services:
       DIFMSYNC_SPOTIFY_CLIENT_SECRET: ...
       DIFMSYNC_PLAYLIST_ID: ...
     volumes:
-      - difmsync-config:/config
+      - difmsync-data:/config
     ports:
       - "127.0.0.1:3437:3437"   # one-time consent; inert afterwards
       - "3436:3436"             # /healthz and /status.json
-    healthcheck:
-      test: ["CMD", "/healthcheck.sh"]
-      interval: 5m
-      timeout: 10s
-      retries: 3
-      start_period: 30m
 
 volumes:
-  difmsync-config:
+  difmsync-data:
 ```
 
 Then authorize once — the container waits for it rather than crash-looping:
@@ -193,8 +191,10 @@ Container-level settings, following the usual self-hosted conventions:
 ownership the host directory already has. Set them to `id -u` / `id -g` for
 whoever owns it. Alternatively set Docker's own `user:` and they are ignored.
 
-`just verify-config` checks this table against the code and runs as part of
-`just check`, so a variable cannot quietly stop being documented.
+`just check` verifies this table against the real command tree — that every
+variable has a row, that no row is dead, and that the defaults stated here are
+the ones the image actually ships. So a variable cannot quietly stop being
+documented, and a default cannot quietly stop being true.
 
 ## How matching works
 

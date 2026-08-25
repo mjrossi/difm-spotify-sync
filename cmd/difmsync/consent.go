@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
@@ -106,4 +107,59 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// completeConsentRequest runs the exchange for one callback request and
+// writes the browser's side of it.
+//
+// Two transports land here — the loopback listener `difmsync auth` binds and
+// the daemon's consent server — and both need the same three things: the
+// exchange must survive the browser hanging up, a failure must reach the
+// person looking at the tab, and success must say so. Only the follow-on
+// differs, so only the follow-on stays at the call site: `auth` reports to a
+// terminal, the daemon logs and signals its wait.
+//
+// ok is the success text. hint is appended to a failure, for the caller that
+// can tell the operator how to retry.
+//
+// The context is WithoutCancel because a browser that closes the tab the
+// instant the callback lands would otherwise cancel the token exchange
+// mid-flight — losing a consent the operator has already given, with nothing
+// to show for it. It keeps the request context's values either way.
+func completeConsentRequest(w http.ResponseWriter, r *http.Request, flow *consentFlow, ok, hint string) error {
+	if err := flow.Complete(context.WithoutCancel(r.Context()), r.URL.Query()); err != nil {
+		http.Error(w, "Consent failed: "+err.Error()+hint, http.StatusBadRequest)
+		return err
+	}
+	fmt.Fprintln(w, ok)
+	return nil
+}
+
+// parseRedirect is the one parse of DIFMSYNC_SPOTIFY_REDIRECT_URL. It
+// enforces only what every consumer needs — that it parses, and that it
+// carries a host — because that is genuinely all they agree on.
+//
+// The path rules deliberately do NOT live here, and the two callers reach
+// opposite verdicts on the same input:
+//
+//   - callbackTarget (auth.go) defaults a pathless URL to "/". Its listener
+//     is single-purpose and shuts down after one callback, so a catch-all is
+//     harmless — and Spotify really will call back to "/", which a hardcoded
+//     "/callback" would 404.
+//   - consentRoutes (authserver.go) refuses a pathless URL. Its mux carries
+//     the start route and the unrouted-request logger too, and "/" in a
+//     ServeMux swallows both.
+//
+// Both are right for their transport. Unifying them would mean picking one
+// and breaking the other, so what is shared is the prefix and the error text
+// — which had already been written out twice, identically.
+func parseRedirect(redirect string) (*url.URL, error) {
+	u, err := url.Parse(redirect)
+	if err != nil {
+		return nil, fmt.Errorf("parse redirect url %q: %w", redirect, err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("redirect url %q has no host", redirect)
+	}
+	return u, nil
 }

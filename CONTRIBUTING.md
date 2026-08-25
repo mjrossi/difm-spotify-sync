@@ -24,7 +24,7 @@ chmod 600 .env.local
 ## The gate
 
 ```sh
-just check     # lint + race tests + codegen drift + config drift
+just check     # lint + workflow lint + race tests + codegen/go.mod/config drift
 ```
 
 CI runs exactly this, plus a container build and a smoke test that the image

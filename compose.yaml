@@ -12,17 +12,22 @@
 #   cp .env.local.example .env.local   # then fill it in
 #   chmod 600 .env.local
 #   docker compose up -d
-#   docker compose logs -f connector   # -> the consent URL, once
+#   docker compose logs -f difmsync   # -> the consent URL, once
 #
 # While there is no refresh token the daemon serves the Spotify consent
 # flow and logs a URL carrying a nonce. Open it, approve, and syncing
 # starts on the next tick. If you cannot reach that port from a browser,
-# `docker compose exec -it connector /difmsync auth --manual` needs no
+# `docker compose exec -it difmsync /difmsync auth --manual` needs no
 # networking at all. See docs/deploy.md.
 services:
-  connector:
+  difmsync:
     build: .
     image: difm-spotify-sync:dev
+    # Pinned so `docker exec difmsync ...` works here exactly as it does for
+    # the `docker run` deployment in the README. Without it Compose derives
+    # <project>-difmsync-1, and every day-2 command in docs/deploy.md that a
+    # reader copies from the README half of the docs fails to resolve.
+    container_name: difmsync
     restart: unless-stopped
     env_file:
       # Secrets only. Everything else is an image default or an override
@@ -34,6 +39,21 @@ services:
       # owns whatever you mount at /config; `id -u` and `id -g` on the
       # host. They matter most for a bind mount, which arrives with the
       # ownership the host directory already has.
+      #
+      # Setting them is NOT done in .env.local, and this is the one place
+      # the two dotenv mechanisms differ in a way that bites:
+      #
+      #   env_file:      applied INSIDE the container. .env.local is read
+      #                  here, which is how the credentials arrive.
+      #   ${VAR} below:  interpolated by Compose on the HOST, before the
+      #                  container exists. Compose sources that from your
+      #                  shell or from a file named exactly `.env` — never
+      #                  from an env_file.
+      #
+      # And `environment:` wins over `env_file:`. So PUID=1001 written into
+      # .env.local is read into the container and then immediately
+      # overwritten by the 1000 default below — silently. Export it in your
+      # shell, or edit the value here.
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       TZ: ${TZ:-UTC}
@@ -53,22 +73,13 @@ services:
       # dashboard can poll them. Narrow to one interface (e.g.
       # "192.168.1.10:3436:3436") if you would rather not answer on all.
       - "3436:3436"
-    # Drops privileges before touching the database — see
-    # docker/healthcheck.sh for why that is not optional. `--check`
-    # rather than plain `status`: `status` only fails when the account
-    # row is missing, so a sync broken for a week still reported healthy.
-    #
-    # start_period is long because the check fails until the one-time
-    # consent has happened, and that needs a human with a browser. A
-    # short period would report `unhealthy` for the whole window between
-    # first deploy and consent — inverting the signal on precisely the
-    # day someone is watching it.
-    healthcheck:
-      test: ["CMD", "/healthcheck.sh"]
-      interval: 5m
-      timeout: 10s
-      retries: 3
-      start_period: 30m
+    # No healthcheck block: the image declares its own HEALTHCHECK, and
+    # Compose inherits it when a service does not override it. Do not
+    # restate it here — the tuple lived in three places at once (image,
+    # this file, the README snippet) and only the image's copy covers the
+    # `docker run` deployment too. See the Dockerfile for why the test is
+    # `status --check` rather than plain `status`, and why start-period is
+    # 30m.
     # The default is 10s, which SIGKILLs a pass that is mid-flight. The
     # engine survives that — the sync_runs row is closed through a
     # detached context, and the watermark only moves after a clean pass —
