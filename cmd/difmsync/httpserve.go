@@ -22,10 +22,21 @@ import (
 // clean close, so a channel that meant "serving stopped" in two places meant
 // "serving failed" in the third. None of that is visible at a call site —
 // which is why it survived.
+//
+// Consolidating settled the first and the third outright. The second it turned
+// from an omission into a choice: stop takes a logger, two callers pass one,
+// and `difmsync auth` still passes nil — for the reason stated at that call.
+// The change there is that the reason exists.
 
 const (
 	// Above the status handler's own timeout, so a slow database read
 	// returns its own 503 rather than being cut off mid-body.
+	//
+	// The consent callback is the one handler that can plausibly approach
+	// it, since it runs Spotify's token exchange inline. What the deadline
+	// passing costs there is the browser's "Authorized" page and nothing
+	// else: Complete runs under WithoutCancel, so the token is stored
+	// regardless, and the terminal or the log reports the real outcome.
 	serveWriteTimeout = 15 * time.Second
 	serveIdleTimeout  = 60 * time.Second
 	serveDrainTimeout = 5 * time.Second

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,8 +29,13 @@ import (
 //
 // Reading the real command tree rather than the source text is what makes the
 // value comparison possible at all. It also means the check cannot be fooled
-// by a variable that is named in a comment, and needs no maintenance when a
-// config file is added or removed.
+// by a variable that is named in a comment.
+//
+// The value comparison needs only the two files that state defaults, so the
+// first cut of this test read only those. That silently narrowed the old
+// recipe, which scanned nine — and two of the three drifts named above lived
+// in files the narrowed set no longer reached. configPaths below restores the
+// coverage; the value checks keep the reason it was rewritten.
 //
 // Note this reads flag *definitions*, never the process environment, so it
 // needs no clearEnv and passes identically on a machine with a populated
@@ -122,6 +129,72 @@ func sameValue(a, b string) bool {
 	return false
 }
 
+// configPaths is every committed place a DIFMSYNC_* name can be set, shipped
+// or written down. README.md and the Dockerfile appear here as well as in the
+// value checks below, because those two regexes read one table and one ENV
+// block — a dead variable mentioned in README prose is invisible to both.
+//
+// Directories are listed rather than their files, so a new doc or workflow is
+// covered the day it is added rather than the day someone remembers this list.
+var configPaths = []string{
+	".env.local.example",
+	".github/workflows",
+	"Dockerfile",
+	"README.md",
+	"compose.yaml",
+	"docker",
+	"docs",
+	"justfile",
+	"mise.toml",
+}
+
+// anyEnvName matches a DIFMSYNC_* name anywhere, prose included. That is the
+// point of it: an operator who reads a variable in a sentence will try to set
+// it, and a name no flag reads costs them the same afternoon whether it was
+// written in a table or in a paragraph.
+var anyEnvName = regexp.MustCompile(`DIFMSYNC_[A-Z_]+`)
+
+// configRefs returns every DIFMSYNC_* name under configPaths, mapped to the
+// files naming it so a failure says where to go.
+func configRefs(t *testing.T) map[string][]string {
+	t.Helper()
+	repo := filepath.Join("..", "..")
+	refs := map[string][]string{}
+
+	for _, p := range configPaths {
+		err := filepath.WalkDir(filepath.Join(repo, p), func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(repo, path)
+			if err != nil {
+				rel = path
+			}
+			for _, name := range anyEnvName.FindAllString(string(b), -1) {
+				if !slices.Contains(refs[name], rel) {
+					refs[name] = append(refs[name], rel)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", p, err)
+		}
+	}
+
+	// A path renamed out from under this list would empty the scan and pass
+	// every assertion built on it, which is the failure this whole file
+	// exists to make impossible.
+	if len(refs) == 0 {
+		t.Fatalf("no DIFMSYNC_* names found under %v; the paths have moved and this check is now vacuous", configPaths)
+	}
+	return refs
+}
+
 func TestConfigSurfaceIsDocumentedAndConsistent(t *testing.T) {
 	flags := envFlags(t)
 	readme := repoFile(t, "README.md")
@@ -155,15 +228,16 @@ func TestConfigSurfaceIsDocumentedAndConsistent(t *testing.T) {
 		}
 	})
 
-	t.Run("nothing is documented or shipped that the binary never reads", func(t *testing.T) {
-		for name := range documented {
+	// The orphan direction, over every file rather than the two the value
+	// checks read. A variable set in compose.yaml, exported by a workflow or
+	// written into docs/ that no flag reads is config an operator can set and
+	// then wonder why nothing happened — DIFMSYNC_NETWORK sat in mise.toml
+	// like that, and the docs carried a DIFM_* prefix nothing had ever read.
+	t.Run("nothing set or documented anywhere is unread by the binary", func(t *testing.T) {
+		for name, files := range configRefs(t) {
 			if _, ok := flags[name]; !ok {
-				t.Errorf("%s has a README table row but no flag reads it — dead config", name)
-			}
-		}
-		for name := range image {
-			if _, ok := flags[name]; !ok {
-				t.Errorf("%s is set in the Dockerfile ENV block but no flag reads it — dead config", name)
+				t.Errorf("%s appears in %s but no flag reads it — dead config",
+					name, strings.Join(files, ", "))
 			}
 		}
 	})
@@ -263,25 +337,58 @@ func TestMiseEnvEarnsItsPlace(t *testing.T) {
 	}
 }
 
+// exampleAssignment matches an uncommented assignment in .env.local.example.
+// The leading anchor is what makes it a credential list: the file also carries
+// DIFMSYNC_SPOTIFY_REDIRECT_URL, commented out, because that one is a setting
+// an operator may need rather than a secret.
+var exampleAssignment = regexp.MustCompile(`(?m)^(DIFMSYNC_[A-Z_]+)=`)
+
+// credentials derives the secret set from .env.local.example rather than from
+// a list here. A list is the shape of check this repo keeps getting caught by:
+// it passes for the sixth credential exactly as it did for the first five, and
+// nothing about adding one prompts anybody to come back and extend it.
+// .env.local.example is the file that already has to name every secret, since
+// it is what an operator copies.
+func credentials(t *testing.T) map[string]bool {
+	t.Helper()
+	found := map[string]bool{}
+	for _, m := range exampleAssignment.FindAllStringSubmatch(repoFile(t, ".env.local.example"), -1) {
+		found[m[1]] = true
+	}
+	if len(found) == 0 {
+		t.Fatal(".env.local.example names no credentials; this check derives its list from that file " +
+			"and has just become vacuous")
+	}
+	return found
+}
+
 // Credentials belong in .env.local, which mise.toml loads and compose.yaml
 // also reads as its only env_file. A secret parked in [env] instead would be
 // committed, and would reach the host tooling but not the container — the
 // half-working state that is hardest to diagnose.
 func TestMiseEnvHoldsNoCredentials(t *testing.T) {
 	mise := repoFile(t, "mise.toml")
+	secret := credentials(t)
+
 	body := mise
 	if i := strings.Index(body, "\n[env]"); i >= 0 {
 		body = body[i:]
 	}
 	for _, m := range miseEnv.FindAllStringSubmatch(body, -1) {
-		switch m[1] {
-		case "DIFMSYNC_API_KEY", "DIFMSYNC_MEMBER_ID", "DIFMSYNC_SPOTIFY_CLIENT_ID",
-			"DIFMSYNC_SPOTIFY_CLIENT_SECRET", "DIFMSYNC_PLAYLIST_ID":
-			t.Errorf("%s is a credential and must live in .env.local, not in committed mise.toml", m[1])
+		if secret[m[1]] {
+			t.Errorf("%s is a credential (it is in .env.local.example) and must live in .env.local, "+
+				"not in committed mise.toml", m[1])
 		}
 	}
-	if !strings.Contains(mise, `_.file = ".env.local"`) {
+
+	// Tolerant of spacing and quote style, so reformatting mise.toml cannot
+	// fail this for a reason that has nothing to do with credentials.
+	if !miseLoadsEnvLocal.MatchString(mise) {
 		t.Error("mise.toml no longer loads .env.local; the host tooling and the container " +
 			"would stop sharing one copy of the credentials")
 	}
 }
+
+// miseLoadsEnvLocal matches the _.file line that makes mise.toml and
+// compose.yaml share one copy of the secrets.
+var miseLoadsEnvLocal = regexp.MustCompile(`_\.file\s*=\s*["']\.env\.local["']`)

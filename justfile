@@ -11,6 +11,15 @@ set shell := ["bash", "-cu"]
 # contributor who ran `mise install` but has not shell-activated mise
 # still gets the pinned versions — and the DIFMSYNC_* defaults from
 # mise.toml's [env], which the run recipes depend on.
+#
+# That holds for a Go tool, which reads the variable itself. It does not
+# hold for the three recipes below that need $DIFMSYNC_DB_PATH in the
+# *shell*: this shell expands the recipe line before mise exec runs, so a
+# bare "$DIFMSYNC_DB_PATH" is unbound there — with `-u`, a hard error —
+# on a machine without mise activated. They wrap the command in `bash -cu`
+# so the expansion happens inside mise's environment instead. Do not
+# unwrap them, and do not paper over it with a `:-` default either: that
+# is a second copy of a value mise.toml already owns.
 
 # ── default ───────────────────────────────────────────
 
@@ -120,12 +129,12 @@ status:
 [group('ops')]
 [doc('show which migrations have been applied to the local database')]
 migrate-status:
-    @mise exec -- goose -dir migrations-sqlite sqlite3 "$DIFMSYNC_DB_PATH" status
+    @mise exec -- bash -cu 'goose -dir migrations-sqlite sqlite3 "$DIFMSYNC_DB_PATH" status'
 
 [group('ops')]
 [doc('list synced tracks with their DI.fm ids (needed by resync-track)')]
 ledger:
-    @mise exec -- sqlite3 -header -column "$DIFMSYNC_DB_PATH" \
+    @mise exec -- bash -cu 'sqlite3 -header -column "$DIFMSYNC_DB_PATH" "$1"' -- \
         "select difm_track_id, artist, substr(title,1,40) as title, \
                 round(match_score,3) as score, substr(added_at,1,10) as added \
          from synced_tracks order by liked_at desc;"
@@ -178,4 +187,4 @@ backup DEST="":
 # open the local SQLite database
 [group('ops')]
 db:
-    mise exec -- sqlite3 "$DIFMSYNC_DB_PATH"
+    mise exec -- bash -cu 'sqlite3 "$DIFMSYNC_DB_PATH"'
