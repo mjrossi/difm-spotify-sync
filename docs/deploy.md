@@ -334,8 +334,10 @@ separate migration step. The build needs BuildKit — the Dockerfile uses
 `latest` follows releases rather than `main`, so an unattended `docker
 compose pull` gets a version tagged on purpose.
 
-Until v1.0.0 is tagged, only `edge` and `sha-<short>` exist — the release
-tags in the first two rows appear with that release.
+`edge` and `sha-<short>` are published from `main` between releases, so
+they exist only after a push to `main` — a freshly pruned registry may
+have neither until the next merge. Deployments should be on `latest` or a
+pinned version regardless; those are the tags a release publishes.
 
 ### Deploying into an existing Compose stack
 

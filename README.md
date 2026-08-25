@@ -42,10 +42,6 @@ You need a Spotify app of your own (free, two minutes) and two values captured
 from a DI.fm page. Both are described under [Credentials](#credentials) below.
 There is no hosted service and no account to make here.
 
-> **Pre-release.** There is no tagged version yet, so `:latest` does not exist.
-> `:edge` tracks `main` and is published on every push. It will become
-> `:latest` at v1.0.0 — see [Which tag to pull](docs/deploy.md#which-tag-to-pull).
-
 ```sh
 docker run -d --name difmsync \
   -v difmsync-data:/config \
@@ -58,7 +54,7 @@ docker run -d --name difmsync \
   -e DIFMSYNC_SPOTIFY_CLIENT_SECRET=... \
   -e DIFMSYNC_PLAYLIST_ID=... \
   --restart unless-stopped \
-  ghcr.io/mjrossi/difm-spotify-sync:edge
+  ghcr.io/mjrossi/difm-spotify-sync:latest
 ```
 
 or with Compose:
@@ -66,7 +62,7 @@ or with Compose:
 ```yaml
 services:
   difmsync:
-    image: ghcr.io/mjrossi/difm-spotify-sync:edge
+    image: ghcr.io/mjrossi/difm-spotify-sync:latest
     container_name: difmsync
     restart: unless-stopped
     environment:
