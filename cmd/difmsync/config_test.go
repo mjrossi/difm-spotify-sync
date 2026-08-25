@@ -392,3 +392,48 @@ func TestMiseEnvHoldsNoCredentials(t *testing.T) {
 // miseLoadsEnvLocal matches the _.file line that makes mise.toml and
 // compose.yaml share one copy of the secrets.
 var miseLoadsEnvLocal = regexp.MustCompile(`_\.file\s*=\s*["']\.env\.local["']`)
+
+// TestGoVersionPinsAgree checks that the three places pinning the Go
+// toolchain state the same patch version.
+//
+// The pins are mise.toml (what `just check` and the govulncheck workflow
+// run), go.mod (the language version), and the Dockerfile's builder
+// image (what compiles the *published* binary). Only the first is what
+// CI scans.
+//
+// So the drift is silent in exactly the direction that matters: let the
+// Dockerfile fall behind and govulncheck reports "No vulnerabilities
+// found" against mise's toolchain while every released image is built on
+// the stale one and ships the CVEs. Nothing fails, and the scan that
+// exists to catch this is the thing reporting green. That is how
+// 1.26.5 shipped with five called stdlib vulnerabilities.
+//
+// A comment in the Dockerfile already said the pins were kept in sync.
+// It was accurate when written, which is the problem a comment cannot
+// solve and a test can.
+func TestGoVersionPinsAgree(t *testing.T) {
+	pins := []struct {
+		file string
+		re   *regexp.Regexp
+	}{
+		{"mise.toml", regexp.MustCompile(`(?m)^go\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"`)},
+		{"go.mod", regexp.MustCompile(`(?m)^go\s+([0-9]+\.[0-9]+\.[0-9]+)`)},
+		{"Dockerfile", regexp.MustCompile(`golang:([0-9]+\.[0-9]+\.[0-9]+)-`)},
+	}
+
+	got := make(map[string]string, len(pins))
+	for _, p := range pins {
+		m := p.re.FindStringSubmatch(repoFile(t, p.file))
+		if m == nil {
+			t.Fatalf("%s: no Go version pin found; if the pin moved, update this test rather than deleting it", p.file)
+		}
+		got[p.file] = m[1]
+	}
+
+	want := got["mise.toml"]
+	for file, v := range got {
+		if v != want {
+			t.Errorf("%s pins Go %s, mise.toml pins %s; all three must agree so the published image is built on the toolchain CI scanned", file, v, want)
+		}
+	}
+}

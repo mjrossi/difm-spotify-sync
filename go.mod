@@ -1,6 +1,6 @@
 module github.com/mjrossi/difm-spotify-sync
 
-go 1.26.5
+go 1.26.7
 
 require (
 	github.com/google/go-cmp v0.7.0

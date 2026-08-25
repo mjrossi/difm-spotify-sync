@@ -19,7 +19,7 @@
 
 [tools]
 # Patch-pinned so reproducibility > convenience.
-go = "1.26.5"
+go = "1.26.7"
 
 # Project tooling, pinned for the same reason.
 "aqua:sqlc-dev/sqlc" = "1.28.0"

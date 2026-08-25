@@ -12,7 +12,12 @@
 # Patch-pinned to match mise.toml and go.mod. A floating `1.26-alpine`
 # would build the release artifact on a different toolchain than
 # `just check` verified.
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS build
+#
+# TestGoVersionPinsAgree enforces the three, because this comment claimed
+# it and nothing checked. govulncheck runs on mise's Go, so a stale pin
+# here reports "No vulnerabilities found" while every published image is
+# built on the vulnerable toolchain — green scan, shipped CVEs.
+FROM --platform=$BUILDPLATFORM golang:1.26.7-alpine AS build
 WORKDIR /src
 
 # Dependencies first so the module cache survives source-only changes.
