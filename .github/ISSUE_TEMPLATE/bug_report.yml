@@ -35,7 +35,11 @@ body:
     id: version
     attributes:
       label: Version
-      description: Image tag, or `git rev-parse --short HEAD` for a build from source.
+      description: |
+        Output of `difmsync --version` — via `docker exec <container> /difmsync
+        --version` for the published image. It reports what the binary actually
+        is, which the image tag does not: `latest` names a different build every
+        release.
     validations:
       required: true
   - type: dropdown

@@ -54,7 +54,31 @@ jobs:
         run: |
           docker buildx build --platform linux/amd64 --load \
             --cache-to type=gha,mode=max --cache-from type=gha \
+            --build-arg VERSION=v0.0.0-ci \
             -t difm-spotify-sync:ci .
+
+      # The VERSION build arg has to reach the binary, not just the image
+      # label. It is stamped through -ldflags, so a renamed variable or a
+      # moved package breaks the stamp without breaking the build: every
+      # released image would report "dev" and run perfectly, and the first
+      # symptom is a bug report nobody can pin to a version.
+      #
+      # Asserted end to end rather than by grepping the Dockerfile,
+      # because the thing that can silently stop being true is whether
+      # the linker matched the symbol at all.
+      - name: the build arg reaches the binary
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm --entrypoint /difmsync \
+                  difm-spotify-sync:ci --version)
+          echo "$got"
+          case "$got" in
+            *v0.0.0-ci*) ;;
+            *)
+              echo "::error::--version reports '$got', want it to carry v0.0.0-ci"
+              exit 1
+              ;;
+          esac
 
       # Building proves the Dockerfile parses; it does not prove the
       # image runs. The failure this catches is a /config the service

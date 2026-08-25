@@ -25,12 +25,17 @@ COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 ARG TARGETARCH
+
+# Stamped into the binary below as well as onto the image label, so
+# `difmsync --version` and `docker inspect` agree. The release workflow
+# passes the git tag; an untagged local build says "dev", which is true.
 ARG VERSION=dev
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/difmsync ./cmd/difmsync
+    go build -trimpath -ldflags="-s -w -X main.version=$VERSION" \
+    -o /out/difmsync ./cmd/difmsync
 
 # Alpine rather than distroless, deliberately, and it is a trade rather
 # than an upgrade.

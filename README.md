@@ -231,6 +231,7 @@ difmsync review    # inspect and resolve the review queue
 difmsync resync    # reset sync state so past likes are re-evaluated
 difmsync status    # ledger totals, pending count, watermark, recent runs
 difmsync backup    # consistent snapshot of the database
+difmsync --version # which build this is; include it in bug reports
 ```
 
 In a container, reach them with `docker exec difmsync /difmsync <command>`.

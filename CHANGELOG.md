@@ -8,7 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet. Changes land here between releases.
 
-## [1.0.0] - unreleased
+## [1.0.0] - 2026-08-25
 
 First public release. There is no upgrade path to document because there is no
 earlier version — everything below describes what 1.0.0 does, not what changed.
@@ -66,6 +66,8 @@ three routes reach it, so that no deployment arrangement is locked out:
 - `difmsync status --check` applies the same health rule from the CLI, and is
   what the container healthcheck runs.
 - `difmsync backup` takes a consistent snapshot without stopping the service.
+- `difmsync --version` reports the build. Released images carry the git tag;
+  a build from a checkout reports its commit.
 
 [Unreleased]: https://github.com/mjrossi/difm-spotify-sync/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/mjrossi/difm-spotify-sync/releases/tag/v1.0.0

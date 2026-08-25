@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -50,13 +51,55 @@ func run() error {
 	return newApp().Run(ctx, os.Args)
 }
 
+// version is stamped at build time with
+// -ldflags="-X main.version=<tag>"; the release workflow passes the git
+// tag and the Dockerfile forwards it as a build arg.
+//
+// It is deliberately not a constant. An operator filing a bug report is
+// a stranger running a published image, and "which version" is the first
+// question every such report has to answer — so an unstamped build must
+// still say something useful rather than a hardcoded number that is
+// wrong for every build that is not a release.
+var version = ""
+
+// buildVersion resolves what this binary calls itself, preferring the
+// stamped tag and falling back to whatever the toolchain recorded.
+//
+// The fallback matters because three kinds of build reach an operator
+// and only one is stamped: the released image, a `go install` from the
+// module path, and a local `go build` from a checkout. The build info
+// covers the other two — an install records the real version, and a
+// build from a checkout records a pseudo-version carrying the commit
+// and a +dirty marker, which is exactly what a contributor's bug report
+// needs.
+//
+// Reading Settings["vcs.revision"] separately would be dead code: the
+// toolchain folds that revision into Main.Version itself, and a build
+// with no VCS info (`-buildvcs=false`) has neither. So "(devel)" and the
+// empty string both mean nothing was recorded, and both land on "dev".
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	return "dev"
+}
+
 // newApp builds the command tree. Separated from run so tests can drive
 // the real flag parsing, env-var fallbacks and subcommand wiring rather
 // than reaching past them.
 func newApp() *cli.Command {
 	cmd := &cli.Command{
-		Name:  "difmsync",
-		Usage: "sync DI.fm liked tracks into a Spotify playlist",
+		Name:    "difmsync",
+		Usage:   "sync DI.fm liked tracks into a Spotify playlist",
+		Version: buildVersion(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name: "db-path", Usage: "SQLite database path",
