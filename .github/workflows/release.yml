@@ -61,7 +61,7 @@ jobs:
       - name: just check
         run: just check
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: derive the version tags
         id: tags

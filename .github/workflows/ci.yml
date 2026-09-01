@@ -66,7 +66,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Versioned releases are tagged by release.yml on a v* tag; this
       # publishes the moving tags only. `edge` tracks main, `sha-<short>`
