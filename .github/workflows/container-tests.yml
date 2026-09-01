@@ -41,7 +41,7 @@ jobs:
       # the build platform and cross-compiles by TARGETARCH, so producing
       # an arm64 image needs no emulation — running one does.
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
       # The image is the deployment artifact, so a Dockerfile that stops
       # building is a release blocker even when the Go build is fine.
