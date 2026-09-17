@@ -72,6 +72,16 @@ var ErrRateLimited = errors.New("spotify: rate limited")
 // should stop rather than back off and retry.
 var ErrUnauthorized = errors.New("spotify: unauthorized")
 
+// ErrGrantRevoked narrows ErrUnauthorized to the one cause a human can
+// only fix by consenting again: the token endpoint refused the refresh
+// token. It always satisfies errors.Is(err, ErrUnauthorized) too, so the
+// engine's abort branches are unchanged; what it adds is permission for
+// the daemon to clear the stored token and re-run consent. An API
+// 401/403 deliberately does not carry it — a missing scope or a
+// Development Mode restriction is not cured by re-consent, and treating
+// it as revoked would turn one bad request into a consent loop.
+var ErrGrantRevoked = errors.New("spotify: refresh token rejected")
+
 // RateLimitError carries Spotify's backoff hint alongside ErrRateLimited.
 // Spotify's Retry-After is authoritative and can be minutes long.
 type RateLimitError struct {
@@ -216,7 +226,7 @@ func classifyTokenError(err error) error {
 		re.Response != nil && (re.Response.StatusCode == http.StatusUnauthorized ||
 			re.Response.StatusCode == http.StatusBadRequest ||
 			re.Response.StatusCode == http.StatusForbidden):
-		return fmt.Errorf("spotify: refresh token rejected (%s): %w", re.ErrorCode, ErrUnauthorized)
+		return fmt.Errorf("%w (%s): %w", ErrGrantRevoked, re.ErrorCode, ErrUnauthorized)
 	}
 	return err
 }
