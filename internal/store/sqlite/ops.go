@@ -297,10 +297,34 @@ func (s *Store) CountActionableReview(ctx context.Context, accountID int64) (int
 	return n, opErr("CountActionableReview", err)
 }
 
+// RunErrorKind categorizes why a pass failed, for the one consumer that
+// is not allowed to see the error text: the status endpoints. The
+// engine picks the value from its own sentinels, so a kind is always a
+// string this code wrote, never one an API returned.
+type RunErrorKind string
+
+const (
+	// KindDiFMUnauthorized: DI.fm rejected the API key.
+	KindDiFMUnauthorized RunErrorKind = "difm_unauthorized"
+	// KindSpotifyGrantRevoked: the token endpoint refused the refresh
+	// token; the daemon has cleared it and is waiting for consent.
+	KindSpotifyGrantRevoked RunErrorKind = "spotify_grant_revoked"
+	// KindRateLimited: either API answered 429; the next pass is delayed.
+	KindRateLimited RunErrorKind = "rate_limited"
+	// KindIncomplete: the pass finished but swallowed at least one
+	// failure, so the watermark was held (syncer.ErrPassIncomplete).
+	KindIncomplete RunErrorKind = "incomplete"
+	// KindError: failed for a reason with no more specific kind.
+	KindError RunErrorKind = "error"
+)
+
 // RunStats is the outcome of one sync pass.
 type RunStats struct {
 	Fetched, Added, Queued, Skipped int
 	Err                             error
+	// Kind is set alongside Err by the engine. Empty with a non-nil Err
+	// is a bug there, not a state the store interprets.
+	Kind RunErrorKind
 }
 
 // StartRun opens a sync_runs row and returns its id.
@@ -331,6 +355,7 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, st RunStats) error {
 		Queued:     int64(st.Queued),
 		Skipped:    int64(st.Skipped),
 		Error:      msg,
+		ErrorKind:  string(st.Kind),
 		ID:         runID,
 	}))
 }
@@ -431,6 +456,7 @@ type SyncRun struct {
 	DryRun                          bool
 	Fetched, Added, Queued, Skipped int
 	Error                           string
+	ErrorKind                       RunErrorKind
 }
 
 // ListRuns returns recent passes, newest first. A failed pass is recorded
@@ -455,6 +481,7 @@ func (s *Store) ListRuns(ctx context.Context, accountID int64, limit int) ([]Syn
 			Queued:     int(r.Queued),
 			Skipped:    int(r.Skipped),
 			Error:      r.Error,
+			ErrorKind:  RunErrorKind(r.ErrorKind),
 		})
 	}
 	return out, nil

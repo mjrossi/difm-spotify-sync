@@ -12,7 +12,7 @@ import (
 
 const finishSyncRun = `-- name: FinishSyncRun :exec
 UPDATE sync_runs
-SET finished_at = ?, fetched = ?, added = ?, queued = ?, skipped = ?, error = ?
+SET finished_at = ?, fetched = ?, added = ?, queued = ?, skipped = ?, error = ?, error_kind = ?
 WHERE id = ?
 `
 
@@ -23,6 +23,7 @@ type FinishSyncRunParams struct {
 	Queued     int64
 	Skipped    int64
 	Error      string
+	ErrorKind  string
 	ID         int64
 }
 
@@ -34,6 +35,7 @@ func (q *Queries) FinishSyncRun(ctx context.Context, arg FinishSyncRunParams) er
 		arg.Queued,
 		arg.Skipped,
 		arg.Error,
+		arg.ErrorKind,
 		arg.ID,
 	)
 	return err
@@ -41,7 +43,7 @@ func (q *Queries) FinishSyncRun(ctx context.Context, arg FinishSyncRunParams) er
 
 const listSyncRuns = `-- name: ListSyncRuns :many
 SELECT id, account_id, started_at, finished_at, dry_run,
-       fetched, added, queued, skipped, error
+       fetched, added, queued, skipped, error, error_kind
 FROM sync_runs
 WHERE account_id = ?
 ORDER BY started_at DESC, id DESC
@@ -73,6 +75,7 @@ func (q *Queries) ListSyncRuns(ctx context.Context, arg ListSyncRunsParams) ([]S
 			&i.Queued,
 			&i.Skipped,
 			&i.Error,
+			&i.ErrorKind,
 		); err != nil {
 			return nil, err
 		}
@@ -91,7 +94,7 @@ const startSyncRun = `-- name: StartSyncRun :one
 INSERT INTO sync_runs (account_id, started_at, dry_run)
 VALUES (?, ?, ?)
 RETURNING id, account_id, started_at, finished_at, dry_run,
-          fetched, added, queued, skipped, error
+          fetched, added, queued, skipped, error, error_kind
 `
 
 type StartSyncRunParams struct {
@@ -114,6 +117,7 @@ func (q *Queries) StartSyncRun(ctx context.Context, arg StartSyncRunParams) (Syn
 		&i.Queued,
 		&i.Skipped,
 		&i.Error,
+		&i.ErrorKind,
 	)
 	return i, err
 }

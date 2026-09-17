@@ -13,6 +13,10 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/pressly/goose/v3"
+
+	migrations "github.com/mjrossi/difm-spotify-sync/migrations-sqlite"
+
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/pkg/match"
 )
@@ -517,5 +521,88 @@ func TestCorruptWatermarkWarnsRatherThanSilentlyZeroing(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "unparseable watermark") {
 		t.Errorf("logged %q, want a warning naming the unparseable watermark", buf.String())
+	}
+}
+
+// TestFinishRunRecordsTheKind: the kind is what /healthz is allowed to
+// say about a failed pass, so it has to round-trip through the row.
+func TestFinishRunRecordsTheKind(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	runID, err := s.StartRun(ctx, acct.ID, false)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if err := s.FinishRun(ctx, runID, sqlite.RunStats{
+		Err: errors.New("difm: page 1: unauthorized"), Kind: sqlite.KindDiFMUnauthorized,
+	}); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	runs, err := s.ListRuns(ctx, acct.ID, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ErrorKind != sqlite.KindDiFMUnauthorized {
+		t.Fatalf("ListRuns = %+v, want one run with ErrorKind %q", runs, sqlite.KindDiFMUnauthorized)
+	}
+}
+
+// TestErrorKindDefaultsForPreexistingRows: a database written by 1.0.0
+// has sync_runs rows with no kind. After migrating they must read as the
+// empty kind, which status treats exactly as it did before the column
+// existed — not fail to scan, and not report something invented.
+func TestErrorKindDefaultsForPreexistingRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// Build the 1.0.0 schema by hand: migrate only to 0001, then write a
+	// row through raw SQL, since the Store API of this version cannot
+	// produce a row without a kind.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	goose.SetBaseFS(migrations.FS)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("dialect: %v", err)
+	}
+	if err := goose.UpToContext(ctx, raw, ".", 1); err != nil {
+		t.Fatalf("goose up-to 1: %v", err)
+	}
+	for _, stmt := range []string{
+		`INSERT INTO accounts (id, label) VALUES (1, 'default')`,
+		`INSERT INTO sync_runs (account_id, finished_at, error) VALUES (1, '2026-01-01T00:00:00.000Z', 'boom')`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	runs, err := s.ListRuns(ctx, 1, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("ListRuns returned %d rows, want 1", len(runs))
+	}
+	if runs[0].ErrorKind != "" || runs[0].Error != "boom" {
+		t.Errorf("run = %+v, want ErrorKind \"\" and Error \"boom\"", runs[0])
 	}
 }
