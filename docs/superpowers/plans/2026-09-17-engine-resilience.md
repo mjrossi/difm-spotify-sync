@@ -343,7 +343,29 @@ type RunStats struct {
 }
 ```
 
-In `FinishRun`, add `ErrorKind: string(st.Kind),` to the `FinishSyncRunParams` literal, after `Error: msg,`.
+Add a guard so the column can only ever hold a value this package
+defines — it is published by the status endpoints, and a caller that
+smuggled error text in through the kind would reopen the channel the
+column exists to close:
+
+```go
+// known reports whether k is a value this package defines.
+func (k RunErrorKind) known() bool {
+	switch k {
+	case "", KindDiFMUnauthorized, KindSpotifyGrantRevoked, KindRateLimited, KindIncomplete, KindError:
+		return true
+	}
+	return false
+}
+```
+
+In `FinishRun`, if `!st.Kind.known()`, log a Warn naming the rejected
+kind as a caller bug and write `KindError` instead — never return an
+error, because FinishRun runs in a deferred path and losing the row is
+worse than losing the kind. Then add `ErrorKind: string(kind),` to the
+`FinishSyncRunParams` literal, after `Error: msg,`. Test:
+`TestFinishRunRejectsAnUnknownKind` writes a kind containing a member id
+and asserts the row reads back `KindError`.
 
 In the `SyncRun` struct (line 427), add after `Error string`:
 
