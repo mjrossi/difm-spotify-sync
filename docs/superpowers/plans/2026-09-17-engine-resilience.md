@@ -105,17 +105,25 @@ In `pkg/spotify/spotify.go`, directly after the `ErrUnauthorized` declaration (l
 var ErrGrantRevoked = errors.New("spotify: refresh token rejected")
 ```
 
-Then in `classifyTokenError`, change the second case's return (line 219) from
+Then in `classifyTokenError`, split the second case so that **only
+`invalid_grant`** carries the new sentinel. `invalid_client` is a wrong
+client secret — the grant is still valid — and a bodiless 4xx is an
+upstream problem; both must stay on the plain `ErrUnauthorized` wrap
+because Task 7 deletes the stored token on `ErrGrantRevoked`:
 
 ```go
-		return fmt.Errorf("spotify: refresh token rejected (%s): %w", re.ErrorCode, ErrUnauthorized)
-```
-
-to
-
-```go
+	case re.ErrorCode == "invalid_grant":
 		return fmt.Errorf("%w (%s): %w", ErrGrantRevoked, re.ErrorCode, ErrUnauthorized)
+	case re.ErrorCode == "invalid_client",
+		re.Response != nil && (re.Response.StatusCode == http.StatusUnauthorized ||
+			re.Response.StatusCode == http.StatusBadRequest ||
+			re.Response.StatusCode == http.StatusForbidden):
+		return fmt.Errorf("spotify: token endpoint refused (%s): %w", re.ErrorCode, ErrUnauthorized)
 ```
+
+Add a token-endpoint negative control, `TestTokenEndpointRefusalsThatAreNotRevocations`,
+over `invalid_client` and a bodiless `text/html` 403: each must be
+`ErrUnauthorized` and not `ErrGrantRevoked`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

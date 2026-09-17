@@ -48,8 +48,12 @@ Made in discussion; restated here so the plan does not reopen them.
 
 **Typed distinction.** `pkg/spotify` gains `ErrGrantRevoked`.
 `classifyTokenError` returns it in place of the bare `ErrUnauthorized`
-wrap for `invalid_grant`, `invalid_client`, and 400/401/403 from the
-*token endpoint*. It is defined so that `errors.Is(err, ErrUnauthorized)`
+wrap for **`invalid_grant` only** from the *token endpoint*.
+`invalid_client` (a wrong client secret, which does not invalidate the
+grant) and a bodiless 400/401/403 (an upstream proxy, not a verdict on
+the token) stay on the plain `ErrUnauthorized` wrap: they still abort the
+pass and still need a human, but they must not authorize deleting a
+stored credential. It is defined so that `errors.Is(err, ErrUnauthorized)`
 remains true — a double wrap, `fmt.Errorf("%w: %w", ErrGrantRevoked,
 ErrUnauthorized)`, is enough — so every existing branch and test on
 `ErrUnauthorized` keeps working and the new branch is strictly narrower.
