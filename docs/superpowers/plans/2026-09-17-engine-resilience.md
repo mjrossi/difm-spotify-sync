@@ -725,7 +725,11 @@ func TestNextDelay(t *testing.T) {
 		{"above the ceiling is capped", &spotify.RateLimitError{RetryAfter: 72 * time.Hour}, maxRetryDelay},
 		{"no header falls back to the interval", &spotify.RateLimitError{StatusCode: 429}, interval},
 		{"wrapped by the engine", fmt.Errorf("spotify search: %w", &spotify.RateLimitError{RetryAfter: 3 * time.Minute}), 3 * time.Minute},
-		{"wrapped in ErrPassIncomplete", fmt.Errorf("%w: %w", ErrPassIncomplete, &difm.RateLimitError{RetryAfter: 4 * time.Minute}), 4 * time.Minute},
+		{"found through a multi-%w chain", fmt.Errorf("%w: %w", ErrPassIncomplete, &difm.RateLimitError{RetryAfter: 4 * time.Minute}), 4 * time.Minute},
+		{"longer than the interval is still honored", &spotify.RateLimitError{RetryAfter: 6 * time.Hour}, 6 * time.Hour},
+		{"negative is treated as absent", &difm.RateLimitError{RetryAfter: -time.Second}, interval},
+		{"exactly the floor", &spotify.RateLimitError{RetryAfter: minInterval}, minInterval},
+		{"exactly the ceiling", &spotify.RateLimitError{RetryAfter: maxRetryDelay}, maxRetryDelay},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := nextDelay(tc.err, interval); got != tc.want {
