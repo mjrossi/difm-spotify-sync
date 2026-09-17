@@ -139,8 +139,9 @@ is tested with a table and needs no clock.
 - **New engine branch.** `RunOnce` gets `case errors.Is(err,
   difm.ErrUnauthorized)` ahead of the generic `err != nil` after
   `ListLikedTracks`. It logs an operator-facing Error line — "DI.fm
-  rejected the API key; set a fresh DIFMSYNC_API_KEY — see
-  docs/difm-api.md" — and returns with the kind set. The tick continues at
+  rejected the API key; set a fresh DIFMSYNC_API_KEY — the README
+  Credentials section says where to find it" (a repo path is useless to
+  someone reading a container log) — and returns with the kind set. The tick continues at
   `interval`: hammering a dead key every interval is harmless and the
   alternative is a crash loop.
 - **Status surfaces the kind, never the text.** `status.Run` gains
@@ -182,7 +183,11 @@ is tested with a table and needs no clock.
 - **Store:** open a database migrated only to 0001, migrate, and assert
   old rows read `error_kind = ''`.
 - **Engine:** `TestRunOnce_DiFMUnauthorizedIsTypedAndLogged` — kind
-  recorded, watermark held.
+  recorded, watermark held, and the log line asserted (the harness
+  captures logs; without that, deleting the branch passes). Also a dry
+  run that swallowed a failure records `incomplete`.
+- Cancellation mid-pass is recorded as `KindError` by design; the
+  constant's comment says so.
 
 ## Documentation
 

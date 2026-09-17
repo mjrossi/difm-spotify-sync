@@ -524,7 +524,7 @@ Append to `internal/syncer/engine_test.go`:
 // rejected one used to be indistinguishable from a network blip: the
 // same "sync pass failed" line, the same generic healthcheck reason. The
 // kind is what lets /healthz say which it was.
-func TestRunOnce_DiFMUnauthorizedIsTypedAndHoldsTheWatermark(t *testing.T) {
+func TestRunOnce_DiFMUnauthorizedIsTypedAndLogged(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
 	h.difmUnauthorized = true
@@ -541,6 +541,26 @@ func TestRunOnce_DiFMUnauthorizedIsTypedAndHoldsTheWatermark(t *testing.T) {
 	}
 	if got := h.lastRunKind(t); got != sqlite.KindDiFMUnauthorized {
 		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindDiFMUnauthorized)
+	}
+	// The branch exists for its log line; without this assertion deleting
+	// the branch passes, because the generic path classifies the same.
+	if !strings.Contains(h.Logs.String(), "DI.fm rejected the API key") {
+		t.Errorf("operator-facing line missing from log:\n%s", h.Logs.String())
+	}
+}
+
+// A dry run that swallowed a failure returns nil (pre-existing) but must
+// still record incomplete: its return precedes the incomplete site.
+func TestRunOnce_DryRunSwallowedFailureIsRecordedAsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.failSearch["One"] = true
+
+	if _, err := h.Engine.RunOnce(ctx, true); err != nil {
+		t.Fatalf("dry run returned %v, want nil", err)
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindIncomplete {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindIncomplete)
 	}
 }
 
@@ -628,10 +648,26 @@ In the fetch `switch` (line 141), insert a new case between the `ErrDropped` cas
 		// produces too, and the two call for different first moves. The
 		// key is a long-lived token with no rotation path (CLAUDE.md,
 		// Credentials); the fix is re-extracting it, not waiting.
-		e.Log.Error("DI.fm rejected the API key; set a fresh DIFMSYNC_API_KEY — see docs/difm-api.md",
-			"err", err)
+		e.Log.Error("DI.fm rejected the API key; set a fresh DIFMSYNC_API_KEY — "+
+			"the README Credentials section says where to find it", "err", err)
 		stats.Err = err
 		return stats, fmt.Errorf("fetch likes: %w", err)
+```
+
+The harness must capture logs for the assertion above: give `harness` a
+`Logs *bytes.Buffer` field and build `Log: slog.New(slog.NewTextHandler(h.Logs, nil))`
+instead of `slog.DiscardHandler`.
+
+Before the dry-run early return (the `if dryRun {` block that precedes
+the add), hoist the incomplete kind so a dry run that swallowed a failure
+is not classified from its raw search error:
+
+```go
+	// The dry-run return below precedes the incomplete site; set the
+	// kind here too so a dry run that swallowed a failure says so.
+	if !passClean {
+		stats.Kind = sqlite.KindIncomplete
+	}
 ```
 
 At the incomplete return (line 352-361), set the kind before returning:
