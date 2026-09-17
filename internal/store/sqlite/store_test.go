@@ -552,7 +552,7 @@ func TestFinishRunRecordsTheKind(t *testing.T) {
 	}
 }
 
-// TestErrorKindDefaultsForPreexistingRows: a database written by 1.0.0
+// TestErrorKindDefaultsForPreexistingRows: a database written by v1.0.0
 // has sync_runs rows with no kind. After migrating they must read as the
 // empty kind, which status treats exactly as it did before the column
 // existed — not fail to scan, and not report something invented.
@@ -560,9 +560,11 @@ func TestErrorKindDefaultsForPreexistingRows(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "old.db")
 
-	// Build the 1.0.0 schema by hand: migrate only to 0001, then write a
+	// Build the v1.0.0 schema by hand: migrate only to 0001, then write a
 	// row through raw SQL, since the Store API of this version cannot
-	// produce a row without a kind.
+	// produce a row without a kind. Drives goose directly, outside
+	// Store.Migrate and its mutex; that is safe only because this
+	// package does not use t.Parallel.
 	raw, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open raw: %v", err)
@@ -604,5 +606,49 @@ func TestErrorKindDefaultsForPreexistingRows(t *testing.T) {
 	}
 	if runs[0].ErrorKind != "" || runs[0].Error != "boom" {
 		t.Errorf("run = %+v, want ErrorKind \"\" and Error \"boom\"", runs[0])
+	}
+}
+
+// TestFinishRunRejectsAnUnknownKind: RunErrorKind is a plain string, so
+// nothing at compile time stops a caller from passing error text through
+// Kind instead of one of the package's sentinels. The column is
+// published by the status endpoints, so FinishRun must refuse it rather
+// than write it verbatim — and it must say so in the log, the same way
+// an unparseable watermark does, rather than fail silently.
+func TestFinishRunRejectsAnUnknownKind(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	var buf bytes.Buffer
+	s.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	runID, err := s.StartRun(ctx, acct.ID, false)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	smuggled := "difm: page 1: https://api.audioaddict.com/v1/di/members/4242/track_votes"
+	if err := s.FinishRun(ctx, runID, sqlite.RunStats{
+		Err:  errors.New("boom"),
+		Kind: sqlite.RunErrorKind(smuggled),
+	}); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+
+	runs, err := s.ListRuns(ctx, acct.ID, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ErrorKind != sqlite.KindError {
+		t.Fatalf("ListRuns = %+v, want one run with ErrorKind %q", runs, sqlite.KindError)
+	}
+	if strings.Contains(string(runs[0].ErrorKind), "4242") {
+		t.Errorf("ErrorKind = %q, want the member id scrubbed rather than written through", runs[0].ErrorKind)
+	}
+	if !strings.Contains(buf.String(), "unknown error kind") {
+		t.Errorf("logged %q, want a warning naming the rejected kind", buf.String())
 	}
 }

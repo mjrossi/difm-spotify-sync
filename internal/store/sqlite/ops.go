@@ -318,12 +318,26 @@ const (
 	KindError RunErrorKind = "error"
 )
 
+// known reports whether k is a value this package defines. The column
+// is published by the status endpoints, so FinishRun refuses to write
+// anything else: a caller that smuggled error text in through the kind
+// would reopen exactly the channel the column exists to close.
+func (k RunErrorKind) known() bool {
+	switch k {
+	case "", KindDiFMUnauthorized, KindSpotifyGrantRevoked, KindRateLimited, KindIncomplete, KindError:
+		return true
+	}
+	return false
+}
+
 // RunStats is the outcome of one sync pass.
 type RunStats struct {
 	Fetched, Added, Queued, Skipped int
 	Err                             error
 	// Kind is set alongside Err by the engine. Empty with a non-nil Err
-	// is a bug there, not a state the store interprets.
+	// is a bug there, not a state the store interprets. Rows written
+	// before migration 0002 read back as empty; that is the only
+	// legitimate source of an empty kind on a failed run.
 	Kind RunErrorKind
 }
 
@@ -348,6 +362,16 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, st RunStats) error {
 	if st.Err != nil {
 		msg = st.Err.Error()
 	}
+	kind := st.Kind
+	if !kind.known() {
+		// Fail safe — write KindError rather than the smuggled value —
+		// but not silently: this column is published by the status
+		// endpoints, so a caller passing error text through Kind is a
+		// bug there worth surfacing, not a state to pass through.
+		s.log.Warn("unknown error kind; recording as error",
+			"kind", string(st.Kind))
+		kind = KindError
+	}
 	return opErr("FinishRun", s.q.FinishSyncRun(ctx, sqlitegen.FinishSyncRunParams{
 		FinishedAt: sql.NullString{String: s.now(), Valid: true},
 		Fetched:    int64(st.Fetched),
@@ -355,7 +379,7 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, st RunStats) error {
 		Queued:     int64(st.Queued),
 		Skipped:    int64(st.Skipped),
 		Error:      msg,
-		ErrorKind:  string(st.Kind),
+		ErrorKind:  string(kind),
 		ID:         runID,
 	}))
 }
