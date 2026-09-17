@@ -729,3 +729,99 @@ func TestRunOnce_SwallowedFailureIsRecordedAsIncomplete(t *testing.T) {
 		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindIncomplete)
 	}
 }
+
+// fakeAfter stands in for time.After. Each delay Loop asks for is sent
+// on asked; each wait completes when the test sends on fire. Receiving
+// from asked is how a test knows Loop has reached its next wait, which
+// keeps the assertions free of sleeps and races.
+type fakeAfter struct {
+	asked chan time.Duration
+	fire  chan time.Time
+}
+
+func newFakeAfter() *fakeAfter {
+	return &fakeAfter{asked: make(chan time.Duration, 8), fire: make(chan time.Time)}
+}
+
+func (f *fakeAfter) after(d time.Duration) <-chan time.Time {
+	f.asked <- d
+	return f.fire
+}
+
+// startLoop runs Loop in the background and returns its result channel.
+func startLoop(ctx context.Context, h *harness, clock *fakeAfter, interval time.Duration) <-chan error {
+	syncer.SetAfter(h.Engine, clock.after)
+	done := make(chan error, 1)
+	go func() { done <- h.Engine.Loop(ctx, interval, false) }()
+	return done
+}
+
+// There was no Loop test that let a tick fire. These three drive the
+// ticker through a fake clock and pin the scheduling decisions the
+// daemon's whole cadence depends on.
+func TestLoop_ReschedulesAtTheIntervalAfterAPass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, nil)
+	clock := newFakeAfter()
+	const interval = 2 * time.Hour
+
+	done := startLoop(ctx, h, clock, interval)
+	if jitter := <-clock.asked; jitter < 0 || jitter >= interval/4 {
+		t.Errorf("first wait = %s, want a jitter in [0, %s)", jitter, interval/4)
+	}
+	clock.fire <- time.Time{} // first pass runs
+	if got := <-clock.asked; got != interval {
+		t.Errorf("wait after a clean pass = %s, want %s", got, interval)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Loop returned %v after cancellation, want nil", err)
+	}
+}
+
+func TestLoop_RateLimitDelaysTheNextPassByRetryAfter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.rateLimitSearch = true
+	h.retryAfter = "300"
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked // jitter
+	clock.fire <- time.Time{}
+	if got := <-clock.asked; got != 5*time.Minute {
+		t.Errorf("wait after a 429 with Retry-After 300 = %s, want 5m", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Loop returned %v after cancellation, want nil", err)
+	}
+}
+
+func TestLoop_ReturnsWhenTheGrantIsRevoked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.revokeGrant = true
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked // jitter
+	clock.fire <- time.Time{}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, spotify.ErrGrantRevoked) {
+			t.Errorf("Loop returned %v, want ErrGrantRevoked", err)
+		}
+	case d := <-clock.asked:
+		t.Fatalf("Loop rescheduled (%s) instead of returning on a revoked grant", d)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Loop neither returned nor rescheduled")
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindSpotifyGrantRevoked {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindSpotifyGrantRevoked)
+	}
+}

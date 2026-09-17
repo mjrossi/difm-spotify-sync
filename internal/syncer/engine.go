@@ -41,6 +41,10 @@ type Engine struct {
 	PlaylistID string
 	Thresholds Thresholds
 	Log        *slog.Logger
+
+	// after is the timer source Loop waits on; nil means time.After. A
+	// test injects one so the ticker can be driven without sleeping.
+	after func(time.Duration) <-chan time.Time
 }
 
 // RunOnce performs a single sync pass.
@@ -446,12 +450,14 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 			"requested", interval, "using", minInterval)
 		interval = minInterval
 	}
+	after := e.after
+	if after == nil {
+		after = time.After
+	}
 	jitter := time.Duration(rand.Int64N(int64(interval / 4)))
 	e.Log.Info("starting sync loop", "interval", interval, "first_run_in", jitter)
 
-	timer := time.NewTimer(jitter)
-	defer timer.Stop()
-
+	wait := after(jitter)
 	for {
 		select {
 		case <-ctx.Done():
@@ -462,15 +468,23 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 				return nil
 			}
 			return ctx.Err()
-		case <-timer.C:
-			if _, err := e.RunOnce(ctx, dryRun); err != nil {
+		case <-wait:
+			_, err := e.RunOnce(ctx, dryRun)
+			if errors.Is(err, spotify.ErrGrantRevoked) {
+				return err
+			}
+			if err != nil {
 				// Keep looping: a transient API failure should not kill
 				// a long-running daemon. ErrPassIncomplete in particular
 				// is self-correcting — the watermark held, so the next
 				// tick re-reads whatever was missed.
 				e.Log.Error("sync pass failed", "err", err)
 			}
-			timer.Reset(interval)
+			delay := nextDelay(err, interval)
+			if delay != interval {
+				e.Log.Warn("rate limited; delaying next pass", "delay", delay, "interval", interval)
+			}
+			wait = after(delay)
 		}
 	}
 }
