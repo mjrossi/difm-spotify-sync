@@ -72,6 +72,13 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		return stats, err
 	}
 	defer func() {
+		// Classified here, once, so that no return site can forget it.
+		// KindIncomplete is the exception: it is set at the single site
+		// that returns ErrPassIncomplete, because by then stats.Err is
+		// the first swallowed error rather than the wrapper.
+		if stats.Err != nil && stats.Kind == "" {
+			stats.Kind = classify(stats.Err)
+		}
 		// Detached from ctx. On SIGTERM mid-pass ctx is already canceled,
 		// and closing the row with a canceled context fails — leaving a
 		// run that never finishes and a phantom "in flight" in `difmsync
@@ -148,6 +155,15 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		// re-read it.
 		e.Log.Error("some likes could not be read; watermark will be held", "err", err)
 		fail(err)
+	case errors.Is(err, difm.ErrUnauthorized):
+		// Named, because the generic line below is what a network blip
+		// produces too, and the two call for different first moves. The
+		// key is a long-lived token with no rotation path (CLAUDE.md,
+		// Credentials); the fix is re-extracting it, not waiting.
+		e.Log.Error("DI.fm rejected the API key; set a fresh DIFMSYNC_API_KEY — see docs/difm-api.md",
+			"err", err)
+		stats.Err = err
+		return stats, fmt.Errorf("fetch likes: %w", err)
 	case err != nil:
 		// Includes difm.ErrTruncated, which carries a partial prefix. The
 		// prefix is deliberately not processed: a pass that cannot see all
@@ -350,6 +366,7 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 	}
 
 	if !passClean {
+		stats.Kind = sqlite.KindIncomplete
 		e.Log.Warn("pass completed with failures; watermark held back",
 			"watermark", account.WatermarkLikedAt, "err", stats.Err)
 		// Returned as an error so a one-shot `difmsync sync` — from cron,

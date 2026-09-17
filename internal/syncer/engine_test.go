@@ -9,6 +9,7 @@ import (
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/internal/syncer"
+	"github.com/mjrossi/difm-spotify-sync/pkg/difm"
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
 )
 
@@ -414,6 +415,9 @@ func TestRunOnce_RateLimitAbortsPass(t *testing.T) {
 	if got := h.reload(t).WatermarkLikedAt; !got.IsZero() {
 		t.Errorf("watermark = %s, want unchanged", got)
 	}
+	if got := h.lastRunKind(t); got != sqlite.KindRateLimited {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindRateLimited)
+	}
 }
 
 // `resync` is the recovery escape hatch, and the deployment keeps the
@@ -654,5 +658,46 @@ func TestLoopClampsANonPositiveInterval(t *testing.T) {
 				t.Fatal("Loop did not return after its context was canceled")
 			}
 		})
+	}
+}
+
+// The DI.fm API key is a long-lived token with no rotation path, and a
+// rejected one used to be indistinguishable from a network blip: the
+// same "sync pass failed" line, the same generic healthcheck reason. The
+// kind is what lets /healthz say which it was.
+func TestRunOnce_DiFMUnauthorizedIsTypedAndHoldsTheWatermark(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.difmUnauthorized = true
+
+	_, err := h.Engine.RunOnce(ctx, false)
+	if !errors.Is(err, difm.ErrUnauthorized) {
+		t.Fatalf("err = %v, want difm.ErrUnauthorized", err)
+	}
+	if h.SearchCount != 0 {
+		t.Errorf("issued %d searches with no likes readable, want 0", h.SearchCount)
+	}
+	if got := h.reload(t).WatermarkLikedAt; !got.IsZero() {
+		t.Errorf("watermark = %s, want unchanged", got)
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindDiFMUnauthorized {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindDiFMUnauthorized)
+	}
+}
+
+// A pass that swallowed a failure is recorded as incomplete, distinct
+// from one that aborted: the writes it made are durable and only the
+// watermark was held.
+func TestRunOnce_SwallowedFailureIsRecordedAsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.failSearch["One"] = true
+
+	_, err := h.Engine.RunOnce(ctx, false)
+	if !errors.Is(err, syncer.ErrPassIncomplete) {
+		t.Fatalf("err = %v, want ErrPassIncomplete", err)
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindIncomplete {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindIncomplete)
 	}
 }

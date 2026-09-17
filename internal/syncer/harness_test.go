@@ -92,6 +92,7 @@ type harness struct {
 	failSearch       map[string]bool
 	rateLimitSearch  bool
 	failPlaylistRead bool
+	difmUnauthorized bool
 
 	// beforeSearch, when set, runs at the start of each search request.
 	// Tests use it to interleave an event — a shutdown, say — into the
@@ -119,6 +120,10 @@ func newHarness(t *testing.T, likes []like) *harness {
 	}
 
 	difmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.difmUnauthorized {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		if r.URL.Query().Get("page") != "1" {
 			_, _ = io.WriteString(w, "[]")
 			return
@@ -262,6 +267,19 @@ func (h *harness) pending(t *testing.T) []sqlite.ReviewItem {
 		t.Fatalf("list review: %v", err)
 	}
 	return items
+}
+
+// lastRunKind reads the kind recorded on the newest sync_runs row.
+func (h *harness) lastRunKind(t *testing.T) sqlite.RunErrorKind {
+	t.Helper()
+	runs, err := h.Store.ListRuns(context.Background(), h.Engine.Account.ID, 1)
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(runs) == 0 {
+		t.Fatal("no sync_runs row recorded")
+	}
+	return runs[0].ErrorKind
 }
 
 // exec runs a statement against the store's file on a separate
