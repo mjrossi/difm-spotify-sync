@@ -37,3 +37,28 @@ func TestClassify(t *testing.T) {
 		})
 	}
 }
+
+func TestNextDelay(t *testing.T) {
+	const interval = 2 * time.Hour
+	for _, tc := range []struct {
+		name string
+		err  error
+		want time.Duration
+	}{
+		{"clean pass", nil, interval},
+		{"unrelated error", errors.New("status 500"), interval},
+		{"spotify retry-after honored", &spotify.RateLimitError{RetryAfter: 5 * time.Minute}, 5 * time.Minute},
+		{"difm retry-after honored", &difm.RateLimitError{RetryAfter: 10 * time.Minute}, 10 * time.Minute},
+		{"below the floor is raised to it", &spotify.RateLimitError{RetryAfter: 5 * time.Second}, minInterval},
+		{"above the ceiling is capped", &spotify.RateLimitError{RetryAfter: 72 * time.Hour}, maxRetryDelay},
+		{"no header falls back to the interval", &spotify.RateLimitError{StatusCode: 429}, interval},
+		{"wrapped by the engine", fmt.Errorf("spotify search: %w", &spotify.RateLimitError{RetryAfter: 3 * time.Minute}), 3 * time.Minute},
+		{"wrapped in ErrPassIncomplete", fmt.Errorf("%w: %w", ErrPassIncomplete, &difm.RateLimitError{RetryAfter: 4 * time.Minute}), 4 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nextDelay(tc.err, interval); got != tc.want {
+				t.Errorf("nextDelay(%v, %s) = %s, want %s", tc.err, interval, got, tc.want)
+			}
+		})
+	}
+}
