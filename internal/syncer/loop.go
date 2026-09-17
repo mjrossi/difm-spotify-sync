@@ -36,10 +36,14 @@ const maxRetryDelay = 24 * time.Hour
 
 // nextDelay decides when the next pass runs, given how the last one
 // ended. A rate limit from either API carries the server's own backoff
-// hint, and before this it was parsed and never read — the next attempt
-// was a full interval later regardless, which at a long interval turns
-// one 429 into hours of nothing. Anything else, including a 429 with no
-// header, keeps the interval.
+// hint; ignoring it and waiting a full interval turns one 429 at a long
+// interval into hours of nothing, and a hint longer than the interval
+// is honored because retrying sooner only guarantees another 429. The
+// hint is clamped to the same floor Loop applies to the interval — a
+// 429 aborts the pass, so the retry is a full pass start including a
+// DI.fm fetch, and the floor is what keeps a tiny hint from driving
+// that at more than one a minute — and to maxRetryDelay above.
+// Anything else, including a 429 with no header, keeps the interval.
 func nextDelay(err error, interval time.Duration) time.Duration {
 	var retryAfter time.Duration
 	var sp *spotify.RateLimitError
