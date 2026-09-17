@@ -159,8 +159,10 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		// Named, because the generic line below is what a network blip
 		// produces too, and the two call for different first moves. The
 		// key is a long-lived token with no rotation path (CLAUDE.md,
-		// Credentials); the fix is re-extracting it, not waiting.
-		e.Log.Error("DI.fm rejected the API key; set a fresh DIFMSYNC_API_KEY — see docs/difm-api.md",
+		// Credentials); the fix is re-extracting it, not waiting. Points
+		// at the README rather than docs/ — this is what someone reading
+		// a container log with no checkout can actually reach.
+		e.Log.Error("DI.fm rejected the API key; set a fresh DIFMSYNC_API_KEY — the README Credentials section says where to find it",
 			"err", err)
 		stats.Err = err
 		return stats, fmt.Errorf("fetch likes: %w", err)
@@ -286,6 +288,13 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 	}
 
 	if dryRun {
+		// This return precedes the !passClean site below, which would
+		// otherwise be the one place that sets KindIncomplete — so a dry
+		// run that swallowed a failure needs its own assignment here or
+		// the defer's classify(stats.Err) records a plain "error" for it.
+		if !passClean {
+			stats.Kind = sqlite.KindIncomplete
+		}
 		e.Log.Info("dry run complete — nothing written",
 			"would_add", len(pendingIDs), "would_queue", stats.Queued, "skipped", stats.Skipped)
 		stats.Added = len(pendingIDs)

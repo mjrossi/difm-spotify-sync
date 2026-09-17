@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -664,8 +665,11 @@ func TestLoopClampsANonPositiveInterval(t *testing.T) {
 // The DI.fm API key is a long-lived token with no rotation path, and a
 // rejected one used to be indistinguishable from a network blip: the
 // same "sync pass failed" line, the same generic healthcheck reason. The
-// kind is what lets /healthz say which it was.
-func TestRunOnce_DiFMUnauthorizedIsTypedAndHoldsTheWatermark(t *testing.T) {
+// kind is what lets /healthz say which it was — but the dedicated branch's
+// only *other* observable effect is its log line (the generic branch
+// below it also satisfies errors.Is and the defer classifies either one
+// the same way), so that line is asserted directly here.
+func TestRunOnce_DiFMUnauthorizedIsTypedAndLogged(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
 	h.difmUnauthorized = true
@@ -682,6 +686,30 @@ func TestRunOnce_DiFMUnauthorizedIsTypedAndHoldsTheWatermark(t *testing.T) {
 	}
 	if got := h.lastRunKind(t); got != sqlite.KindDiFMUnauthorized {
 		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindDiFMUnauthorized)
+	}
+	if !strings.Contains(h.Logs.String(), "DI.fm rejected the API key") {
+		t.Errorf("operator-facing line missing from log:\n%s", h.Logs.String())
+	}
+}
+
+// The dry-run early return sits above the !passClean site that normally
+// sets KindIncomplete, so a dry run that swallowed a failure used to fall
+// through to the defer's raw classify(stats.Err) — recording a plain
+// "error" for a failure mode that is, in every other respect, identical
+// to the non-dry-run incomplete case.
+func TestRunOnce_DryRunSwallowedFailureIsRecordedAsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.failSearch["One"] = true
+
+	// The dry-run error is nil today regardless of a swallowed failure —
+	// pre-existing behavior this task does not change.
+	_, err := h.Engine.RunOnce(ctx, true)
+	if err != nil {
+		t.Fatalf("RunOnce(dry): %v", err)
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindIncomplete {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindIncomplete)
 	}
 }
 

@@ -1,6 +1,7 @@
 package syncer_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -85,6 +86,12 @@ type harness struct {
 	// a specific write).
 	DBPath string
 
+	// Logs captures everything the engine logs, so a test can assert on an
+	// operator-facing line rather than only on state. Discarding logs left
+	// a branch whose only observable effect is its log line indistinguishable
+	// from deleting it.
+	Logs *bytes.Buffer
+
 	// Knobs the tests flip.
 	inPlaylist       []string
 	searchResult     map[string][]spotifyTrack
@@ -117,6 +124,7 @@ func newHarness(t *testing.T, likes []like) *harness {
 	h := &harness{
 		searchResult: map[string][]spotifyTrack{},
 		failSearch:   map[string]bool{},
+		Logs:         &bytes.Buffer{},
 	}
 
 	difmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -235,7 +243,7 @@ func newHarness(t *testing.T, likes []like) *harness {
 		Account:    account,
 		PlaylistID: "PL1",
 		Thresholds: syncer.Thresholds{Auto: 0.85, Review: 0.60},
-		Log:        slog.New(slog.DiscardHandler),
+		Log:        slog.New(slog.NewTextHandler(h.Logs, nil)),
 	}
 	return h
 }

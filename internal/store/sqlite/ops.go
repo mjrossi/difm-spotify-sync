@@ -314,7 +314,8 @@ const (
 	// KindIncomplete: the pass finished but swallowed at least one
 	// failure, so the watermark was held (syncer.ErrPassIncomplete).
 	KindIncomplete RunErrorKind = "incomplete"
-	// KindError: failed for a reason with no more specific kind.
+	// KindError: failed for a reason with no more specific kind, including
+	// a pass cut short by shutdown.
 	KindError RunErrorKind = "error"
 )
 
