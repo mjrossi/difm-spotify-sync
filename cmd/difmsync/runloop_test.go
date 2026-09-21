@@ -112,7 +112,7 @@ func TestSyncRunnerReturnsNilWhenCanceledWhileAwaitingConsent(t *testing.T) {
 // Without a consent server there is nothing to wait on. The error must
 // come back unchanged so the operator sees "run difmsync auth" rather
 // than a wrapped mystery.
-func TestSyncRunnerSurfacesMissingCredentialsUnchanged(t *testing.T) {
+func TestSyncRunnerSurfacesMissingCredentials(t *testing.T) {
 	f := newRunnerFixture(t, nil)
 	f.runner.await = func(context.Context, sqlite.Account) error {
 		return spotify.ErrNoCredentials

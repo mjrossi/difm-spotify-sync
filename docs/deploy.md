@@ -185,14 +185,17 @@ parameter. That is the standard protection, and the same one `difmsync
 auth` relies on.
 
 The listener exists only while there is no refresh token and shuts down
-for the life of the process once there is one. A *failed* consent
+once there is one; it comes back only if the grant is later revoked and
+the token cleared (below). A *failed* consent
 deliberately leaves it up — a denied grant or a mistyped state has to be
 retryable by clicking the URL again, not by restarting the container.
 
 If Spotify later revokes the grant — a password change, or removing the
-app under Spotify's *Manage apps* — the daemon notices, either during its
-next sync pass or immediately at its next restart if the token was
-already dead, logs `Spotify revoked the refresh token; consent is
+app under Spotify's *Manage apps* — the daemon notices within about an
+hour (the cached access token has to expire before a refresh is
+attempted, so a pass or two may first fail with a plain 401), or
+immediately at its next restart if the token was already dead. It then
+logs `Spotify revoked the refresh token; consent is
 required again`, clears the stored token, and brings the listener back up
 with a new URL and a new nonce. Click it as you did the first time;
 nothing needs restarting. `auth --manual` works here too, exactly as on
@@ -444,7 +447,7 @@ what makes them safe to expose on a LAN without authentication.
 | `no sync pass has run yet` | The container started but has not completed a pass | Wait one interval; then read the logs |
 | `newest run errored — run …` | A pass failed and the watermark was held back | `difmsync status` for the error text |
 | `awaiting Spotify consent` (after a revoked grant) | The refresh token was rejected; the daemon cleared it and brought the consent server back up. The `KIND` column / `error_kind` says `spotify_grant_revoked` | Open the new consent URL from the log |
-| `newest run found the Spotify grant revoked` | Same event, seen before the daemon restarted or from a one-shot `sync` | Open the consent URL, or run `difmsync auth` |
+| `newest run found the Spotify grant revoked` | Consent was re-given (by you, or a sidecar `auth --manual`) and the first pass since has not completed yet | Wait one interval; if it persists, open the consent URL or run `difmsync auth` |
 | `newest run had its DI.fm API key rejected` | `DIFMSYNC_API_KEY` no longer works | [Rotate the key](#rotating-the-difm-key) |
 | `newest run was rate limited` | An API answered 429; the loop backs off by its `Retry-After` | Nothing — it recovers on its own |
 | `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 difmsync` |

@@ -18,6 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reason, rather than the generic "newest run errored".
 - `difmsync status` and `/status.json` carry an `error_kind` for failed
   passes — a fixed category, never the error text, which stays CLI-only.
+- A one-shot `difmsync sync` with a revoked grant now exits non-zero from
+  the playlist probe, before the pass runs and without recording a
+  `sync_runs` row; it used to warn and run the pass anyway.
 
 ### Database
 

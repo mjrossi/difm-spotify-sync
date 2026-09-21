@@ -386,8 +386,9 @@ front, that is every peer on the tailnet, not one host. The nonce is the
 only guard that survives that, which is why it is the first of the four
 rather than a convenience.
 
-- It exists **only while there is no refresh token**, and shuts down for
-  the life of the process the moment one is stored. A *failed* consent
+- It exists **only while there is no refresh token**, and shuts down the
+  moment one is stored; it comes back only if the grant is later revoked
+  and the token cleared (below). A *failed* consent
   deliberately leaves it up: a denied grant or a mistyped state has to be
   retryable by clicking the URL again, not by restarting the container.
   `done` fires only after `Complete` returns nil, so the narrowing is the
