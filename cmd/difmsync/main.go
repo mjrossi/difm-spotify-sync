@@ -824,7 +824,7 @@ func printStatus(rep status.Report) {
 		fmt.Println("no sync runs recorded yet")
 		return
 	}
-	fmt.Printf("%-20s  %-5s  %5s  %5s  %5s  %-22s  %s\n",
+	fmt.Printf("%-20s  %-5s  %5s  %5s  %5s  %-21s  %s\n",
 		"STARTED", "DRY", "ADDED", "QUEUE", "SKIP", "KIND", "ERROR")
 	for _, run := range rep.Runs {
 		dry := ""
@@ -835,7 +835,7 @@ func printStatus(rep status.Report) {
 		if len(started) > 19 {
 			started = started[:19]
 		}
-		fmt.Printf("%-20s  %-5s  %5d  %5d  %5d  %-22s  %s\n",
+		fmt.Printf("%-20s  %-5s  %5d  %5d  %5d  %-21s  %s\n",
 			started, dry, run.Added, run.Queued, run.Skipped, run.ErrorKind, run.Error)
 	}
 }

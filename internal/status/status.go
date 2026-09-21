@@ -95,6 +95,15 @@ type Run struct {
 
 // newRun copies one store row into the reported view, field by field.
 func newRun(r sqlite.SyncRun) Run {
+	// The write side already refuses to record a kind it did not define
+	// (FinishRun), but this endpoint answers the LAN from whatever
+	// database it was handed — a restored or hand-edited one included —
+	// so the exclusion is repeated here rather than trusted across
+	// processes. See TestStatusJSONDropsAnUnknownKind.
+	var kind string
+	if r.ErrorKind.Known() {
+		kind = string(r.ErrorKind)
+	}
 	return Run{
 		ID:         r.ID,
 		StartedAt:  r.StartedAt,
@@ -105,7 +114,7 @@ func newRun(r sqlite.SyncRun) Run {
 		Queued:     r.Queued,
 		Skipped:    r.Skipped,
 		Failed:     r.Error != "",
-		ErrorKind:  string(r.ErrorKind),
+		ErrorKind:  kind,
 		Error:      r.Error,
 	}
 }
@@ -296,17 +305,20 @@ func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (bool, s
 // reviewed by nobody; the Run.Error comment above has the longer version.
 // Naming the run and pointing at the CLI keeps the reason actionable
 // without turning the probe into a disclosure channel.
+//
+// A reason may name the recorded *kind* — an enum this code defined —
+// and nothing else from the row.
 func describe(run sqlite.SyncRun) string {
 	// The kind is checked first because it is the only thing about a
 	// failed run this function may say. It is an enum the engine chose
 	// (sqlite.RunErrorKind), so naming it here is not interpolation.
 	switch run.ErrorKind {
 	case sqlite.KindSpotifyGrantRevoked:
-		return "Spotify revoked the grant; consent is required again — the consent URL is in the daemon log"
+		return "newest run found the Spotify grant revoked; if consent has not been re-given, open the consent URL from the daemon log or run difmsync auth"
 	case sqlite.KindDiFMUnauthorized:
-		return "DI.fm rejected the API key — run `difmsync status` for details, then set a fresh DIFMSYNC_API_KEY"
+		return "newest run had its DI.fm API key rejected — set a fresh DIFMSYNC_API_KEY; the README Credentials section says where to find it"
 	case sqlite.KindRateLimited:
-		return "newest run was rate limited; the next pass is delayed by the Retry-After the API sent"
+		return "newest run was rate limited by an API; the daemon backs off before retrying"
 	}
 	switch {
 	case run.Error != "":

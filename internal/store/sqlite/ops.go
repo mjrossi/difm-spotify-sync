@@ -319,11 +319,13 @@ const (
 	KindError RunErrorKind = "error"
 )
 
-// known reports whether k is a value this package defines. The column
+// Known reports whether k is a value this package defines. The column
 // is published by the status endpoints, so FinishRun refuses to write
 // anything else: a caller that smuggled error text in through the kind
-// would reopen exactly the channel the column exists to close.
-func (k RunErrorKind) known() bool {
+// would reopen exactly the channel the column exists to close. It is
+// also the read-side check: a row a process did not write itself — a
+// restore, a hand edit — gets the same exclusion before it is served.
+func (k RunErrorKind) Known() bool {
 	switch k {
 	case "", KindDiFMUnauthorized, KindSpotifyGrantRevoked, KindRateLimited, KindIncomplete, KindError:
 		return true
@@ -364,7 +366,7 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, st RunStats) error {
 		msg = st.Err.Error()
 	}
 	kind := st.Kind
-	if !kind.known() {
+	if !kind.Known() {
 		// Fail safe — write KindError rather than the smuggled value —
 		// but not silently: this column is published by the status
 		// endpoints, so a caller passing error text through Kind is a

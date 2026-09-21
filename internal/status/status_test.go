@@ -2,6 +2,7 @@ package status_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -282,17 +283,18 @@ func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
 // first move was "re-extract the DI.fm key" or "click the consent URL".
 func TestReasonNamesTheFailureKind(t *testing.T) {
 	for _, tc := range []struct {
+		name       string
 		kind       sqlite.RunErrorKind
 		wantReason string // substring
 	}{
-		{sqlite.KindSpotifyGrantRevoked, "consent is required again"},
-		{sqlite.KindDiFMUnauthorized, "DI.fm rejected the API key"},
-		{sqlite.KindRateLimited, "rate limited"},
-		{sqlite.KindIncomplete, "newest run errored"},
-		{sqlite.KindError, "newest run errored"},
-		{"", "newest run errored"},
+		{"spotify grant revoked", sqlite.KindSpotifyGrantRevoked, "grant revoked"},
+		{"difm unauthorized", sqlite.KindDiFMUnauthorized, "DI.fm API key rejected"},
+		{"rate limited", sqlite.KindRateLimited, "rate limited"},
+		{"incomplete", sqlite.KindIncomplete, "newest run errored"},
+		{"error", sqlite.KindError, "newest run errored"},
+		{"pre-0002 row", "", "newest run errored"},
 	} {
-		t.Run(string(tc.kind), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			s, account := newStore(t)
 			recordFailedRun(t, s, account.ID, time.Minute, tc.kind, errWithMemberID)
 
@@ -311,6 +313,66 @@ func TestReasonNamesTheFailureKind(t *testing.T) {
 			}
 			if len(rep.Runs) == 0 || rep.Runs[0].ErrorKind != string(tc.kind) {
 				t.Errorf("Runs[0].ErrorKind = %q, want %q", rep.Runs[0].ErrorKind, tc.kind)
+			}
+		})
+	}
+}
+
+// TestStatusJSONDropsAnUnknownKind is the read-side half of the guard.
+// FinishRun refuses to write a kind this package did not define, but the
+// status endpoints answer from whatever database they are handed — a
+// restored or hand-edited one included — so a row that got an unknown
+// kind past the write side some other way must still not be published
+// verbatim.
+func TestStatusJSONDropsAnUnknownKind(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	ctx := context.Background()
+	s, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	account, err := s.EnsureAccount(ctx, testLabel, testMemberID, testPlaylist)
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	if err := s.SetSpotifyRefreshToken(ctx, account.ID, refreshToken); err != nil {
+		t.Fatalf("SetSpotifyRefreshToken: %v", err)
+	}
+	recordFailedRun(t, s, account.ID, time.Minute, sqlite.KindError, errWithMemberID)
+
+	// A row this process did not write through FinishRun: a hand edit, or
+	// what a restored database could carry. The Store API has no way to
+	// produce this on demand, so a raw connection on the same file is the
+	// only way to get it there.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	if _, err := raw.Exec(`UPDATE sync_runs SET error_kind = 'SMUGGLED-4242'`); err != nil {
+		t.Fatalf("UPDATE sync_runs: %v", err)
+	}
+
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	defer srv.Close()
+
+	for _, path := range []string{"/status.json", "/healthz"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if strings.Contains(string(body), "SMUGGLED") {
+				t.Errorf("%s published an unknown error_kind verbatim: %s", path, body)
 			}
 		})
 	}
