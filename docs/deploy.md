@@ -172,11 +172,12 @@ deployment will mount.**
 
 Two things, and they are different guards for different reasons.
 
-The **nonce** in the start URL is generated at startup and emitted once,
-to the log. Reaching the port is not enough to begin a flow — without
-this, anyone who could reach it could complete consent with *their*
-Spotify account and bind your sync to a stranger's playlist. The endpoint
-is unauthenticated by necessity, since you have no session with it yet.
+The **nonce** in the start URL is generated when the daemon starts
+waiting for consent and emitted once, to the log. Reaching the port is
+not enough to begin a flow — without this, anyone who could reach it
+could complete consent with *their* Spotify account and bind your sync
+to a stranger's playlist. The endpoint is unauthenticated by necessity,
+since you have no session with it yet.
 
 The **callback** is guarded by the OAuth `state` parameter instead,
 because Spotify redirects a browser to it and will not carry an extra
@@ -187,6 +188,15 @@ The listener exists only while there is no refresh token and shuts down
 for the life of the process once there is one. A *failed* consent
 deliberately leaves it up — a denied grant or a mistyped state has to be
 retryable by clicking the URL again, not by restarting the container.
+
+If Spotify later revokes the grant — a password change, or removing the
+app under Spotify's *Manage apps* — the daemon notices, either during its
+next sync pass or immediately at its next restart if the token was
+already dead, logs `Spotify revoked the refresh token; consent is
+required again`, clears the stored token, and brings the listener back up
+with a new URL and a new nonce. Click it as you did the first time;
+nothing needs restarting. `auth --manual` works here too, exactly as on
+first run.
 
 ## Running it
 
@@ -433,6 +443,10 @@ what makes them safe to expose on a LAN without authentication.
 | `no account "default" yet` | Nothing has ever run against this volume | Start the container; it creates the row |
 | `no sync pass has run yet` | The container started but has not completed a pass | Wait one interval; then read the logs |
 | `newest run errored — run …` | A pass failed and the watermark was held back | `difmsync status` for the error text |
+| `awaiting Spotify consent` (after a revoked grant) | The refresh token was rejected; the daemon cleared it and brought the consent server back up. The `KIND` column / `error_kind` says `spotify_grant_revoked` | Open the new consent URL from the log |
+| `newest run found the Spotify grant revoked` | Same event, seen before the daemon restarted or from a one-shot `sync` | Open the consent URL, or run `difmsync auth` |
+| `newest run had its DI.fm API key rejected` | `DIFMSYNC_API_KEY` no longer works | [Rotate the key](#rotating-the-difm-key) |
+| `newest run was rate limited` | An API answered 429; the loop backs off by its `Retry-After` | Nothing — it recovers on its own |
 | `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 difmsync` |
 | `newest run is still in flight` | A pass is running, or was killed mid-run | Wait; if it persists, restart the container |
 

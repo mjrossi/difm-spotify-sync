@@ -209,6 +209,28 @@ Three invariants that the code depends on, in order:
    one-shot `difmsync sync` exits non-zero. `Loop` logs it and carries on —
    the watermark held, so the next tick re-reads whatever was missed.
 
+   Two pass outcomes change what `Loop` does next, and both are decided
+   by the pass error rather than by control flow. A rate limit from
+   either API carries `Retry-After`, and `nextDelay` (`loop.go`)
+   schedules the next tick from it, clamped to `[1m, 24h]`, instead of
+   the interval — before that the hint was parsed and never read, and at
+   a long interval one 429 cost hours. `spotify.ErrGrantRevoked` makes
+   `Loop` *return*: the engine cannot fix a dead grant, so it hands the
+   decision to `cmd/difmsync`, which clears the token and re-enters the
+   consent wait (see Operator surface). `ErrGrantRevoked` narrows
+   `ErrUnauthorized` to exactly `invalid_grant` from the token endpoint —
+   `invalid_client` and a bodiless 4xx stay plain `ErrUnauthorized` —
+   because it is the one error that authorizes deleting a stored
+   credential; anything looser would let a wrong client secret or a
+   transient upstream error erase a token that was never actually dead.
+
+   Every failed pass also records a **kind** (`sync_runs.error_kind`), set
+   once by `classify` in the engine's `FinishRun` defer — never by the
+   store, which must not import the API packages, and never at individual
+   return sites, where one branch forgets. The kind is an enum the code
+   chose; it is the only thing about a failure the status endpoints may
+   say.
+
    Correspondingly, a transport failure is never recorded as a *verdict*.
    "We could not ask Spotify" must not be stored as `no_match`.
 3. **Dedupe is reconciled, not assumed.** Each pass reads live playlist
@@ -375,12 +397,21 @@ rather than a convenience.
   token. Watching only its own callback left the daemon waiting forever
   on a URL nobody was going to open, with the account row already
   authorized, which is what made it hard to see.
-- Starting a flow requires a **nonce** generated at startup and emitted
-  once, to the log — one per process, valid until consent completes,
-  rather than one per attempt. Reaching the port is not sufficient. Without this,
-  anyone who could reach it could complete consent with their own Spotify
-  account and bind the sync to a stranger's playlist — the endpoint is
-  unauthenticated by necessity, since the operator has no session yet.
+
+  The converse also holds: when the token endpoint rejects the refresh
+  token (`spotify.ErrGrantRevoked`, and only that — an API 403 is not
+  it), `syncRunner` (`runloop.go`) clears the stored token and re-enters
+  the same wait. The daemon heals the way it bootstraps, through the same
+  `consentFlow`, with no new code path. Clearing first is what keeps this
+  sentence literal.
+- Starting a flow requires a **nonce** generated when the wait begins
+  and emitted once, to the log — one per consent wait, valid until that
+  consent completes, rather than one per attempt. A daemon whose grant is
+  revoked mid-life re-enters the wait and gets a fresh one. Reaching the
+  port is not sufficient. Without this, anyone who could reach it could
+  complete consent with their own Spotify account and bind the sync to a
+  stranger's playlist — the endpoint is unauthenticated by necessity,
+  since the operator has no session yet.
 - The callback is guarded by the OAuth `state` parameter rather than the
   nonce, because Spotify redirects a browser to it and will not carry an
   extra parameter. That is the standard protection and the same one
@@ -440,6 +471,11 @@ Two consequences for code:
 
   `pkg/difm` scrubs the member id at the source as well
   (`scrubMemberID`), so the two defenses are independent.
+
+  What the endpoints *may* say is the kind: `describe()` switches on
+  `sync_runs.error_kind` first. A kind is an enum the engine chose from
+  its own sentinels, so naming it is not interpolation. A new reason
+  string may name a kind; it may not include `Error`.
 
 The health rule itself: the newest `sync_runs` row that finished,
 recorded no error, and was **not** a dry run must be within

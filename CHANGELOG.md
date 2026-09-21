@@ -6,7 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet. Changes land here between releases.
+### Changed
+
+- A refresh token that Spotify revokes mid-life no longer needs a human
+  to run `difmsync auth` and restart the container. The daemon clears the
+  dead token, brings the consent server back up with a fresh URL and
+  nonce, and resumes once you click it.
+- A 429 from either API now delays the next pass by the `Retry-After`
+  the server sent (clamped to 1m–24h) instead of a full interval.
+- A rejected DI.fm API key gets its own log line and its own `/healthz`
+  reason, rather than the generic "newest run errored".
+- `difmsync status` and `/status.json` carry an `error_kind` for failed
+  passes — a fixed category, never the error text, which stays CLI-only.
+
+### Database
+
+- Migration `0002` adds `sync_runs.error_kind`. Applied automatically on
+  start; existing rows read as unclassified.
 
 ## [1.0.0] - 2026-08-25
 
