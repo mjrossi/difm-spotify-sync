@@ -147,13 +147,25 @@ is tested with a table and needs no clock.
 - **Status surfaces the kind, never the text.** `status.Run` gains
   `ErrorKind string` with `json:"error_kind"` — visible, because it is an
   enum. `newRun` copies it field by field like everything else.
-  `describe()` switches on the kind first:
-  - `spotify_grant_revoked` → "Spotify revoked the grant; consent is
-    required again — the consent URL is in the log"
-  - `difm_unauthorized` → "DI.fm rejected the API key — run `difmsync
-    status` for details"
-  - `rate_limited` → "rate limited; next pass delayed"
+  `describe()` switches on the kind first. Each reason is a past-tense
+  fact leading with the same subject as the generic ones, and claims
+  nothing about daemon state that status cannot know:
+  - `spotify_grant_revoked` → "newest run found the Spotify grant
+    revoked; if consent has not been re-given, open the consent URL from
+    the daemon log or run difmsync auth". In the daemon this is usually
+    shadowed by `Build`'s "awaiting Spotify consent" override once the
+    token is cleared; it survives for a one-shot `sync` and for the
+    window after a sidecar re-consent before the next pass.
+  - `difm_unauthorized` → "newest run had its DI.fm API key rejected —
+    set a fresh DIFMSYNC_API_KEY; the README Credentials section says
+    where to find it"
+  - `rate_limited` → "newest run was rate limited by an API; the daemon
+    backs off before retrying"
   - anything else → the existing generic text.
+
+  The exclusion is structural on both endpoints: `newRun` publishes a
+  kind only if the store's `Known()` predicate accepts it, so a restored
+  or hand-edited row cannot put arbitrary text on `/status.json` either.
 
   `TestEndpointsCarryNoSecretsFromAFailedRun` must pass unchanged, because
   nothing interpolates `Error`. The CLI `status` table gains a kind column.

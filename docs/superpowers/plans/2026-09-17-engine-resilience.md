@@ -1141,8 +1141,8 @@ func TestReasonNamesTheFailureKind(t *testing.T) {
 		kind       sqlite.RunErrorKind
 		wantReason string // substring
 	}{
-		{sqlite.KindSpotifyGrantRevoked, "consent is required again"},
-		{sqlite.KindDiFMUnauthorized, "DI.fm rejected the API key"},
+		{sqlite.KindSpotifyGrantRevoked, "grant revoked"},
+		{sqlite.KindDiFMUnauthorized, "DI.fm API key rejected"},
 		{sqlite.KindRateLimited, "rate limited"},
 		{sqlite.KindIncomplete, "newest run errored"},
 		{sqlite.KindError, "newest run errored"},
@@ -1204,7 +1204,14 @@ In `internal/status/status.go`, in the `Run` struct add after `Failed bool`:
 	ErrorKind string `json:"error_kind,omitempty"`
 ```
 
-In `newRun`, add `ErrorKind: string(r.ErrorKind),` after `Failed:`.
+In `newRun`, publish the kind only if `r.ErrorKind.Known()` (export the
+store's `known()` predicate), else `""`. The write side already refuses
+unknown kinds, but the endpoints answer from whatever database they are
+handed — restored or hand-edited included — so the exclusion is repeated
+here rather than trusted across processes. Negative control:
+`TestStatusJSONDropsAnUnknownKind` raw-`UPDATE`s a row to
+`error_kind='SMUGGLED-4242'` and asserts neither endpoint body contains
+it.
 
 Replace `describe` with:
 
@@ -1215,11 +1222,11 @@ func describe(run sqlite.SyncRun) string {
 	// (sqlite.RunErrorKind), so naming it here is not interpolation.
 	switch run.ErrorKind {
 	case sqlite.KindSpotifyGrantRevoked:
-		return "Spotify revoked the grant; consent is required again — the consent URL is in the daemon log"
+		return "newest run found the Spotify grant revoked; if consent has not been re-given, open the consent URL from the daemon log or run difmsync auth"
 	case sqlite.KindDiFMUnauthorized:
-		return "DI.fm rejected the API key — run `difmsync status` for details, then set a fresh DIFMSYNC_API_KEY"
+		return "newest run had its DI.fm API key rejected — set a fresh DIFMSYNC_API_KEY; the README Credentials section says where to find it"
 	case sqlite.KindRateLimited:
-		return "newest run was rate limited; the next pass is delayed by the Retry-After the API sent"
+		return "newest run was rate limited by an API; the daemon backs off before retrying"
 	}
 	switch {
 	case run.Error != "":
@@ -1701,9 +1708,10 @@ restarting. `auth --manual` works here too, exactly as on first run.
 In the "When it goes red" table, add rows after the `newest run errored` row:
 
 ```markdown
-| `Spotify revoked the grant; consent is required again` | The refresh token was rejected; the daemon has cleared it and is waiting | Open the new consent URL from the log |
-| `DI.fm rejected the API key` | `DIFMSYNC_API_KEY` no longer works | [Rotate the key](#rotating-the-difm-key) |
-| `newest run was rate limited` | An API answered 429; the next pass is delayed by its `Retry-After` | Nothing — it recovers on its own |
+| `awaiting Spotify consent` (after a revoked grant) | The refresh token was rejected; the daemon cleared it and brought the consent server back up. The `KIND` column / `error_kind` says `spotify_grant_revoked` | Open the new consent URL from the log |
+| `newest run found the Spotify grant revoked` | Same event, seen before the daemon restarted or from a one-shot `sync` | Open the consent URL, or run `difmsync auth` |
+| `newest run had its DI.fm API key rejected` | `DIFMSYNC_API_KEY` no longer works | [Rotate the key](#rotating-the-difm-key) |
+| `newest run was rate limited` | An API answered 429; the loop backs off by its `Retry-After` | Nothing — it recovers on its own |
 ```
 
 - [ ] **Step 4: CHANGELOG.md**
