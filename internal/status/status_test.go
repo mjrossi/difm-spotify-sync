@@ -75,6 +75,23 @@ func recordRun(t *testing.T, s *sqlite.Store, accountID int64, age time.Duration
 	}
 }
 
+// recordFailedRun is recordRun for a pass that ended with a kind.
+func recordFailedRun(t *testing.T, s *sqlite.Store, accountID int64, age time.Duration, kind sqlite.RunErrorKind, runErr error) {
+	t.Helper()
+	ctx := context.Background()
+	at := time.Now().Add(-age)
+	s.SetClock(func() time.Time { return at })
+	defer s.SetClock(time.Now)
+
+	id, err := s.StartRun(ctx, accountID, false)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if err := s.FinishRun(ctx, id, sqlite.RunStats{Err: runErr, Kind: kind}); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+}
+
 // The freshness rule is the whole reason this package exists: the old
 // healthcheck ran `status`, which only failed when the account row was
 // missing, so a sync that had been broken for a week still reported
@@ -224,7 +241,11 @@ func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
 	s, account := newStore(t)
 	// Newest run failed, and nothing clean behind it — so health() has to
 	// fall through to describe(), which is the /healthz leak channel.
-	recordRun(t, s, account.ID, time.Minute, false, errWithMemberID)
+	//
+	// A kinded failure, because the kind path is the one branch of
+	// describe() that says more than the generic text — so it is the one
+	// that could leak if a later edit interpolated the run.
+	recordFailedRun(t, s, account.ID, time.Minute, sqlite.KindDiFMUnauthorized, errWithMemberID)
 
 	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
 	defer srv.Close()
@@ -250,6 +271,46 @@ func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
 			// nothing would pass the checks above for the wrong reason.
 			if len(strings.TrimSpace(string(body))) == 0 {
 				t.Fatal("empty body")
+			}
+		})
+	}
+}
+
+// TestReasonNamesTheFailureKind: the endpoints may not serve error text,
+// so before the kind existed every failed pass produced the same reason
+// and the operator had to exec into the container to learn whether the
+// first move was "re-extract the DI.fm key" or "click the consent URL".
+func TestReasonNamesTheFailureKind(t *testing.T) {
+	for _, tc := range []struct {
+		kind       sqlite.RunErrorKind
+		wantReason string // substring
+	}{
+		{sqlite.KindSpotifyGrantRevoked, "consent is required again"},
+		{sqlite.KindDiFMUnauthorized, "DI.fm rejected the API key"},
+		{sqlite.KindRateLimited, "rate limited"},
+		{sqlite.KindIncomplete, "newest run errored"},
+		{sqlite.KindError, "newest run errored"},
+		{"", "newest run errored"},
+	} {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			s, account := newStore(t)
+			recordFailedRun(t, s, account.ID, time.Minute, tc.kind, errWithMemberID)
+
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0)
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if rep.Healthy {
+				t.Fatal("Healthy = true over a failed newest run")
+			}
+			if !strings.Contains(rep.Reason, tc.wantReason) {
+				t.Errorf("Reason = %q, want it to contain %q", rep.Reason, tc.wantReason)
+			}
+			if strings.Contains(rep.Reason, testMemberID) {
+				t.Errorf("Reason leaked the member id: %q", rep.Reason)
+			}
+			if len(rep.Runs) == 0 || rep.Runs[0].ErrorKind != string(tc.kind) {
+				t.Errorf("Runs[0].ErrorKind = %q, want %q", rep.Runs[0].ErrorKind, tc.kind)
 			}
 		})
 	}
