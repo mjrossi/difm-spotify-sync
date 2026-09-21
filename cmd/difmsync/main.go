@@ -323,6 +323,31 @@ func maxAgeFlag(usage string) cli.Flag {
 	}
 }
 
+// intervalFlag is shared by sync and status. status needs it only to
+// derive max-age (see effectiveMaxAge); one definition keeps the two
+// defaults from drifting, which the config-drift test also asserts.
+func intervalFlag() cli.Flag {
+	return &cli.DurationFlag{
+		Name: "interval", Value: 15 * time.Minute,
+		Usage:   "how often the loop runs a pass",
+		Sources: cli.EnvVars("DIFMSYNC_INTERVAL"),
+	}
+}
+
+// effectiveMaxAge returns the freshness window the health rule uses.
+// Unset, it follows the interval: a probe that is red between every
+// pair of passes at a long interval is wrong, not strict, and restart
+// policies ignore health, so the mistake is silent. Set, it is the
+// operator's number. The declared default stays 45m, which is 3 × the
+// default interval — so the README, the Dockerfile and the config-drift
+// test are untouched and an unchanged deployment sees no difference.
+func effectiveMaxAge(c *cli.Command) time.Duration {
+	if c.IsSet("max-age") {
+		return c.Duration("max-age")
+	}
+	return 3 * c.Duration("interval")
+}
+
 func jsonFlag(usage string) cli.Flag {
 	return &cli.BoolFlag{Name: "json", Usage: usage}
 }
@@ -344,10 +369,7 @@ func syncCommand() *cli.Command {
 				Name:  "loop",
 				Usage: "run continuously on --interval instead of exiting after one pass",
 			},
-			&cli.DurationFlag{
-				Name: "interval", Value: 15 * time.Minute,
-				Sources: cli.EnvVars("DIFMSYNC_INTERVAL"),
-			},
+			intervalFlag(),
 			&cli.StringFlag{
 				Name: "http-addr",
 				Usage: "serve the read-only /healthz and /status.json endpoints on this " +
@@ -514,7 +536,7 @@ func syncCommand() *cli.Command {
 					return loop(ctx)
 				}
 				return serveWhile(ctx, addr,
-					status.Handler(store, c.String("account"), c.Duration("max-age"), log),
+					status.Handler(store, c.String("account"), effectiveMaxAge(c), log),
 					log, loop)
 			})
 		},
@@ -757,12 +779,14 @@ func statusCommand() *cli.Command {
 					"(this is the container healthcheck)",
 			},
 			limitFlag(status.DefaultRunLimit, "how many recent runs to show"),
-			maxAgeFlag("how stale the last clean pass may be before --check fails"),
+			intervalFlag(),
+			maxAgeFlag("how stale the last clean pass may be before --check fails " +
+				"(default: 3x --interval)"),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			return withStore(ctx, c, func(store *sqlite.Store) error {
 				rep, err := status.Build(ctx, store, c.String("account"),
-					c.Duration("max-age"), c.Int("limit"))
+					effectiveMaxAge(c), c.Int("limit"))
 				if err != nil {
 					return err
 				}

@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/urfave/cli/v3"
+
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 )
 
@@ -694,6 +696,24 @@ func TestStatusCheckIsTheHealthcheckContract(t *testing.T) {
 		}
 	})
 
+	t.Run("max-age follows DIFMSYNC_INTERVAL when unset", func(t *testing.T) {
+		// seed clears DIFMSYNC_* itself, so DIFMSYNC_INTERVAL is set after
+		// seeding (matching the --max-age subtest above) rather than
+		// before, where seed's own clearEnv would immediately wipe it.
+		dbPath, account := seed(t)
+		t.Setenv("DIFMSYNC_INTERVAL", "2h")
+		recordRun(t, dbPath, account.ID, 5*time.Hour)
+		if err := runCLI(t, dbPath, "status", "--check"); err != nil {
+			t.Errorf("5h-old pass at a 2h interval = %v, want nil (max-age should be 6h)", err)
+		}
+		dbPath, account = seed(t)
+		t.Setenv("DIFMSYNC_INTERVAL", "2h")
+		recordRun(t, dbPath, account.ID, 7*time.Hour)
+		if err := runCLI(t, dbPath, "status", "--check"); err == nil {
+			t.Error("7h-old pass at a 2h interval = nil, want an error")
+		}
+	})
+
 	t.Run("before auth exits non-zero", func(t *testing.T) {
 		// The pre-auth window is why compose.yaml sets a 30m start_period.
 		// A fresh deployment has no account row at all, and the check has
@@ -720,4 +740,41 @@ func TestStatusCheckIsTheHealthcheckContract(t *testing.T) {
 			t.Error("DIFMSYNC_STATUS_MAX_AGE=1s did not make a 10m-old pass unhealthy")
 		}
 	})
+}
+
+// TestEffectiveMaxAge: unset, the freshness window follows the interval.
+// A fixed 45m at a 2h interval is a probe that is red between every pair
+// of passes — wrong, not strict — and restart policies ignore health, so
+// nothing visibly breaks. Set, the operator's number wins.
+func TestEffectiveMaxAge(t *testing.T) {
+	clearEnv(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  map[string]string
+		want time.Duration
+	}{
+		{"defaults agree", nil, nil, 45 * time.Minute},
+		{"unset follows the interval", []string{"--interval", "2h"}, nil, 6 * time.Hour},
+		{"flag wins", []string{"--interval", "2h", "--max-age", "1h"}, nil, time.Hour},
+		{"env wins", []string{"--interval", "2h"}, map[string]string{"DIFMSYNC_STATUS_MAX_AGE": "90m"}, 90 * time.Minute},
+		{"env interval", nil, map[string]string{"DIFMSYNC_INTERVAL": "30m"}, 90 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			var got time.Duration
+			cmd := &cli.Command{
+				Flags:  []cli.Flag{intervalFlag(), maxAgeFlag("")},
+				Action: func(_ context.Context, c *cli.Command) error { got = effectiveMaxAge(c); return nil },
+			}
+			if err := cmd.Run(context.Background(), append([]string{"x"}, tc.args...)); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("effectiveMaxAge = %s, want %s", got, tc.want)
+			}
+		})
+	}
 }
