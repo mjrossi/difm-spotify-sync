@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"time"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
@@ -15,10 +14,6 @@ import (
 	"github.com/mjrossi/difm-spotify-sync/pkg/match"
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
 )
-
-// minInterval floors the sync interval. Below this the jitter
-// computation degenerates and the API traffic stops being polite.
-const minInterval = time.Minute
 
 // ErrPassIncomplete reports a pass that finished but swallowed at least
 // one failure, so the watermark was held back and the affected likes will
@@ -435,70 +430,6 @@ func (e *Engine) enqueue(ctx context.Context, like difm.Track, candidates []matc
 		Reason:      reason,
 		LikedAt:     like.LikedAt,
 	})
-}
-
-// Loop runs passes on an interval until ctx is canceled, or until a pass
-// reports that Spotify revoked the grant. The first tick is jittered so
-// multiple deployments don't stampede the APIs together.
-//
-// A revoked grant is the one pass failure Loop does not ride out. The
-// engine cannot fix it — consent is a cmd/difmsync concern — and ticking
-// on would fail identically every interval while the row that could
-// re-open consent sat unread. Returning spotify.ErrGrantRevoked hands the
-// decision to the caller, which clears the token and re-enters the
-// consent wait.
-func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) error {
-	// The interval is operator-supplied via --interval/DIFMSYNC_INTERVAL.
-	// Two separate reasons to floor it: rand.Int64N panics outright below
-	// 4ns, and anything under a minute stops being polite to a private
-	// API. The floor is set by the second, which is why a deliberate
-	// --interval=30s is overridden rather than honored — it warns.
-	if interval < minInterval {
-		e.Log.Warn("interval too small; clamping",
-			"requested", interval, "using", minInterval)
-		interval = minInterval
-	}
-	after := e.after
-	if after == nil {
-		after = time.After
-	}
-	jitter := time.Duration(rand.Int64N(int64(interval / 4)))
-	e.Log.Info("starting sync loop", "interval", interval, "first_run_in", jitter)
-
-	// A wait abandoned on return is not stopped. That is fine on both
-	// return paths: context cancellation is process exit, and the
-	// revoked-grant return happens right after a pass, before a new wait
-	// is armed. Go 1.23+ collects an unreferenced timer anyway.
-	wait := after(jitter)
-	for {
-		select {
-		case <-ctx.Done():
-			// A clean shutdown mid-pass is not an error: the watermark
-			// simply hasn't advanced, so the next boot re-reads.
-			if errors.Is(ctx.Err(), context.Canceled) {
-				e.Log.Info("sync loop stopped")
-				return nil
-			}
-			return ctx.Err()
-		case <-wait:
-			_, err := e.RunOnce(ctx, dryRun)
-			if errors.Is(err, spotify.ErrGrantRevoked) {
-				return err
-			}
-			if err != nil {
-				// Keep looping: a transient API failure should not kill
-				// a long-running daemon. ErrPassIncomplete in particular
-				// is self-correcting — the watermark held, so the next
-				// tick re-reads whatever was missed.
-				e.Log.Error("sync pass failed", "err", err)
-			}
-			delay := nextDelay(err, interval)
-			if delay != interval {
-				e.Log.Warn("rate limited; delaying next pass", "delay", delay, "interval", interval)
-			}
-			wait = after(delay)
-		}
-	}
 }
 
 func bestOf(candidates []match.Scored) (match.Scored, bool) {
