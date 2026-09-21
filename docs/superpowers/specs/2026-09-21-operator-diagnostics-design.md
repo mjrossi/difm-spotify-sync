@@ -76,9 +76,21 @@ read by two flags has one default). The README row for
 `docs/deploy.md`'s "Is it still working?" section drops the instruction
 to set `max-age` by hand when changing the interval, and says the rule.
 
-The 20-row scan window (CLAUDE.md, health rule) still applies. At a
-derived 3 × interval it is never the binding constraint: 20 rows at
-interval *i* span ~20*i*, which exceeds 3*i* for every *i*.
+The 20-row scan window (CLAUDE.md, health rule) still applies. At one
+row per interval it is never the binding constraint — 20 rows at
+interval *i* span ~20*i*, which exceeds 3*i* for every *i* — but rows
+are not always one per interval: a `Retry-After` shorter than the
+interval, or repeated restarts, can stack twenty failed rows in far less
+than 3*i* and evict the clean row early. CLAUDE.md already argues that
+verdict is the better one; the rule just should not be stated as
+"never".
+
+An empty `DIFMSYNC_STATUS_MAX_AGE=` counts as unset. urfave/cli marks a
+flag set the moment its variable exists, even empty, which would pin the
+window to 45m for exactly the `VAR=` style `.env.local.example`
+teaches; a small `nonEmptyEnv` value source corrects that. The
+derivation uses the same 1m floor `Loop` applies to the interval, so the
+health rule and the ticker never compute from different intervals.
 
 ## Section 2: pass logging
 
@@ -131,10 +143,10 @@ field is added without being looked at).
 
 - `TestEffectiveMaxAge`: unset → 3 × interval; set via flag → as set;
   set via env → as set; at the default interval the two agree (45m).
-- `TestStatusCommandReadsTheInterval`: the config-drift test's
-  duplicate-default assertion covers the new flag; add a case in
-  `main_test.go` that `status --check` with `DIFMSYNC_INTERVAL=2h` and
-  no max-age accepts a 5h-old clean run and rejects a 7h-old one.
+- A subtest of `TestStatusCheckIsTheHealthcheckContract`: `status
+  --check` with `DIFMSYNC_INTERVAL=2h` and no max-age accepts a 5h-old
+  clean run and rejects a 7h-old one. The config-drift test's
+  duplicate-default assertion covers the shared flag.
 - Loop tests (`engine_test.go`): after a pass, the log buffer contains
   `pass finished` with `next_run` equal to the fake clock's now + delay;
   an idle pass produces exactly one Info line; an active pass still has
@@ -148,8 +160,10 @@ field is added without being looked at).
 ## Documentation
 
 README table cell; `docs/deploy.md` "Is it still working?" and the
-`/status.json` field list; CLAUDE.md health-rule paragraph gains the
-derivation sentence; CHANGELOG `[Unreleased]`.
+`/status.json` field list; `docker/healthcheck.sh`'s comment (it says
+"within DIFMSYNC_STATUS_MAX_AGE"); CLAUDE.md health-rule paragraph gains
+the derivation sentence and the corrected scan-window wording;
+CHANGELOG `[Unreleased]`.
 
 ## Out of scope
 
