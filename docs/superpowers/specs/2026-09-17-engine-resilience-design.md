@@ -76,15 +76,26 @@ is extracted into a function that can be tested with fakes:
 func runUntilStopped(ctx, store, account, awaitConsentFn, newEngineFn, log) error
 ```
 
-On `ErrGrantRevoked` it calls `store.SetSpotifyRefreshToken(ctx, id, "")`,
-logs one Error line for the operator — "Spotify revoked the refresh token;
-consent is required again — open the consent URL below" — clears the
-in-memory copy, and loops. That reaches the existing `awaitConsent` with a
+On `ErrGrantRevoked` it logs one Error line for the operator — "Spotify
+revoked the refresh token; consent is required again" — clears the stored
+token under `context.WithoutCancel` (a shutdown landing between the
+revoked pass and the clear must not leave the dead token in place or turn
+a clean stop into a non-zero exit; a canceled account read at the top of
+the loop is likewise a clean stop), and loops. The clear is unconditional
+and documented as such: a token written by `auth --manual` in the window
+between Spotify revoking the grant and the daemon noticing is cleared
+too, because a compare-and-clear keyed on the runner's copy is wrong
+after a rotation and would leave the dead token in place forever.
+
+`newEngine`'s boot-time `PlaylistName` probe returns `ErrGrantRevoked`
+rather than warning, so a stored-but-dead token reaches consent
+immediately instead of after the first jittered pass. That reaches the existing `awaitConsent` with a
 fresh server and a fresh nonce. No new consent code is written: the fourth
 caller of `consentFlow.Complete` is the first caller run twice. Without
 `--auth-http-addr` (the workstation case) the round trip hits
-`ErrNoCredentials` and the process exits with the existing "run `difmsync
-auth`" message — loud, rather than ticking forever.
+`ErrNoCredentials`, wrapped to say that `--auth-http-addr` lets the daemon
+serve consent itself, and the process exits — loud, rather than ticking
+forever.
 
 Clearing the token before waiting keeps the CLAUDE.md invariant literal:
 the consent server exists only while there is no refresh token.

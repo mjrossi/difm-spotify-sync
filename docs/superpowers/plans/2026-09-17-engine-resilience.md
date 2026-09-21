@@ -1475,6 +1475,9 @@ func (r syncRunner) run(ctx context.Context) error {
 	for {
 		account, err := r.store.GetAccount(ctx, r.label)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil // a clean stop, as below
+			}
 			return err
 		}
 		if account.SpotifyRefreshToken == "" {
@@ -1514,9 +1517,16 @@ func (r syncRunner) run(ctx context.Context) error {
 		// literal, and so `difmsync status` reports "awaiting consent"
 		// rather than a stale "authorized". awaitConsent polls the
 		// store, so `auth --manual` in a sidecar remains a way out.
-		r.log.Error("Spotify revoked the refresh token; consent is required again — open the consent URL below",
+		r.log.Error("Spotify revoked the refresh token; consent is required again",
 			"err", err)
-		if err := r.store.SetSpotifyRefreshToken(ctx, account.ID, ""); err != nil {
+		// Unconditional: a token written by `auth --manual` in the window
+		// between Spotify revoking the grant and the daemon noticing is
+		// cleared too. A compare-and-clear keyed on the copy above is
+		// wrong after a rotation (the copy is stale, nothing matches, the
+		// dead token stays and consent is never reached), which is worse
+		// than one extra consent. WithoutCancel, as FinishRun: a shutdown
+		// landing here must not leave the dead token in place.
+		if err := r.store.SetSpotifyRefreshToken(context.WithoutCancel(ctx), account.ID, ""); err != nil {
 			return fmt.Errorf("clear revoked refresh token: %w", err)
 		}
 	}
@@ -1553,7 +1563,8 @@ In `cmd/difmsync/main.go`, replace the `loop := func(ctx context.Context) error 
 					await: func(ctx context.Context, account sqlite.Account) error {
 						authAddr := c.String("auth-http-addr")
 						if authAddr == "" {
-							return spotify.ErrNoCredentials
+							return fmt.Errorf("%w; set --auth-http-addr for the daemon to serve consent itself",
+								spotify.ErrNoCredentials)
 						}
 						flow, err := newConsentFlow(auth, store, account.ID)
 						if err != nil {
@@ -1573,6 +1584,10 @@ In `cmd/difmsync/main.go`, replace the `loop := func(ctx context.Context) error 
 ```
 
 The three lines after it (`addr := c.String("http-addr")` … `serveWhile(...)`) are unchanged: `serveWhile` takes `func(context.Context) error`, which `runner.run` is.
+
+Also in `newEngine`: after `sp.PlaylistName(...)` fails, `if errors.Is(err, spotify.ErrGrantRevoked) { return nil, err }` before the existing Warn — the probe already asked the token endpoint, and returning the typed error lets the runner clear and re-enter consent at boot rather than after the first jittered pass.
+
+Additional tests: `TestSyncRunnerClearsTheTokenEvenWhenCanceledMidStep` (fake loop cancels ctx then returns errRevoked; run returns nil, token is empty), `TestSyncRunnerErrorsWhenAwaitReturnsWithoutAToken`, and the revocation test asserts the tokens seen by successive loop calls are `["original", "token-1"]`.
 
 - [ ] **Step 6: Run the cmd tests, including the existing consent integration tests**
 
@@ -1616,6 +1631,8 @@ Wait for `target playlist` in the log, then in another terminal corrupt the toke
 ```sh
 sqlite3 "$DIFMSYNC_DB_PATH" "UPDATE accounts SET spotify_refresh_token='garbage'"
 ```
+
+(This mutates the store under a running engine and works only because the engine holds its token in the oauth2 source and never re-reads it — the same property that makes the sidecar race above unconditional. Do not "fix" that.)
 
 Within one interval expect, in order: `sync pass failed` is **not** logged for this pass; instead `Spotify revoked the refresh token; consent is required again`, then `spotify consent required — open this URL to authorize url=...?t=<new nonce>`. `curl -i 127.0.0.1:3436/healthz` (if `--http-addr` is set) returns 503 with `awaiting Spotify consent`. Open the URL, consent, and expect `starting sync loop` again without restarting the process. `difmsync status` shows the failed run with KIND `spotify_grant_revoked`.
 
