@@ -794,9 +794,9 @@ func TestLoop_RateLimitDelaysTheNextPassByRetryAfter(t *testing.T) {
 	if got := <-clock.asked; got != 5*time.Minute {
 		t.Errorf("wait after a 429 with Retry-After 300 = %s, want 5m", got)
 	}
-	// Safe to write outside the mutex a stub server's handler goroutine
-	// reads: Loop is parked at its select (we just received from asked),
-	// so no request is in flight to race with this write.
+	// Written without synchronization against the stub server's handler
+	// goroutine, which is safe because Loop is parked at its select (we
+	// just received from asked), so no request is in flight to race with.
 	h.rateLimitSearch = false
 	clock.fire <- time.Time{}
 	if got := <-clock.asked; got != 2*time.Hour {

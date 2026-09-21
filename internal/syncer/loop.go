@@ -1,4 +1,5 @@
 // Scheduling: when the next pass runs and what a pass failure means.
+
 package syncer
 
 import (
