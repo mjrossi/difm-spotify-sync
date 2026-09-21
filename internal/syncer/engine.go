@@ -437,8 +437,16 @@ func (e *Engine) enqueue(ctx context.Context, like difm.Track, candidates []matc
 	})
 }
 
-// Loop runs passes on an interval until ctx is canceled. The first tick
-// is jittered so multiple deployments don't stampede the APIs together.
+// Loop runs passes on an interval until ctx is canceled, or until a pass
+// reports that Spotify revoked the grant. The first tick is jittered so
+// multiple deployments don't stampede the APIs together.
+//
+// A revoked grant is the one pass failure Loop does not ride out. The
+// engine cannot fix it — consent is a cmd/difmsync concern — and ticking
+// on would fail identically every interval while the row that could
+// re-open consent sat unread. Returning spotify.ErrGrantRevoked hands the
+// decision to the caller, which clears the token and re-enters the
+// consent wait.
 func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) error {
 	// The interval is operator-supplied via --interval/DIFMSYNC_INTERVAL.
 	// Two separate reasons to floor it: rand.Int64N panics outright below
@@ -457,6 +465,10 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 	jitter := time.Duration(rand.Int64N(int64(interval / 4)))
 	e.Log.Info("starting sync loop", "interval", interval, "first_run_in", jitter)
 
+	// A wait abandoned on return is not stopped. That is fine on both
+	// return paths: context cancellation is process exit, and the
+	// revoked-grant return happens right after a pass, before a new wait
+	// is armed. Go 1.23+ collects an unreferenced timer anyway.
 	wait := after(jitter)
 	for {
 		select {
