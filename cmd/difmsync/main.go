@@ -460,21 +460,24 @@ func syncCommand() *cli.Command {
 					return err
 				}
 
-				loop := func(ctx context.Context) error {
-					// The one step that cannot run headless, handled in-process.
-					//
-					// Returning ErrNoCredentials here is what made a missing
-					// token a crash loop rather than a prompt: the process
-					// exits, `restart: unless-stopped` starts it again, and the
-					// operator sees the same line forever with nothing to act
-					// on. With --auth-http-addr set the daemon instead serves
-					// the consent flow and waits, so the whole deployment is
-					// `up -d` plus one click.
-					//
-					// Unset, the old behavior is preserved exactly, which is
-					// what a workstation running `difmsync sync --loop` wants:
-					// fail loudly and tell the operator to run `difmsync auth`.
-					if account.SpotifyRefreshToken == "" {
+				// The one step that cannot run headless, handled in-process.
+				//
+				// Returning ErrNoCredentials from await is what made a
+				// missing token a crash loop rather than a prompt: the
+				// process exits, `restart: unless-stopped` starts it again,
+				// and the operator sees the same line forever with nothing
+				// to act on. With --auth-http-addr set the daemon instead
+				// serves the consent flow and waits, so the whole
+				// deployment is `up -d` plus one click.
+				//
+				// Unset, the old behavior is preserved exactly, which is
+				// what a workstation running `difmsync sync --loop` wants:
+				// fail loudly and tell the operator to run `difmsync auth`.
+				runner := syncRunner{
+					store: store,
+					label: c.String("account"),
+					log:   log,
+					await: func(ctx context.Context, account sqlite.Account) error {
 						authAddr := c.String("auth-http-addr")
 						if authAddr == "" {
 							return spotify.ErrNoCredentials
@@ -483,37 +486,17 @@ func syncCommand() *cli.Command {
 						if err != nil {
 							return err
 						}
-						if err := awaitConsent(ctx, authAddr,
-							c.String("spotify-redirect-url"), flow, log); err != nil {
-							// A shutdown while waiting is a clean stop, not a
-							// failure — the same verdict Engine.Loop reaches
-							// on a canceled context. Without this the process
-							// contract disagrees with itself: an authorized
-							// daemon exits 0 on SIGTERM and one still waiting
-							// for consent exits 1, which reads as a crash to
-							// anything watching exit codes.
-							if errors.Is(err, context.Canceled) {
-								return nil
-							}
-							return err
-						}
-						// Re-read rather than patching the local copy. The token
-						// was written through the store, and everything below
-						// keys off this struct — an in-memory field set by hand
-						// here would work until someone adds a second thing
-						// consent changes.
-						updated, err := store.GetAccount(ctx, c.String("account"))
+						return awaitConsent(ctx, authAddr, c.String("spotify-redirect-url"), flow, log)
+					},
+					loop: func(ctx context.Context, account sqlite.Account) error {
+						engine, err := newEngine(ctx, account)
 						if err != nil {
 							return err
 						}
-						account = updated
-					}
-					engine, err := newEngine(ctx, account)
-					if err != nil {
-						return err
-					}
-					return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
+						return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
+					},
 				}
+				loop := runner.run
 				addr := c.String("http-addr")
 				if addr == "" {
 					return loop(ctx)
