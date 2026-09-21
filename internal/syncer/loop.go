@@ -13,9 +13,9 @@ import (
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
 )
 
-// minInterval floors the sync interval. Below this the jitter
+// MinInterval floors the sync interval. Below this the jitter
 // computation degenerates and the API traffic stops being polite.
-const minInterval = time.Minute
+const MinInterval = time.Minute
 
 // classify maps the error a pass ended with onto the kind recorded in
 // sync_runs. It lives here rather than in the store because the store
@@ -65,7 +65,7 @@ func nextDelay(err error, interval time.Duration) time.Duration {
 	if retryAfter <= 0 {
 		return interval
 	}
-	return min(max(retryAfter, minInterval), maxRetryDelay)
+	return min(max(retryAfter, MinInterval), maxRetryDelay)
 }
 
 // Loop runs passes on an interval until ctx is canceled, or until a pass
@@ -84,10 +84,10 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 	// 4ns, and anything under a minute stops being polite to a private
 	// API. The floor is set by the second, which is why a deliberate
 	// --interval=30s is overridden rather than honored — it warns.
-	if interval < minInterval {
+	if interval < MinInterval {
 		e.Log.Warn("interval too small; clamping",
-			"requested", interval, "using", minInterval)
-		interval = minInterval
+			"requested", interval, "using", MinInterval)
+		interval = MinInterval
 	}
 	after := e.after
 	if after == nil {

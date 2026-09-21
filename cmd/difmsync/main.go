@@ -310,6 +310,22 @@ func requireAccount(ctx context.Context, c *cli.Command, store *sqlite.Store) (s
 	return account, nil
 }
 
+// nonEmptyEnv is cli.EnvVars with one difference: a variable that is
+// present but empty counts as absent. urfave/cli marks a flag set the
+// moment the variable exists, even when the value is "" and the parse is
+// skipped, so DIFMSYNC_STATUS_MAX_AGE= in a compose file or .env.local
+// would silently pin max-age to the declared 45m instead of deriving it.
+type nonEmptyEnv string
+
+func (e nonEmptyEnv) Lookup() (string, bool) {
+	v, ok := os.LookupEnv(string(e))
+	return v, ok && strings.TrimSpace(v) != ""
+}
+func (e nonEmptyEnv) IsFromEnv() bool  { return true }
+func (e nonEmptyEnv) Key() string      { return string(e) }
+func (e nonEmptyEnv) String() string   { return fmt.Sprintf("environment variable %q", string(e)) }
+func (e nonEmptyEnv) GoString() string { return fmt.Sprintf("nonEmptyEnv(%q)", string(e)) }
+
 // Flags defined on more than one subcommand, built here rather than written
 // out per command. --max-age was two literals with the same env source, which
 // is the shape of drift TestConfigSurfaceIsDocumentedAndConsistent now also
@@ -318,18 +334,19 @@ func requireAccount(ctx context.Context, c *cli.Command, store *sqlite.Store) (s
 func maxAgeFlag(usage string) cli.Flag {
 	return &cli.DurationFlag{
 		Name: "max-age", Value: 45 * time.Minute,
-		Usage:   usage,
-		Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
+		Usage:       usage,
+		DefaultText: "3 × --interval; 45m at the default 15m",
+		Sources:     cli.NewValueSourceChain(nonEmptyEnv("DIFMSYNC_STATUS_MAX_AGE")),
 	}
 }
 
 // intervalFlag is shared by sync and status. status needs it only to
 // derive max-age (see effectiveMaxAge); one definition keeps the two
 // defaults from drifting, which the config-drift test also asserts.
-func intervalFlag() cli.Flag {
+func intervalFlag(usage string) cli.Flag {
 	return &cli.DurationFlag{
 		Name: "interval", Value: 15 * time.Minute,
-		Usage:   "how often the loop runs a pass",
+		Usage:   usage,
 		Sources: cli.EnvVars("DIFMSYNC_INTERVAL"),
 	}
 }
@@ -341,11 +358,14 @@ func intervalFlag() cli.Flag {
 // operator's number. The declared default stays 45m, which is 3 × the
 // default interval — so the README, the Dockerfile and the config-drift
 // test are untouched and an unchanged deployment sees no difference.
+// The interval is clamped to syncer.MinInterval first, the same floor
+// Loop applies, so an unreasonably small --interval doesn't also produce
+// an unreasonably small derived max-age.
 func effectiveMaxAge(c *cli.Command) time.Duration {
 	if c.IsSet("max-age") {
 		return c.Duration("max-age")
 	}
-	return 3 * c.Duration("interval")
+	return 3 * max(c.Duration("interval"), syncer.MinInterval)
 }
 
 func jsonFlag(usage string) cli.Flag {
@@ -369,7 +389,7 @@ func syncCommand() *cli.Command {
 				Name:  "loop",
 				Usage: "run continuously on --interval instead of exiting after one pass",
 			},
-			intervalFlag(),
+			intervalFlag("how often the loop runs a pass"),
 			&cli.StringFlag{
 				Name: "http-addr",
 				Usage: "serve the read-only /healthz and /status.json endpoints on this " +
@@ -779,9 +799,8 @@ func statusCommand() *cli.Command {
 					"(this is the container healthcheck)",
 			},
 			limitFlag(status.DefaultRunLimit, "how many recent runs to show"),
-			intervalFlag(),
-			maxAgeFlag("how stale the last clean pass may be before --check fails " +
-				"(default: 3x --interval)"),
+			intervalFlag("the daemon's interval; --max-age defaults to three times it"),
+			maxAgeFlag("how stale the last clean pass may be before --check fails"),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			return withStore(ctx, c, func(store *sqlite.Store) error {

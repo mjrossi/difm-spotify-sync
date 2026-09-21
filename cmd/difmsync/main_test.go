@@ -118,12 +118,26 @@ func TestCallbackTarget(t *testing.T) {
 // .env.local exports live credentials — and assertions about
 // missing configuration pass or fail depending on whose machine runs
 // them.
+//
+// It unsets rather than blanks: a present-but-empty variable is not the
+// same as an absent one (nonEmptyEnv in main.go depends on exactly that
+// difference), so setting each to "" would leave tests starting from a
+// state no real deployment is in.
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, kv := range os.Environ() {
-		if k, _, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(k, "DIFMSYNC_") {
-			t.Setenv(k, "")
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasPrefix(k, "DIFMSYNC_") {
+			continue
 		}
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatalf("unsetenv %s: %v", k, err)
+		}
+		t.Cleanup(func() {
+			if err := os.Setenv(k, v); err != nil {
+				t.Fatalf("restore %s: %v", k, err)
+			}
+		})
 	}
 }
 
@@ -759,6 +773,8 @@ func TestEffectiveMaxAge(t *testing.T) {
 		{"flag wins", []string{"--interval", "2h", "--max-age", "1h"}, nil, time.Hour},
 		{"env wins", []string{"--interval", "2h"}, map[string]string{"DIFMSYNC_STATUS_MAX_AGE": "90m"}, 90 * time.Minute},
 		{"env interval", nil, map[string]string{"DIFMSYNC_INTERVAL": "30m"}, 90 * time.Minute},
+		{"empty env derives", []string{"--interval", "2h"}, map[string]string{"DIFMSYNC_STATUS_MAX_AGE": ""}, 6 * time.Hour},
+		{"interval below the floor is clamped first", []string{"--interval", "30s"}, nil, 3 * time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for k, v := range tc.env {
@@ -766,7 +782,7 @@ func TestEffectiveMaxAge(t *testing.T) {
 			}
 			var got time.Duration
 			cmd := &cli.Command{
-				Flags:  []cli.Flag{intervalFlag(), maxAgeFlag("")},
+				Flags:  []cli.Flag{intervalFlag(""), maxAgeFlag("")},
 				Action: func(_ context.Context, c *cli.Command) error { got = effectiveMaxAge(c); return nil },
 			}
 			if err := cmd.Run(context.Background(), append([]string{"x"}, tc.args...)); err != nil {
