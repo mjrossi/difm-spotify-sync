@@ -407,6 +407,17 @@ func syncCommand() *cli.Command {
 					// Name the playlist in the log before writing to it, so a
 					// misconfigured id is obvious rather than silently wrong.
 					if name, err := sp.PlaylistName(ctx, account.SpotifyPlaylistID); err != nil {
+						// A dead grant is not a wrong playlist id — the probe
+						// already asked the token endpoint, and it said no.
+						// Returning it typed rather than logging and carrying
+						// on lets syncRunner clear the token and re-enter
+						// consent right now, instead of after a jittered
+						// failing pass discovers the same thing on its own.
+						// The one-shot path exits with this same typed
+						// error, which is what it wants too.
+						if errors.Is(err, spotify.ErrGrantRevoked) {
+							return nil, err
+						}
 						// Logged, not swallowed: this is the loudest early signal
 						// that the deployment is pointed at the wrong playlist, or
 						// that the grant lost its scopes. Discarding it defeats
@@ -480,7 +491,8 @@ func syncCommand() *cli.Command {
 					await: func(ctx context.Context, account sqlite.Account) error {
 						authAddr := c.String("auth-http-addr")
 						if authAddr == "" {
-							return spotify.ErrNoCredentials
+							return fmt.Errorf("%w; set --auth-http-addr for the daemon to serve consent itself",
+								spotify.ErrNoCredentials)
 						}
 						flow, err := newConsentFlow(auth, store, account.ID)
 						if err != nil {

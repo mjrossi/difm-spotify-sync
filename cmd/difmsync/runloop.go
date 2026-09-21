@@ -39,6 +39,14 @@ func (r syncRunner) run(ctx context.Context) error {
 	for {
 		account, err := r.store.GetAccount(ctx, r.label)
 		if err != nil {
+			// A shutdown landing here — most likely right after the
+			// clear below sends the loop back to the top — is a clean
+			// stop, not a failure, same as a shutdown during await.
+			// Without this the non-zero exit just moves one line down
+			// from where it used to be.
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return err
 		}
 		if account.SpotifyRefreshToken == "" {
@@ -78,9 +86,24 @@ func (r syncRunner) run(ctx context.Context) error {
 		// literal, and so `difmsync status` reports "awaiting consent"
 		// rather than a stale "authorized". awaitConsent polls the
 		// store, so `auth --manual` in a sidecar remains a way out.
-		r.log.Error("Spotify revoked the refresh token; consent is required again — open the consent URL below",
+		r.log.Error("Spotify revoked the refresh token; consent is required again",
 			"err", err)
-		if err := r.store.SetSpotifyRefreshToken(ctx, account.ID, ""); err != nil {
+		// Unconditional, not a compare-and-clear keyed on this account
+		// copy. A token written by `auth --manual` in a sidecar between
+		// Spotify revoking the grant and this goroutine noticing gets
+		// cleared too, because the engine that hit ErrGrantRevoked was
+		// still holding the old one — that copy has no way to tell a
+		// rotation apart from the revocation it already observed. A CAS
+		// would be wrong here: after a rotation the copy is stale, the
+		// compare matches nothing, the dead-per-this-copy token survives
+		// uncleared, and consent is never re-entered. One extra consent
+		// round trip is cheaper than that.
+		//
+		// WithoutCancel, as FinishRun's close does: this is a tiny local
+		// write that must land even when shutdown arrives mid-step,
+		// otherwise the next boot starts with the same dead token and
+		// does a jittered failing pass before ever reaching consent.
+		if err := r.store.SetSpotifyRefreshToken(context.WithoutCancel(ctx), account.ID, ""); err != nil {
 			return fmt.Errorf("clear revoked refresh token: %w", err)
 		}
 	}

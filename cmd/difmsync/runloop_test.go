@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
@@ -22,6 +25,9 @@ type runnerFixture struct {
 	loopCalls  int
 	// tokenSeenByAwait records what await found stored when it ran.
 	tokenSeenByAwait []string
+	// tokenSeenByLoop records account.SpotifyRefreshToken as loop
+	// received it each call — the "never a cached copy" claim.
+	tokenSeenByLoop []string
 }
 
 func newRunnerFixture(t *testing.T, loopResults []error) *runnerFixture {
@@ -39,8 +45,9 @@ func newRunnerFixture(t *testing.T, loopResults []error) *runnerFixture {
 			// consentFlow.Complete writes one.
 			return store.SetSpotifyRefreshToken(ctx, account.ID, fmt.Sprintf("token-%d", f.awaitCalls))
 		},
-		loop: func(context.Context, sqlite.Account) error {
+		loop: func(_ context.Context, account sqlite.Account) error {
 			f.loopCalls++
+			f.tokenSeenByLoop = append(f.tokenSeenByLoop, account.SpotifyRefreshToken)
 			if f.loopCalls > len(loopResults) {
 				t.Fatalf("loop called %d times, only %d results scripted", f.loopCalls, len(loopResults))
 			}
@@ -78,6 +85,12 @@ func TestSyncRunnerReentersConsentWhenTheGrantIsRevoked(t *testing.T) {
 	if got := storedToken(t, f.store); got != "token-1" {
 		t.Errorf("stored token after re-consent = %q, want token-1", got)
 	}
+	// Each loop call must key off a fresh read of the store, never a
+	// cached copy from before the clear-and-reconsent.
+	want := []string{"original", "token-1"}
+	if diff := cmp.Diff(want, f.tokenSeenByLoop); diff != "" {
+		t.Errorf("tokens seen by loop (-want +got):\n%s", diff)
+	}
 }
 
 // A shutdown while waiting for consent is a clean stop, matching what
@@ -110,18 +123,62 @@ func TestSyncRunnerSurfacesMissingCredentialsUnchanged(t *testing.T) {
 	}
 }
 
+var errLoop = errors.New("status server died")
+
 // Any other loop error is returned as-is: the runner only knows how to
 // recover from a revoked grant.
 func TestSyncRunnerReturnsOtherLoopErrors(t *testing.T) {
 	ctx := context.Background()
-	f := newRunnerFixture(t, []error{errors.New("status server died")})
+	f := newRunnerFixture(t, []error{errLoop})
 	if err := f.store.SetSpotifyRefreshToken(ctx, 1, "original"); err != nil {
 		t.Fatalf("seed token: %v", err)
 	}
-	if err := f.runner.run(ctx); err == nil || err.Error() != "status server died" {
+	if err := f.runner.run(ctx); !errors.Is(err, errLoop) {
 		t.Errorf("run returned %v, want the loop error unchanged", err)
 	}
 	if got := storedToken(t, f.store); got != "original" {
 		t.Errorf("token = %q after an unrelated error, want it untouched", got)
+	}
+}
+
+// await's contract is "returns nil once a token is stored". A fake that
+// violates it (returns nil without writing one) must not send the
+// runner into loop with an empty token — that would hand the engine a
+// credential it can't use and blame Spotify for it.
+func TestSyncRunnerErrorsWhenAwaitReturnsWithoutAToken(t *testing.T) {
+	f := newRunnerFixture(t, nil)
+	f.runner.await = func(context.Context, sqlite.Account) error {
+		f.awaitCalls++
+		return nil
+	}
+	err := f.runner.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no refresh token is stored") {
+		t.Errorf(`run returned %v, want an error containing "no refresh token is stored"`, err)
+	}
+	if f.loopCalls != 0 {
+		t.Errorf("loop ran %d times, want 0 — await's violation must not reach it", f.loopCalls)
+	}
+}
+
+// A SIGTERM landing between the loop returning ErrGrantRevoked and the
+// clear completing must not leave the dead token in the store, and must
+// not turn a clean shutdown into a non-zero exit.
+func TestSyncRunnerClearsTheTokenEvenWhenCanceledMidStep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := newRunnerFixture(t, nil)
+	if err := f.store.SetSpotifyRefreshToken(context.Background(), 1, "original"); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	f.runner.loop = func(context.Context, sqlite.Account) error {
+		f.loopCalls++
+		cancel()
+		return errRevoked
+	}
+
+	if err := f.runner.run(ctx); err != nil {
+		t.Fatalf("run returned %v, want nil on a clean shutdown mid-clear", err)
+	}
+	if got := storedToken(t, f.store); got != "" {
+		t.Errorf("stored token = %q, want cleared even though ctx was canceled first", got)
 	}
 }
