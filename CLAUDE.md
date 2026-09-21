@@ -226,10 +226,13 @@ Three invariants that the code depends on, in order:
 
    Every failed pass also records a **kind** (`sync_runs.error_kind`), set
    once by `classify` in the engine's `FinishRun` defer — never by the
-   store, which must not import the API packages, and never at individual
-   return sites, where one branch forgets. The kind is an enum the code
-   chose; it is the only thing about a failure the status endpoints may
-   say.
+   store, which must not import the API packages, and not at individual
+   return sites, where one branch forgets. The one exception is
+   `KindIncomplete`, which the two sites that end an unclean pass set
+   themselves, because by the time the defer runs `stats.Err` is the
+   first swallowed error rather than `ErrPassIncomplete`. The kind is an
+   enum the code chose; it is the only thing about a failure the status
+   endpoints may say.
 
    Correspondingly, a transport failure is never recorded as a *verdict*.
    "We could not ask Spotify" must not be stored as `no_match`.
@@ -475,7 +478,13 @@ Two consequences for code:
   What the endpoints *may* say is the kind: `describe()` switches on
   `sync_runs.error_kind` first. A kind is an enum the engine chose from
   its own sentinels, so naming it is not interpolation. A new reason
-  string may name a kind; it may not include `Error`.
+  string may name a kind; it may not include `Error`. The exclusion is
+  enforced at both ends: `FinishRun` refuses to write a kind the store
+  does not define, and `newRun` publishes one only if `Known()` accepts
+  it — because the endpoints answer from whatever database they are
+  handed, restored or hand-edited included, and a guard in a different
+  process is not a guard. `TestStatusJSONDropsAnUnknownKind` is the
+  negative control.
 
 The health rule itself: the newest `sync_runs` row that finished,
 recorded no error, and was **not** a dry run must be within
