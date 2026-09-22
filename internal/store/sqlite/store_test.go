@@ -731,3 +731,42 @@ func TestPruneRunsKeepsTheWindowAndTheInFlightRow(t *testing.T) {
 		t.Errorf("second prune = (%d, %v), want (0, nil)", n, err)
 	}
 }
+
+// Both account_id filters are load-bearing: the floor subquery is
+// exactly where dropping the inner one would keep another account's
+// newest rows and delete this one's.
+func TestPruneRunsIsScopedToTheAccount(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	a, err := s.EnsureAccount(ctx, "a", "1", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount a: %v", err)
+	}
+	b, err := s.EnsureAccount(ctx, "b", "2", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount b: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.SetClock(func() time.Time { return base.Add(-30 * 24 * time.Hour) })
+	for _, id := range []int64{a.ID, b.ID, b.ID} {
+		run, err := s.StartRun(ctx, id, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := s.FinishRun(ctx, run, sqlite.RunStats{}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+	s.SetClock(func() time.Time { return base })
+
+	if n, err := s.PruneRuns(ctx, a.ID, base, 0); err != nil || n != 1 {
+		t.Fatalf("prune a = (%d, %v), want (1, nil)", n, err)
+	}
+	runs, err := s.ListRuns(ctx, b.ID, 10)
+	if err != nil {
+		t.Fatalf("ListRuns b: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Errorf("account b has %d rows after pruning a, want 2", len(runs))
+	}
+}

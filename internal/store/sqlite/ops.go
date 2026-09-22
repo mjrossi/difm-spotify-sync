@@ -517,8 +517,11 @@ func (s *Store) ListRuns(ctx context.Context, accountID int64, limit int) ([]Syn
 // PruneRuns deletes finished runs that started before the cutoff, except
 // the newest keep rows. The floor exists because the health rule reads a
 // fixed window of rows (status.HealthScanLimit) and must never lose one
-// to housekeeping; the in-flight exclusion is what makes it safe to call
-// from inside a pass whose own row is still open. Returns the count.
+// to housekeeping; the unfinished-row exclusion is what makes it safe to
+// call from inside a pass whose own row is still open. It also keeps a
+// row a killed pass never closed — one per hard crash, left alone rather
+// than guessed at. A negative keep is unlimited (SQLite LIMIT -1), so
+// callers pass a constant. Returns the count.
 func (s *Store) PruneRuns(ctx context.Context, accountID int64, before time.Time, keep int) (int64, error) {
 	n, err := s.q.PruneSyncRuns(ctx, sqlitegen.PruneSyncRunsParams{
 		AccountID:   accountID,
