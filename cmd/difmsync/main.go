@@ -556,7 +556,7 @@ func syncCommand() *cli.Command {
 					return loop(ctx)
 				}
 				return serveWhile(ctx, addr,
-					status.Handler(store, c.String("account"), effectiveMaxAge(c), log),
+					status.Handler(store, c.String("account"), effectiveMaxAge(c), buildVersion(), log),
 					log, loop)
 			})
 		},
@@ -805,7 +805,7 @@ func statusCommand() *cli.Command {
 		Action: func(ctx context.Context, c *cli.Command) error {
 			return withStore(ctx, c, func(store *sqlite.Store) error {
 				rep, err := status.Build(ctx, store, c.String("account"),
-					effectiveMaxAge(c), c.Int("limit"))
+					effectiveMaxAge(c), c.Int("limit"), buildVersion())
 				if err != nil {
 					return err
 				}
@@ -852,6 +852,13 @@ func printStatus(rep status.Report) {
 		fmt.Printf("health:    ok\n")
 	} else {
 		fmt.Printf("health:    NOT OK — %s\n", rep.Reason)
+	}
+	fmt.Printf("version:   %s\n", rep.Version)
+	if rep.LastSuccessAt != "" {
+		fmt.Printf("last ok:   %s\n", rep.LastSuccessAt)
+	}
+	if rep.ConsecutiveFailures > 0 {
+		fmt.Printf("failures:  %d since the last clean pass\n", rep.ConsecutiveFailures)
 	}
 
 	// The runs table is the whole point of the command's usage string,

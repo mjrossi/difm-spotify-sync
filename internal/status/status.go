@@ -57,6 +57,15 @@ type Report struct {
 	Authorized bool   `json:"authorized"`
 	Healthy    bool   `json:"healthy"`
 	Reason     string `json:"reason,omitempty"`
+	// Version is what the answering binary calls itself. A probe that
+	// sees a stale healthy report wants to know which build produced it.
+	Version string `json:"version"`
+	// LastSuccessAt is the finished_at of the run the health rule
+	// accepted — the same row, never a second query that could disagree.
+	LastSuccessAt string `json:"last_success_at,omitempty"`
+	// ConsecutiveFailures counts finished, non-dry, errored runs newer
+	// than that row, within the scan window. In-flight rows are skipped.
+	ConsecutiveFailures int `json:"consecutive_failures"`
 }
 
 // Run is one recorded pass as the operator surface reports it.
@@ -133,6 +142,7 @@ func Build(
 	label string,
 	maxAge time.Duration,
 	runLimit int,
+	version string,
 ) (Report, error) {
 	if runLimit <= 0 {
 		runLimit = DefaultRunLimit
@@ -146,7 +156,7 @@ func Build(
 	// Decide over the whole scan window, then trim to what the caller
 	// asked to see — so two callers wanting different amounts of detail
 	// cannot disagree about whether the sync is working.
-	healthy, reason := health(runs, maxAge, time.Now())
+	healthy, reason, accepted := health(runs, maxAge, time.Now())
 
 	// Checked after health() rather than inside it, because health() is
 	// about whether passes are completing and this is about whether the
@@ -160,10 +170,14 @@ func Build(
 		reason = "awaiting Spotify consent — open the authorization URL from the daemon log"
 	}
 
+	// Computed over the full scan window, before runs is truncated to
+	// what the caller asked to see — same reasoning as health() above.
+	failures := consecutiveFailures(runs, accepted)
+
 	if len(runs) > runLimit {
 		runs = runs[:runLimit]
 	}
-	return assemble(account, counts, runs, authorized, healthy, reason), nil
+	return assemble(account, counts, runs, authorized, healthy, reason, version, accepted, failures), nil
 }
 
 // counts holds the three totals the report carries, read together because
@@ -220,6 +234,9 @@ func assemble(
 	runs []sqlite.SyncRun,
 	authorized, healthy bool,
 	reason string,
+	version string,
+	accepted *sqlite.SyncRun,
+	failures int,
 ) Report {
 	// make, not a nil slice: an account with no runs should encode as
 	// "runs": [] rather than "runs": null.
@@ -229,15 +246,20 @@ func assemble(
 	}
 
 	r := Report{
-		Account:    account.Label,
-		Playlist:   account.SpotifyPlaylistID,
-		Authorized: authorized,
-		Synced:     c.synced,
-		Pending:    c.actionable,
-		Skipped:    c.pending - c.actionable,
-		Runs:       reported,
-		Healthy:    healthy,
-		Reason:     reason,
+		Account:             account.Label,
+		Playlist:            account.SpotifyPlaylistID,
+		Authorized:          authorized,
+		Synced:              c.synced,
+		Pending:             c.actionable,
+		Skipped:             c.pending - c.actionable,
+		Runs:                reported,
+		Healthy:             healthy,
+		Reason:              reason,
+		Version:             version,
+		ConsecutiveFailures: failures,
+	}
+	if accepted != nil {
+		r.LastSuccessAt = accepted.FinishedAt
 	}
 	if !account.WatermarkLikedAt.IsZero() {
 		r.Watermark = account.WatermarkLikedAt.UTC().Format(time.RFC3339)
@@ -268,11 +290,12 @@ func assemble(
 // ListRuns orders newest-first, so the first qualifying row is the one
 // that matters. The caller passes the full healthScanLimit window, never
 // a caller-chosen display slice — see Build.
-func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (bool, string) {
+func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (healthy bool, reason string, accepted *sqlite.SyncRun) {
 	if len(runs) == 0 {
-		return false, "no sync pass has run yet"
+		return false, "no sync pass has run yet", nil
 	}
-	for _, run := range runs {
+	for i := range runs {
+		run := &runs[i]
 		if run.DryRun || run.FinishedAt == "" || run.Error != "" {
 			continue
 		}
@@ -282,16 +305,38 @@ func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (bool, s
 			// rather than reporting unhealthy over a formatting problem.
 			continue
 		}
+		// The stale case still returns the row: it is still the last
+		// success, just too old — so last_success_at is reported
+		// alongside the unhealthy reason.
 		if age := now.Sub(at); age > maxAge {
 			return false, fmt.Sprintf("last clean pass finished %s ago (max %s)",
-				age.Round(time.Second), maxAge)
+				age.Round(time.Second), maxAge), run
 		}
-		return true, ""
+		return true, "", run
 	}
 	// Something ran, but nothing that counts. Say which, because "no clean
 	// pass" and "no pass at all" call for different first moves.
 	return false, fmt.Sprintf("no clean pass in the last %d run(s): %s",
-		len(runs), describe(runs[0]))
+		len(runs), describe(runs[0])), nil
+}
+
+// consecutiveFailures counts the finished, non-dry, errored runs newer
+// than the accepted row (or all of them in the window when there is
+// none). In-flight rows are skipped, not counted: a pass that is running
+// has not failed yet.
+func consecutiveFailures(runs []sqlite.SyncRun, accepted *sqlite.SyncRun) int {
+	n := 0
+	for i := range runs {
+		run := &runs[i]
+		if accepted != nil && run.ID == accepted.ID {
+			break
+		}
+		if run.DryRun || run.FinishedAt == "" || run.Error == "" {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // describe summarizes why one run did not count, for the unhealthy reason

@@ -163,7 +163,7 @@ func TestHealth(t *testing.T) {
 			s, account := newStore(t)
 			tt.setup(t, s, account.ID)
 
-			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 10)
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 10, "")
 			if err != nil {
 				t.Fatalf("Build: %v", err)
 			}
@@ -188,7 +188,9 @@ func TestReportCarriesNoSecrets(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, time.Minute, false, nil)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	// A real version string, so its presence in the body is a positive
+	// assertion rather than one that would pass vacuously with "".
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "v9.9.9-test", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/status.json")
@@ -212,6 +214,19 @@ func TestReportCarriesNoSecrets(t *testing.T) {
 	// Guard against the test passing because the body was empty.
 	if !strings.Contains(string(body), testPlaylist) {
 		t.Fatalf("body does not look like a report: %s", body)
+	}
+	// Version, last_success_at and consecutive_failures are new fields on
+	// the same struct the secret checks above cover — asserting on them
+	// here is what keeps a future field from being added to Report
+	// without this test being looked at.
+	if !strings.Contains(string(body), `"version":"v9.9.9-test"`) {
+		t.Errorf("body does not carry the version: %s", body)
+	}
+	if !strings.Contains(string(body), `"last_success_at"`) {
+		t.Errorf("body does not carry last_success_at: %s", body)
+	}
+	if !strings.Contains(string(body), `"consecutive_failures":0`) {
+		t.Errorf("body does not carry consecutive_failures: %s", body)
 	}
 }
 
@@ -248,7 +263,7 @@ func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
 	// that could leak if a later edit interpolated the run.
 	recordFailedRun(t, s, account.ID, time.Minute, sqlite.KindDiFMUnauthorized, errWithMemberID)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
 	defer srv.Close()
 
 	for _, path := range []string{"/status.json", "/healthz"} {
@@ -298,7 +313,7 @@ func TestReasonNamesTheFailureKind(t *testing.T) {
 			s, account := newStore(t)
 			recordFailedRun(t, s, account.ID, time.Minute, tc.kind, errWithMemberID)
 
-			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0)
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "")
 			if err != nil {
 				t.Fatalf("Build: %v", err)
 			}
@@ -357,7 +372,7 @@ func TestStatusJSONDropsAnUnknownKind(t *testing.T) {
 		t.Fatalf("UPDATE sync_runs: %v", err)
 	}
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
 	defer srv.Close()
 
 	for _, path := range []string{"/status.json", "/healthz"} {
@@ -387,7 +402,7 @@ func TestCLIKeepsTheErrorText(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, time.Minute, false, errPass)
 
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit)
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -428,7 +443,7 @@ func TestHealthzStatusCodes(t *testing.T) {
 			s, account := newStore(t)
 			recordRun(t, s, account.ID, tt.age, false, nil)
 
-			srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+			srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
 			defer srv.Close()
 
 			resp, err := http.Get(srv.URL + "/healthz")
@@ -459,7 +474,7 @@ func TestHealthzBeforeAuth(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/healthz")
@@ -478,7 +493,7 @@ func TestStatusJSONIs200WhenUnhealthy(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, 3*time.Hour, false, nil)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/status.json")
@@ -509,7 +524,7 @@ func TestReportCarriesRuns(t *testing.T) {
 	recordRun(t, s, account.ID, 2*time.Minute, false, nil)
 	recordRun(t, s, account.ID, time.Minute, false, errPass)
 
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit)
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -541,7 +556,7 @@ func TestHealthIgnoresRunLimit(t *testing.T) {
 	}
 
 	for _, limit := range []int{1, 2, 5, 50} {
-		rep, err := status.Build(ctx, s, testLabel, testMaxAge, limit)
+		rep, err := status.Build(ctx, s, testLabel, testMaxAge, limit, "")
 		if err != nil {
 			t.Fatalf("Build(limit=%d): %v", limit, err)
 		}
@@ -564,7 +579,7 @@ func TestInFlightRunIsStillListed(t *testing.T) {
 		t.Fatalf("StartRun: %v", err)
 	}
 
-	rep, err := status.Build(ctx, s, testLabel, testMaxAge, status.DefaultRunLimit)
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, status.DefaultRunLimit, "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -604,7 +619,7 @@ func TestUnauthorizedAccountReportsWhyItIsUnhealthy(t *testing.T) {
 	// cannot, because there is no token for it to have used.
 	recordRun(t, s, account.ID, time.Minute, false, nil)
 
-	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0)
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -622,12 +637,79 @@ func TestUnauthorizedAccountReportsWhyItIsUnhealthy(t *testing.T) {
 	if err := s.SetSpotifyRefreshToken(ctx, account.ID, refreshToken); err != nil {
 		t.Fatalf("SetSpotifyRefreshToken: %v", err)
 	}
-	rep, err = status.Build(ctx, s, testLabel, testMaxAge, 0)
+	rep, err = status.Build(ctx, s, testLabel, testMaxAge, 0, "")
 	if err != nil {
 		t.Fatalf("Build after consent: %v", err)
 	}
 	if !rep.Authorized || !rep.Healthy {
 		t.Errorf("after consent: Authorized=%v Healthy=%v (%s), want both true",
 			rep.Authorized, rep.Healthy, rep.Reason)
+	}
+}
+
+// The three numbers a probe wants next to the boolean: when the last
+// success was, how many failures have stacked since, and which binary
+// is answering.
+func TestReportCarriesSuccessTimeAndFailureCount(t *testing.T) {
+	ctx := context.Background()
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, 40*time.Minute, false, nil) // clean
+	recordFailedRun(t, s, account.ID, 30*time.Minute, sqlite.KindError, errPass)
+	recordRun(t, s, account.ID, 20*time.Minute, true, nil) // dry run: not counted
+	recordFailedRun(t, s, account.ID, 10*time.Minute, sqlite.KindRateLimited, errPass)
+	// An in-flight row: started, never finished. Not counted either.
+	if _, err := s.StartRun(ctx, account.ID, false); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "v9.9.9-test")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.Version != "v9.9.9-test" {
+		t.Errorf("Version = %q", rep.Version)
+	}
+	if rep.ConsecutiveFailures != 2 {
+		t.Errorf("ConsecutiveFailures = %d, want 2 (dry run and in-flight row excluded)", rep.ConsecutiveFailures)
+	}
+	if rep.LastSuccessAt == "" {
+		t.Fatal("LastSuccessAt empty with a clean run recorded")
+	}
+	at, err := time.Parse(sqlite.TimeFormat, rep.LastSuccessAt)
+	if err != nil {
+		t.Fatalf("LastSuccessAt = %q, not %s", rep.LastSuccessAt, sqlite.TimeFormat)
+	}
+	if age := time.Since(at); age < 39*time.Minute || age > 41*time.Minute {
+		t.Errorf("LastSuccessAt is %s old, want ~40m", age)
+	}
+	if !rep.Healthy {
+		t.Error("Healthy = false with a 40m-old clean run and a 45m window")
+	}
+}
+
+func TestConsecutiveFailuresIsZeroWhenTheNewestRunIsClean(t *testing.T) {
+	s, account := newStore(t)
+	recordFailedRun(t, s, account.ID, 20*time.Minute, sqlite.KindError, errPass)
+	recordRun(t, s, account.ID, 10*time.Minute, false, nil)
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0", rep.ConsecutiveFailures)
+	}
+}
+
+func TestConsecutiveFailuresWithNoCleanRunCountsTheWindow(t *testing.T) {
+	s, account := newStore(t)
+	for i := 1; i <= 3; i++ {
+		recordFailedRun(t, s, account.ID, time.Duration(i)*time.Minute, sqlite.KindError, errPass)
+	}
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.ConsecutiveFailures != 3 || rep.LastSuccessAt != "" {
+		t.Errorf("ConsecutiveFailures = %d, LastSuccessAt = %q; want 3 and empty", rep.ConsecutiveFailures, rep.LastSuccessAt)
 	}
 }
