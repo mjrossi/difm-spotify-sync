@@ -383,6 +383,19 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		}
 	}
 
+	// Housekeeping rides on a clean, real pass — after the ledger and
+	// the watermark, so it can never sit between them. A failure here
+	// is logged and swallowed: it is not a like reaching or missing
+	// durable state, so invariant 2 is not in play and passClean stays.
+	if passClean && !dryRun {
+		before := time.Now().Add(-RunsRetention)
+		if n, err := e.Store.PruneRuns(ctx, account.ID, before, KeepRuns); err != nil {
+			e.Log.Warn("could not prune old sync runs", "err", err)
+		} else if n > 0 {
+			e.Log.Debug("pruned old sync runs", "count", n, "older_than", before.Format(time.RFC3339))
+		}
+	}
+
 	if !passClean {
 		stats.Kind = sqlite.KindIncomplete
 		e.Log.Warn("pass completed with failures; watermark held back",

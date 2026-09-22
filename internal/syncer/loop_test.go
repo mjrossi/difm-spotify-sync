@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mjrossi/difm-spotify-sync/internal/status"
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/pkg/difm"
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
@@ -69,5 +70,14 @@ func TestNextDelay(t *testing.T) {
 				t.Errorf("nextDelay(%v, %s) = %s, want %s", tc.err, interval, got, tc.want)
 			}
 		})
+	}
+}
+
+// The prune floor and the health scan window are the same number by
+// construction, not by coincidence: pruning below the window would let
+// housekeeping delete the row the health rule was about to accept.
+func TestKeepRunsIsTheHealthScanWindow(t *testing.T) {
+	if KeepRuns != status.HealthScanLimit {
+		t.Errorf("KeepRuns = %d, status.HealthScanLimit = %d; they must agree", KeepRuns, status.HealthScanLimit)
 	}
 }

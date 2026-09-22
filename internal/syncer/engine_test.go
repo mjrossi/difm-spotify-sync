@@ -949,3 +949,91 @@ func TestRunOnce_IdlePassIsQuietAtInfo(t *testing.T) {
 		t.Errorf("idle one-shot logged at Info:\n%s", strings.Join(lines, "\n"))
 	}
 }
+
+// seedOldRuns writes n finished runs with started_at well past the
+// retention window, so a clean pass has something to prune.
+func seedOldRuns(t *testing.T, h *harness, n int) {
+	t.Helper()
+	ctx := context.Background()
+	old := time.Now().Add(-syncer.RunsRetention - 24*time.Hour)
+	h.Store.SetClock(func() time.Time { return old })
+	defer h.Store.SetClock(time.Now)
+	for range n {
+		id, err := h.Store.StartRun(ctx, h.Engine.Account.ID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := h.Store.FinishRun(ctx, id, sqlite.RunStats{}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+}
+
+func runCount(t *testing.T, h *harness) int {
+	t.Helper()
+	runs, err := h.Store.ListRuns(context.Background(), h.Engine.Account.ID, 1000)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	return len(runs)
+}
+
+// Housekeeping rides on a clean pass and on nothing else: a failed pass
+// has better things to do, and a dry run writes nothing by definition.
+func TestRunOnce_CleanPassPrunesOldRuns(t *testing.T) {
+	h := newHarness(t, nil)
+	seedOldRuns(t, h, syncer.KeepRuns+10)
+
+	if _, err := h.Engine.RunOnce(context.Background(), false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// KeepRuns newest survive; the pass's own row is among them.
+	if got := runCount(t, h); got != syncer.KeepRuns {
+		t.Errorf("%d rows after a clean pass, want %d", got, syncer.KeepRuns)
+	}
+}
+
+func TestRunOnce_FailedAndDryPassesDoNotPrune(t *testing.T) {
+	t.Run("failed", func(t *testing.T) {
+		h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+		h.failSearch["One"] = true
+		seedOldRuns(t, h, syncer.KeepRuns+10)
+		_, _ = h.Engine.RunOnce(context.Background(), false)
+		if got := runCount(t, h); got != syncer.KeepRuns+11 {
+			t.Errorf("%d rows after a failed pass, want %d (nothing pruned)", got, syncer.KeepRuns+11)
+		}
+	})
+	t.Run("dry run", func(t *testing.T) {
+		h := newHarness(t, nil)
+		seedOldRuns(t, h, syncer.KeepRuns+10)
+		if _, err := h.Engine.RunOnce(context.Background(), true); err != nil {
+			t.Fatalf("RunOnce(dry): %v", err)
+		}
+		if got := runCount(t, h); got != syncer.KeepRuns+11 {
+			t.Errorf("%d rows after a dry run, want %d (nothing pruned)", got, syncer.KeepRuns+11)
+		}
+	})
+}
+
+// A prune failure is logged and swallowed. It is not a like reaching or
+// missing durable state, so invariant 2 is not in play: the pass is
+// still clean and the watermark still moves.
+func TestRunOnce_PruneFailureDoesNotMarkThePassIncomplete(t *testing.T) {
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	// A trigger that refuses every delete on sync_runs.
+	h.exec(t, `CREATE TRIGGER no_prune BEFORE DELETE ON sync_runs BEGIN SELECT RAISE(ABORT, 'no'); END`)
+	seedOldRuns(t, h, syncer.KeepRuns+1)
+
+	if _, err := h.Engine.RunOnce(context.Background(), false); err != nil {
+		t.Fatalf("RunOnce returned %v, want nil despite the prune failure", err)
+	}
+	if got := h.reload(t).WatermarkLikedAt; !got.Equal(feb) {
+		t.Errorf("watermark = %s, want %s — the pass was clean", got, feb)
+	}
+	if !strings.Contains(h.Logs.String(), "could not prune") {
+		t.Errorf("prune failure not logged:\n%s", h.Logs.String())
+	}
+}

@@ -17,6 +17,18 @@ import (
 // computation degenerates and the API traffic stops being polite.
 const MinInterval = time.Minute
 
+// RunsRetention is how long sync_runs history is kept. Not a flag: a
+// retention period is not a knob a self-hoster needs, and every flag
+// is a README row the config-drift test then polices. Ninety days at
+// the default 15m interval is under nine thousand rows.
+const RunsRetention = 90 * 24 * time.Hour
+
+// KeepRuns is the floor pruning never goes below, whatever the age. It
+// is the health scan window: the rule reads that many rows and must
+// never lose one to housekeeping. TestKeepRunsIsTheHealthScanWindow
+// pins the two together, since this package cannot import status.
+const KeepRuns = 20
+
 // classify maps the error a pass ended with onto the kind recorded in
 // sync_runs. It lives here rather than in the store because the store
 // must not import the API packages, and here rather than at each return
