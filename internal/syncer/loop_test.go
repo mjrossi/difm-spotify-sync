@@ -19,6 +19,11 @@ func TestClassify(t *testing.T) {
 		want sqlite.RunErrorKind
 	}{
 		{
+			"incomplete pass, as Loop receives it",
+			fmt.Errorf("%w: %w", ErrPassIncomplete, errors.New("status 500")),
+			sqlite.KindIncomplete,
+		},
+		{
 			"revoked grant, wrapped", fmt.Errorf("spotify search: %w",
 				fmt.Errorf("%w (invalid_grant): %w", spotify.ErrGrantRevoked, spotify.ErrUnauthorized)),
 			sqlite.KindSpotifyGrantRevoked,

@@ -21,10 +21,15 @@ const MinInterval = time.Minute
 // sync_runs. It lives here rather than in the store because the store
 // must not import the API packages, and here rather than at each return
 // site because a kind set in one branch and forgotten in another is the
-// failure mode. KindIncomplete is the one kind not decided here: RunOnce
-// sets it at the single site that returns ErrPassIncomplete.
+// failure mode. RunOnce still sets KindIncomplete itself at the sites
+// that return ErrPassIncomplete, because its FinishRun defer sees the
+// first swallowed error rather than the wrapper — but the wrapper is
+// what Loop receives, so it is classified here too and the log line and
+// the row agree.
 func classify(err error) sqlite.RunErrorKind {
 	switch {
+	case errors.Is(err, ErrPassIncomplete):
+		return sqlite.KindIncomplete
 	case errors.Is(err, spotify.ErrGrantRevoked):
 		return sqlite.KindSpotifyGrantRevoked
 	case errors.Is(err, difm.ErrUnauthorized):
