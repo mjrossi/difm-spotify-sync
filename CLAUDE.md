@@ -224,6 +224,15 @@ Three invariants that the code depends on, in order:
    credential; anything looser would let a wrong client secret or a
    transient upstream error erase a token that was never actually dead.
 
+   `Loop` logs exactly one `pass finished` line per pass, at Info, with
+   the counts, `clean` and `next_run` — and, on failure, the same `kind`
+   `classify` writes to `sync_runs.error_kind` — so an idle interval
+   costs one log line rather than the silence-or-noise choice between
+   nothing and every step. `RunOnce`'s own `fetched likes` and `sync
+   complete` lines stay Info only when they carry information — a
+   nonzero count — and drop to Debug otherwise, since `Loop` already
+   says the pass happened.
+
    Every failed pass also records a **kind** (`sync_runs.error_kind`), set
    once by `classify` in the engine's `FinishRun` defer — never by the
    store, which must not import the API packages, and not at individual
@@ -476,6 +485,14 @@ Two consequences for code:
   `pkg/difm` scrubs the member id at the source as well
   (`scrubMemberID`), so the two defenses are independent.
 
+- `Report` also carries `version`, `last_success_at` and
+  `consecutive_failures`, none of which cost a second query:
+  `health()` returns the accepted row alongside its verdict, so
+  `last_success_at` is that row's own `finished_at` rather than a
+  fetch that could disagree with what decided the verdict, and
+  `consecutive_failures` walks the same fixed window, capped at
+  `HealthScanLimit` (20 means "at least 20").
+
   What the endpoints *may* say is the kind: `describe()` switches on
   `sync_runs.error_kind` first. A kind is an enum the engine chose from
   its own sentinels, so naming it is not interpolation. A new reason
@@ -489,27 +506,45 @@ Two consequences for code:
 
 The health rule itself: the newest `sync_runs` row that finished,
 recorded no error, and was **not** a dry run must be within
-`--max-age`, **and must be within the last `healthScanLimit` (20) rows**.
+`--max-age`, **and must be within the last `HealthScanLimit` (20) rows**.
 The dry-run clause is load-bearing — the deployed loop never dry-runs, so
 without it a stale `just dry-run` from a debugging session keeps the probe
 green over a daemon that has not completed a real pass in days.
 
+`--max-age` unset is 3 × the floored interval — `MinInterval`, the same
+floor `Loop` applies — rather than a second number to keep in sync with
+it. `effectiveMaxAge` (`cmd/difmsync/main.go`) decides this once, and
+both the daemon's `status.Handler` and `status --check`'s `status.Build`
+call through it, so the two cannot compute from different intervals and
+disagree. The declared default stays `45m` in the README and the
+`Dockerfile` `ENV` block regardless — `TestConfigSurfaceIsDocumentedAndConsistent`
+reads that literal — and an empty `DIFMSYNC_STATUS_MAX_AGE=` counts as
+unset (`nonEmptyEnv`), because urfave/cli otherwise treats the variable
+existing at all, even empty, as the flag being set.
+
 The row-count clause is a real part of the rule, not an implementation
-detail, so it is stated here rather than left to be discovered. It is
-unreachable at production defaults (20 rows at a 15m interval spans ~5h,
-well past the 45m `--max-age`) but reachable at any interval short enough
-that 20 rows span less than `--max-age` — a 2m interval, say, where 20
-rows is 40m and the window is 45m. There, a clean pass with 20 failures
-stacked on top of it reports unhealthy. That verdict is arguably the better one, which is why the
-window stays; what is not acceptable is the two disagreeing silently.
+detail, so it is stated here rather than left to be discovered. At one
+row per interval it is never the binding constraint — `HealthScanLimit`
+rows at interval *i* span ~20*i*, past the 3*i* `--max-age` derives to
+for every *i* — but rows are not always one per interval: a
+`Retry-After` shorter than the interval, or repeated restarts, can stack
+twenty failed rows in far less than 3*i* and evict the clean row behind
+them from the window. That verdict is arguably the better one, which is
+why the window stays; what is not acceptable is the two disagreeing
+silently.
 
 The scan window is deliberately decoupled from the caller's display
-limit. `health()` looks for the newest *qualifying* row, so letting a
-caller asking for a short list also narrow the search made `/healthz`
-disagree with `status --check` for the duration of every pass — the
-engine opens a `sync_runs` row when a pass starts, so at a limit of 1 the
-only visible row was the in-flight one. `Build` scans the fixed window,
-decides, and truncates afterwards; `TestHealthIgnoresRunLimit` pins it.
+limit, and fixed in **both** directions. `health()` looks for the newest
+*qualifying* row, so letting a caller asking for a short list also
+narrow the search made `/healthz` disagree with `status --check` for the
+duration of every pass — the engine opens a `sync_runs` row when a pass
+starts, so at a limit of 1 the only visible row was the in-flight one.
+Widening was the same bug the other way: a large `--limit` let
+`status --limit 50` see further back than `/healthz` did and disagree
+about the verdict. `Build` scans the fixed window, decides, and
+truncates afterwards regardless of what the caller asked to see;
+`TestHealthIgnoresRunLimit` pins the narrowing case and
+`TestScanWindowIsFixedInBothDirections` the widening one.
 
 ## Credentials
 

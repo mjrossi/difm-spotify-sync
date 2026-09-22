@@ -396,8 +396,9 @@ credentials simply stops syncing, quietly.
 
 One rule answers it, and everything below uses that same rule: **the
 newest pass that finished, recorded no error, and was not a dry run must
-be within `DIFMSYNC_STATUS_MAX_AGE`** (45m by default — three ticks of
-the 15m interval, so one missed pass is tolerated and two are not).
+be within `DIFMSYNC_STATUS_MAX_AGE`** (unset, three times
+`DIFMSYNC_INTERVAL` — 45m at the default 15m — so one missed pass is
+tolerated and two are not, whatever the interval; set it to override).
 
 ```sh
 docker compose ps                                            # healthy / unhealthy
@@ -405,6 +406,14 @@ docker compose exec difmsync /difmsync status --check   # the same verdict, with
 curl -s http://<host>:3436/healthz                           # 200 ok, or 503 and the reason
 curl -s http://<host>:3436/status.json | jq                  # the full report
 ```
+
+The JSON report's own fields worth knowing: `healthy` and `reason` are
+the same verdict `/healthz` gives; `version` names the build that
+answered; `last_success_at` is the finished time of the pass the health
+rule accepted, absent once that pass has fallen out of the last 20
+`sync_runs` rows; `consecutive_failures` counts errored passes since
+then, capped at 20 (`20` means "at least 20"); and `runs[].error_kind`
+names why each recent pass failed, never the error text.
 
 The container healthcheck runs `/healthcheck.sh`, which is `status
 --check` with a privilege drop in front of it. It is deliberately not a
@@ -435,6 +444,12 @@ is the pre-auth window working as intended rather than a stall.
 Point a dashboard (Uptime Kuma, Homepage, anything that polls a URL) at
 `/healthz`. Both endpoints are read-only and carry no secrets, which is
 what makes them safe to expose on a LAN without authentication.
+
+Reading `docker compose logs -f difmsync` directly, a healthy idle
+interval shows as one `pass finished` line per tick, carrying `next_run`
+for when the next one fires — nothing more, unless a like was actually
+fetched. A pass that swallowed something logs `clean=false` on that same
+line and names the `kind` alongside it, matching the reason table below.
 
 ### When it goes red
 

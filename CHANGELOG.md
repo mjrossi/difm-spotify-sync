@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `DIFMSYNC_STATUS_MAX_AGE`, left unset, now follows the interval — three
+  times `DIFMSYNC_INTERVAL` — instead of a fixed 45m regardless of it, so
+  a longer interval no longer reports unhealthy between every pair of
+  passes. The declared default is still `45m`; set the variable to
+  override the derivation.
+- The loop logs one `pass finished` line per pass at Info, with the
+  fetch/add/queue/skip counts, whether it was clean, and `next_run` —
+  replacing what used to be either silence or a scattering of per-step
+  lines for an idle tick.
+- `difmsync status`, `--json` and `/status.json` gain `version`,
+  `last_success_at` (the accepted pass's own finish time) and
+  `consecutive_failures` (capped at the 20-row scan window), so an
+  operator or a dashboard can see which build answered and how long a
+  stall has been running without reading the runs table by hand.
 - A refresh token that Spotify revokes mid-life no longer needs a human
   to run `difmsync auth` and restart the container. The daemon clears the
   dead token, brings the consent server back up with a fresh URL and
@@ -21,6 +35,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A one-shot `difmsync sync` with a revoked grant now exits non-zero from
   the playlist probe, before the pass runs and without recording a
   `sync_runs` row; it used to warn and run the pass anyway.
+
+### Fixed
+
+- The 20-row health scan window is now fixed in both directions. A large
+  `--limit` used to widen it, so `difmsync status --limit 50` could
+  report healthy in a case where `/healthz` — which always uses the
+  fixed window — reported unhealthy.
 
 ### Database
 

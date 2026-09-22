@@ -22,7 +22,8 @@
 # --check rather than plain `status`: `status` only fails when the
 # account row is missing, so a sync broken for a week still reported
 # healthy. --check requires a clean, non-dry pass within
-# DIFMSYNC_STATUS_MAX_AGE. It is also deliberately not a curl of
+# DIFMSYNC_STATUS_MAX_AGE (unset: three times DIFMSYNC_INTERVAL). It is
+# also deliberately not a curl of
 # /healthz — internal/status is the single implementation of the health
 # rule either way, and this still works when DIFMSYNC_HTTP_ADDR is unset.
 set -eu

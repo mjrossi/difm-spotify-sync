@@ -171,7 +171,7 @@ CLI defaults noted where they differ.
 | `DIFMSYNC_HTTP_ADDR` | `--http-addr` | `0.0.0.0:3436` (CLI: off) |
 | `DIFMSYNC_AUTH_HTTP_ADDR` | `--auth-http-addr` | `0.0.0.0:3437` (CLI: off) |
 | `DIFMSYNC_AUTH_BIND` | `--auth-bind` | `0.0.0.0` (CLI: the redirect URL's host) |
-| `DIFMSYNC_STATUS_MAX_AGE` | `--max-age` | `45m` |
+| `DIFMSYNC_STATUS_MAX_AGE` | `--max-age` | `45m` (unset: 3 × `DIFMSYNC_INTERVAL`) |
 
 Container-level settings, following the usual self-hosted conventions:
 
@@ -257,7 +257,7 @@ serves the same verdict over HTTP, for a dashboard:
 | Endpoint | Answer |
 |---|---|
 | `GET /healthz` | `200 ok`, or `503` and the reason |
-| `GET /status.json` | the full report; always `200`, with `"healthy": false` when it is not |
+| `GET /status.json` | the full report; always `200`, with `"healthy": false` when it is not — `version`, `last_success_at` and `consecutive_failures` included |
 
 Both are **read-only and carry no secrets**, which is what makes them safe to
 expose on a LAN unauthenticated. Anything that writes — approving a queued
