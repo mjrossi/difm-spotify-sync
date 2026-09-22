@@ -387,12 +387,19 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 	// the watermark, so it can never sit between them. A failure here
 	// is logged and swallowed: it is not a like reaching or missing
 	// durable state, so invariant 2 is not in play and passClean stays.
+	// dry runs returned at the top of the write phase; !dryRun is
+	// restated so the guard reads as the rule.
 	if passClean && !dryRun {
-		before := time.Now().Add(-RunsRetention)
-		if n, err := e.Store.PruneRuns(ctx, account.ID, before, KeepRuns); err != nil {
-			e.Log.Warn("could not prune old sync runs", "err", err)
-		} else if n > 0 {
-			e.Log.Debug("pruned old sync runs", "count", n, "older_than", before.Format(time.RFC3339))
+		// A shutdown landing between the ledger commit and here is a
+		// clean stop; skipping the prune avoids a misleading Warn, and
+		// the next clean pass prunes anyway.
+		if ctx.Err() == nil {
+			before := time.Now().Add(-RunsRetention)
+			if n, err := e.Store.PruneRuns(ctx, account.ID, before, KeepRuns); err != nil {
+				e.Log.Warn("could not prune old sync runs", "err", err)
+			} else if n > 0 {
+				e.Log.Debug("pruned old sync runs", "count", n, "older_than", before)
+			}
 		}
 	}
 

@@ -26,7 +26,9 @@ const RunsRetention = 90 * 24 * time.Hour
 // KeepRuns is the floor pruning never goes below, whatever the age. It
 // is the health scan window: the rule reads that many rows and must
 // never lose one to housekeeping. TestKeepRunsIsTheHealthScanWindow
-// pins the two together, since this package cannot import status.
+// pins the two together: the engine must not depend on the reporting
+// layer that reads the store downstream of it, so the two are pinned
+// by a test rather than by a shared constant.
 const KeepRuns = 20
 
 // classify maps the error a pass ended with onto the kind recorded in

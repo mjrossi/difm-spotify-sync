@@ -991,6 +991,20 @@ func TestRunOnce_CleanPassPrunesOldRuns(t *testing.T) {
 	if got := runCount(t, h); got != syncer.KeepRuns {
 		t.Errorf("%d rows after a clean pass, want %d", got, syncer.KeepRuns)
 	}
+	runs, err := h.Store.ListRuns(context.Background(), h.Engine.Account.ID, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if runs[0].FinishedAt == "" {
+		t.Error("newest run has no FinishedAt; the pass's own row did not survive pruning")
+	}
+	startedAt, err := time.Parse(sqlite.TimeFormat, runs[0].StartedAt)
+	if err != nil {
+		t.Fatalf("parse StartedAt %q: %v", runs[0].StartedAt, err)
+	}
+	if since := time.Since(startedAt); since < 0 || since > time.Minute {
+		t.Errorf("newest run StartedAt = %s, want within the last minute", startedAt)
+	}
 }
 
 func TestRunOnce_FailedAndDryPassesDoNotPrune(t *testing.T) {
@@ -1035,5 +1049,24 @@ func TestRunOnce_PruneFailureDoesNotMarkThePassIncomplete(t *testing.T) {
 	}
 	if !strings.Contains(h.Logs.String(), "could not prune") {
 		t.Errorf("prune failure not logged:\n%s", h.Logs.String())
+	}
+}
+
+// The prune is appended after invariant 1's chain, not inserted into
+// it; if it ever moves ahead of the ledger transaction this fails.
+func TestRunOnce_PruneRunsOnlyAfterTheLedgerCommits(t *testing.T) {
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.exec(t, `CREATE TRIGGER no_ledger BEFORE INSERT ON synced_tracks BEGIN SELECT RAISE(ABORT, 'no'); END`)
+	seedOldRuns(t, h, syncer.KeepRuns+10)
+
+	if _, err := h.Engine.RunOnce(context.Background(), false); err == nil {
+		t.Fatal("RunOnce returned nil, want an error — the ledger write failed")
+	}
+	// Nothing pruned: seeded rows plus the pass's own row all survive.
+	if got := runCount(t, h); got != syncer.KeepRuns+11 {
+		t.Errorf("%d rows after a failed ledger write, want %d (nothing pruned)", got, syncer.KeepRuns+11)
 	}
 }
