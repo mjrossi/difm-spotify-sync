@@ -516,9 +516,9 @@ floor `Loop` applies — rather than a second number to keep in sync with
 it. `effectiveMaxAge` (`cmd/difmsync/main.go`) decides this once, and
 both the daemon's `status.Handler` and `status --check`'s `status.Build`
 call through it, so the two cannot compute from different intervals and
-disagree. The declared default stays `45m` in the README and the
-`Dockerfile` `ENV` block regardless — `TestConfigSurfaceIsDocumentedAndConsistent`
-reads that literal — and an empty `DIFMSYNC_STATUS_MAX_AGE=` counts as
+disagree. The declared default stays `45m` in the flag and the README
+table regardless — `TestConfigSurfaceIsDocumentedAndConsistent` compares
+those two, and the `Dockerfile` sets no override — and an empty `DIFMSYNC_STATUS_MAX_AGE=` counts as
 unset (`nonEmptyEnv`), because urfave/cli otherwise treats the variable
 existing at all, even empty, as the flag being set.
 

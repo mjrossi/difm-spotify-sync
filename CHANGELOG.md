@@ -15,8 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   override the derivation.
 - The loop logs one `pass finished` line per pass at Info, with the
   fetch/add/queue/skip counts, whether it was clean, and `next_run` —
-  replacing what used to be either silence or a scattering of per-step
-  lines for an idle tick.
+  replacing the two lines an idle tick used to log without ever saying
+  when the next attempt was.
 - `difmsync status`, `--json` and `/status.json` gain `version`,
   `last_success_at` (the accepted pass's own finish time) and
   `consecutive_failures` (capped at the 20-row scan window), so an
