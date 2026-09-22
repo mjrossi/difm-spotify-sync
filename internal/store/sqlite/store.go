@@ -64,12 +64,30 @@ func Open(path string) (*Store, error) {
 	db.SetMaxIdleConns(1)
 
 	// sql.Open is lazy — Ping eagerly so a bad path fails at boot with a
-	// clear error instead of leaking into the first query.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// clear error instead of leaking into the first query. 10s rather
+	// than 2s: quick_check below shares this context, and a large
+	// database on slow storage (a network-backed /config volume) should
+	// not be misreported as unopenable just because it is big.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite.Open: ping: %w", err)
+	}
+
+	// quick_check is integrity_check without the index pass: cheap enough
+	// to run on every open, including the healthcheck's, and it is what
+	// turns a truncated docker cp into a message that names the file and
+	// the runbook instead of a driver error from inside the first query.
+	var verdict string
+	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&verdict); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite.Open: %s: integrity check could not run: %w", path, err)
+	}
+	if verdict != "ok" {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite.Open: %s failed integrity check (%s); restore from a backup — docs/deploy.md, Restoring",
+			path, verdict)
 	}
 
 	return &Store{

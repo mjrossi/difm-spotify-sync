@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -769,4 +770,74 @@ func TestPruneRunsIsScopedToTheAccount(t *testing.T) {
 	if len(runs) != 2 {
 		t.Errorf("account b has %d rows after pruning a, want 2", len(runs))
 	}
+}
+
+// TestOpenRefusesACorruptDatabase: the documented restore is a docker cp,
+// and a truncated or half-written copy used to surface as whatever query
+// tripped first — from inside a pass, under a restart policy, with no
+// file name and no next step. Now the open itself says which file and
+// where the runbook is.
+func TestOpenRefusesACorruptDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.db")
+	s := openAt(t, path)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Overwrite the middle of the file. Page 1 stays intact so SQLite
+	// still recognizes the header and reaches the check; a page inside
+	// the btree does not.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	garbage := bytes.Repeat([]byte{0xFF}, 512)
+	if _, err := f.WriteAt(garbage, info.Size()/2); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	_, err = sqlite.Open(path)
+	if err == nil {
+		t.Fatal("Open succeeded on a corrupt database")
+	}
+	for _, want := range []string{"integrity check", path, "Restoring"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Open error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// openAt opens and migrates a store at a known path, then seeds enough
+// rows that the file spans several pages.
+func openAt(t *testing.T, path string) *sqlite.Store {
+	t.Helper()
+	ctx := context.Background()
+	s, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	for range 200 {
+		id, err := s.StartRun(ctx, acct.ID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := s.FinishRun(ctx, id, sqlite.RunStats{Err: errors.New(strings.Repeat("x", 200))}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+	return s
 }
