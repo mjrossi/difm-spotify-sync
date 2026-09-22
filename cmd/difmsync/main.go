@@ -854,10 +854,16 @@ func printStatus(rep status.Report) {
 		fmt.Printf("health:    NOT OK — %s\n", rep.Reason)
 	}
 	fmt.Printf("version:   %s\n", rep.Version)
-	if rep.LastSuccessAt != "" {
+	switch {
+	case rep.LastSuccessAt != "":
 		fmt.Printf("last ok:   %s\n", rep.LastSuccessAt)
+	case len(rep.Runs) > 0:
+		fmt.Printf("last ok:   none in the last %d runs\n", status.HealthScanLimit)
 	}
-	if rep.ConsecutiveFailures > 0 {
+	switch {
+	case rep.ConsecutiveFailures == status.HealthScanLimit && rep.LastSuccessAt == "":
+		fmt.Printf("failures:  %d+ since the last clean pass\n", status.HealthScanLimit)
+	case rep.ConsecutiveFailures > 0:
 		fmt.Printf("failures:  %d since the last clean pass\n", rep.ConsecutiveFailures)
 	}
 

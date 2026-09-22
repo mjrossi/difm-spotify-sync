@@ -655,7 +655,7 @@ func TestReportCarriesSuccessTimeAndFailureCount(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, 40*time.Minute, false, nil) // clean
 	recordFailedRun(t, s, account.ID, 30*time.Minute, sqlite.KindError, errPass)
-	recordRun(t, s, account.ID, 20*time.Minute, true, nil) // dry run: not counted
+	recordRun(t, s, account.ID, 20*time.Minute, true, errPass) // a dry run that swallowed a failure: still not counted
 	recordFailedRun(t, s, account.ID, 10*time.Minute, sqlite.KindRateLimited, errPass)
 	// An in-flight row: started, never finished. Not counted either.
 	if _, err := s.StartRun(ctx, account.ID, false); err != nil {
@@ -711,5 +711,36 @@ func TestConsecutiveFailuresWithNoCleanRunCountsTheWindow(t *testing.T) {
 	}
 	if rep.ConsecutiveFailures != 3 || rep.LastSuccessAt != "" {
 		t.Errorf("ConsecutiveFailures = %d, LastSuccessAt = %q; want 3 and empty", rep.ConsecutiveFailures, rep.LastSuccessAt)
+	}
+}
+
+// The verdict and the count must use the same fixed-size window
+// regardless of how many rows the caller asks to see, in either
+// direction. Narrowing was closed once already (TestHealthIgnoresRunLimit);
+// this covers widening: a --limit above HealthScanLimit must not pull a
+// clean run that has fallen out of the scan window back into the verdict.
+func TestScanWindowIsFixedInBothDirections(t *testing.T) {
+	s, account := newStore(t)
+	// The clean run is older than all HealthScanLimit+5 failures stacked
+	// on top of it, so it sits just past the fixed window.
+	recordRun(t, s, account.ID, 30*time.Minute, false, nil)
+	for i := 1; i <= status.HealthScanLimit+5; i++ {
+		recordFailedRun(t, s, account.ID, time.Duration(i)*time.Minute, sqlite.KindError, errPass)
+	}
+
+	for _, limit := range []int{5, status.HealthScanLimit, 50} {
+		rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, limit, "")
+		if err != nil {
+			t.Fatalf("Build(limit=%d): %v", limit, err)
+		}
+		if rep.Healthy {
+			t.Errorf("limit=%d: Healthy = true, want false — the clean run has fallen out of the window", limit)
+		}
+		if rep.ConsecutiveFailures != status.HealthScanLimit {
+			t.Errorf("limit=%d: ConsecutiveFailures = %d, want %d", limit, rep.ConsecutiveFailures, status.HealthScanLimit)
+		}
+		if rep.LastSuccessAt != "" {
+			t.Errorf("limit=%d: LastSuccessAt = %q, want empty", limit, rep.LastSuccessAt)
+		}
 	}
 }

@@ -21,8 +21,10 @@ import (
 // caller does not ask for a specific number.
 const DefaultRunLimit = 5
 
-// healthScanLimit is how far back the health verdict looks, independent of
-// how many rows the caller wants reported.
+// HealthScanLimit is how far back the health verdict — and the failure
+// count alongside it — look, independent of how many rows the caller
+// wants reported. Exported so main can name it in what it prints,
+// rather than repeating the number as a literal.
 //
 // These have to be separate numbers. health() scans for the newest row
 // that *qualifies* — finished, no error, not a dry run — so a caller
@@ -33,7 +35,7 @@ const DefaultRunLimit = 5
 // the verdict flipped to unhealthy. A window this size also absorbs a
 // run of dry runs or failures without losing sight of the clean pass
 // behind them.
-const healthScanLimit = 20
+const HealthScanLimit = 20
 
 // Report is the whole operator-visible state of one account.
 //
@@ -62,9 +64,12 @@ type Report struct {
 	Version string `json:"version"`
 	// LastSuccessAt is the finished_at of the run the health rule
 	// accepted — the same row, never a second query that could disagree.
+	// Absent when no clean pass exists in the window, including when the
+	// last one has fallen out of it.
 	LastSuccessAt string `json:"last_success_at,omitempty"`
 	// ConsecutiveFailures counts finished, non-dry, errored runs newer
 	// than that row, within the scan window. In-flight rows are skipped.
+	// At most HealthScanLimit — the scan window — so 20 means at least 20.
 	ConsecutiveFailures int `json:"consecutive_failures"`
 }
 
@@ -133,7 +138,7 @@ func newRun(r sqlite.SyncRun) Run {
 // sync_runs rows *reported* (<= 0 means DefaultRunLimit).
 //
 // runLimit deliberately does not affect Healthy. The health scan always
-// covers healthScanLimit rows and the list is truncated afterwards, so
+// covers HealthScanLimit rows and the list is truncated afterwards, so
 // two callers asking for different amounts of detail cannot disagree
 // about whether the sync is working.
 func Build(
@@ -148,15 +153,16 @@ func Build(
 		runLimit = DefaultRunLimit
 	}
 
-	account, counts, runs, err := read(ctx, store, label, max(runLimit, healthScanLimit))
+	account, counts, runs, err := read(ctx, store, label, max(runLimit, HealthScanLimit))
 	if err != nil {
 		return Report{}, err
 	}
 
-	// Decide over the whole scan window, then trim to what the caller
-	// asked to see — so two callers wanting different amounts of detail
-	// cannot disagree about whether the sync is working.
-	healthy, reason, accepted := health(runs, maxAge, time.Now())
+	// The verdict and the count use the fixed window regardless of how
+	// many rows the caller asked to see — in either direction. Narrowing
+	// was closed once (TestHealthIgnoresRunLimit); widening was not.
+	window := runs[:min(len(runs), HealthScanLimit)]
+	healthy, reason, accepted := health(window, maxAge, time.Now())
 
 	// Checked after health() rather than inside it, because health() is
 	// about whether passes are completing and this is about whether the
@@ -170,9 +176,9 @@ func Build(
 		reason = "awaiting Spotify consent — open the authorization URL from the daemon log"
 	}
 
-	// Computed over the full scan window, before runs is truncated to
+	// Computed over the same fixed window, before runs is truncated to
 	// what the caller asked to see — same reasoning as health() above.
-	failures := consecutiveFailures(runs, accepted)
+	failures := consecutiveFailures(window, accepted)
 
 	if len(runs) > runLimit {
 		runs = runs[:runLimit]
@@ -288,7 +294,7 @@ func assemble(
 //     days — the precise failure this function exists to catch.
 //
 // ListRuns orders newest-first, so the first qualifying row is the one
-// that matters. The caller passes the full healthScanLimit window, never
+// that matters. The caller passes the full HealthScanLimit window, never
 // a caller-chosen display slice — see Build.
 func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (healthy bool, reason string, accepted *sqlite.SyncRun) {
 	if len(runs) == 0 {
@@ -324,6 +330,14 @@ func health(runs []sqlite.SyncRun, maxAge time.Duration, now time.Time) (healthy
 // than the accepted row (or all of them in the window when there is
 // none). In-flight rows are skipped, not counted: a pass that is running
 // has not failed yet.
+//
+// The clause set (DryRun, FinishedAt == "", Error == "") is deliberately
+// identical to health()'s, so this count is the complement of the
+// verdict rather than a second definition of "failed" that could drift
+// from it. FinishedAt == "" stays even though this package never writes
+// a row with Error set and FinishedAt empty: it does not trust the
+// writer, and a restored or hand-edited database can still hand it a
+// row that breaks that pairing — a row is still just a row here.
 func consecutiveFailures(runs []sqlite.SyncRun, accepted *sqlite.SyncRun) int {
 	n := 0
 	for i := range runs {
