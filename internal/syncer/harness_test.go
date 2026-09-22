@@ -273,7 +273,7 @@ func newHarness(t *testing.T, likes []like) *harness {
 		Account:    account,
 		PlaylistID: "PL1",
 		Thresholds: syncer.Thresholds{Auto: 0.85, Review: 0.60},
-		Log:        slog.New(slog.NewTextHandler(h.Logs, nil)),
+		Log:        slog.New(slog.NewTextHandler(h.Logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	return h
 }

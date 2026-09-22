@@ -852,7 +852,7 @@ func TestLoop_IdlePassLogsOneLineWithNextRun(t *testing.T) {
 	defer cancel()
 	h := newHarness(t, nil)
 	clock := newFakeAfter()
-	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.FixedZone("+01:00", 3600))
 	syncer.SetNow(h.Engine, func() time.Time { return now })
 	const interval = 2 * time.Hour
 
@@ -866,6 +866,7 @@ func TestLoop_IdlePassLogsOneLineWithNextRun(t *testing.T) {
 	// Info line, a real once-per-process lifecycle event rather than
 	// idle-pass noise, and it would otherwise land in this same buffer.
 	lines := infoLines(h)
+	log := h.Logs.String()
 	cancel()
 	<-done
 
@@ -878,6 +879,11 @@ func TestLoop_IdlePassLogsOneLineWithNextRun(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "clean=true") || !strings.Contains(lines[0], "fetched=0") {
 		t.Errorf("line = %q, want clean=true fetched=0", lines[0])
+	}
+	// Demoted to Debug, not deleted: the handler is at Debug level here
+	// specifically so this is distinguishable from the line never firing.
+	if !strings.Contains(log, `level=DEBUG msg="fetched likes"`) {
+		t.Errorf("idle pass lacks a Debug 'fetched likes' line:\n%s", log)
 	}
 }
 
@@ -905,6 +911,30 @@ func TestLoop_ActivePassKeepsItsDetailLines(t *testing.T) {
 		if !strings.Contains(log, want) {
 			t.Errorf("active pass log lacks %q:\n%s", want, log)
 		}
+	}
+}
+
+// A failed pass names its kind on the summary line, in the same
+// vocabulary /status.json publishes as error_kind, so a log line and the
+// endpoint always agree on why — never the error text itself.
+func TestLoop_FailedPassNamesItsKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.difmUnauthorized = true
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked
+	h.Logs.Reset()
+	clock.fire <- time.Time{}
+	<-clock.asked
+	cancel()
+	<-done
+
+	log := h.Logs.String()
+	if !strings.Contains(log, "clean=false") || !strings.Contains(log, "kind=difm_unauthorized") {
+		t.Errorf("failed pass log lacks clean=false/kind=difm_unauthorized:\n%s", log)
 	}
 }
 

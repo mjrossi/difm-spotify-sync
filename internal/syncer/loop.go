@@ -98,7 +98,8 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 		now = time.Now
 	}
 	jitter := time.Duration(rand.Int64N(int64(interval / 4)))
-	e.Log.Info("starting sync loop", "interval", interval, "first_run_in", jitter)
+	e.Log.Info("starting sync loop", "interval", interval, "first_run_in", jitter,
+		"next_run", now().Add(jitter).Format(time.RFC3339))
 
 	// A wait abandoned on return is not stopped. That is fine on both
 	// return paths: context cancellation is process exit, and the
@@ -134,11 +135,23 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 			// The one line an idle pass leaves at Info. It carries the
 			// counts and the next attempt; the error text, when there is
 			// one, is on the "sync pass failed" line above and not here.
-			e.Log.Info("pass finished",
+			// A revoked grant returns above without it: there is no next
+			// run to name.
+			attrs := []any{
 				"fetched", stats.Fetched, "added", stats.Added,
 				"queued", stats.Queued, "skipped", stats.Skipped,
 				"clean", err == nil,
-				"next_run", now().Add(delay).Format(time.RFC3339))
+				"dry_run", dryRun,
+			}
+			if err != nil {
+				// The same enum /status.json publishes as error_kind, so
+				// a log line and the endpoint always agree on why a pass
+				// failed — never the error text, which stays on the
+				// "sync pass failed" line above.
+				attrs = append(attrs, "kind", classify(err))
+			}
+			attrs = append(attrs, "next_run", now().Add(delay).Format(time.RFC3339))
+			e.Log.Info("pass finished", attrs...)
 			wait = after(delay)
 		}
 	}
