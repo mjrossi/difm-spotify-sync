@@ -16,3 +16,18 @@ FROM sync_runs
 WHERE account_id = ?
 ORDER BY started_at DESC, id DESC
 LIMIT ?;
+
+-- name: PruneSyncRuns :execrows
+-- Rows older than the cutoff go, except the newest N, which the health
+-- rule reads, and any row still in flight. The inner table is aliased
+-- because sqlc otherwise reports the self-reference as ambiguous.
+DELETE FROM sync_runs
+WHERE sync_runs.account_id = ?
+  AND sync_runs.finished_at IS NOT NULL
+  AND sync_runs.started_at < ?
+  AND sync_runs.id NOT IN (
+    SELECT recent.id FROM sync_runs AS recent
+    WHERE recent.account_id = ?
+    ORDER BY recent.started_at DESC, recent.id DESC
+    LIMIT ?
+  );

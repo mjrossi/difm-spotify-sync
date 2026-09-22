@@ -90,6 +90,42 @@ func (q *Queries) ListSyncRuns(ctx context.Context, arg ListSyncRunsParams) ([]S
 	return items, nil
 }
 
+const pruneSyncRuns = `-- name: PruneSyncRuns :execrows
+DELETE FROM sync_runs
+WHERE sync_runs.account_id = ?
+  AND sync_runs.finished_at IS NOT NULL
+  AND sync_runs.started_at < ?
+  AND sync_runs.id NOT IN (
+    SELECT recent.id FROM sync_runs AS recent
+    WHERE recent.account_id = ?
+    ORDER BY recent.started_at DESC, recent.id DESC
+    LIMIT ?
+  )
+`
+
+type PruneSyncRunsParams struct {
+	AccountID   int64
+	StartedAt   string
+	AccountID_2 int64
+	Limit       int64
+}
+
+// Rows older than the cutoff go, except the newest N, which the health
+// rule reads, and any row still in flight. The inner table is aliased
+// because sqlc otherwise reports the self-reference as ambiguous.
+func (q *Queries) PruneSyncRuns(ctx context.Context, arg PruneSyncRunsParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, pruneSyncRuns,
+		arg.AccountID,
+		arg.StartedAt,
+		arg.AccountID_2,
+		arg.Limit,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const startSyncRun = `-- name: StartSyncRun :one
 INSERT INTO sync_runs (account_id, started_at, dry_run)
 VALUES (?, ?, ?)

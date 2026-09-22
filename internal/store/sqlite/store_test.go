@@ -652,3 +652,82 @@ func TestFinishRunRejectsAnUnknownKind(t *testing.T) {
 		t.Errorf("logged %q, want a warning naming the rejected kind", buf.String())
 	}
 }
+
+// TestPruneRunsKeepsTheWindowAndTheInFlightRow: retention is by age, but
+// the newest rows survive regardless — the health rule reads them — and
+// a row that has not finished is never a candidate, however old its
+// start looks to a rewound clock.
+func TestPruneRunsKeepsTheWindowAndTheInFlightRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	finished := func(age time.Duration) {
+		t.Helper()
+		s.SetClock(func() time.Time { return base.Add(-age) })
+		id, err := s.StartRun(ctx, acct.ID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := s.FinishRun(ctx, id, sqlite.RunStats{}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+	// 30 finished rows, one per day, the oldest 30 days old.
+	for d := 30; d >= 1; d-- {
+		finished(time.Duration(d) * 24 * time.Hour)
+	}
+	// One in-flight row that looks 40 days old.
+	s.SetClock(func() time.Time { return base.Add(-40 * 24 * time.Hour) })
+	if _, err := s.StartRun(ctx, acct.ID, false); err != nil {
+		t.Fatalf("StartRun (in-flight): %v", err)
+	}
+	s.SetClock(func() time.Time { return base })
+
+	// Retain 10 days, keep at least 5: rows 11..30 days old are
+	// candidates (20 rows); the floor of 5 is already satisfied by the
+	// newest 10, so all 20 go. The in-flight row stays.
+	n, err := s.PruneRuns(ctx, acct.ID, base.Add(-10*24*time.Hour), 5)
+	if err != nil {
+		t.Fatalf("PruneRuns: %v", err)
+	}
+	if n != 20 {
+		t.Errorf("pruned %d rows, want 20", n)
+	}
+	runs, err := s.ListRuns(ctx, acct.ID, 100)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 11 {
+		t.Fatalf("%d rows remain, want 11 (10 recent + in-flight)", len(runs))
+	}
+	inFlight := 0
+	for _, r := range runs {
+		if r.FinishedAt == "" {
+			inFlight++
+		}
+	}
+	if inFlight != 1 {
+		t.Errorf("in-flight rows remaining = %d, want 1", inFlight)
+	}
+
+	// Now retain nothing by age but keep 8: the floor is what saves rows.
+	n, err = s.PruneRuns(ctx, acct.ID, base.Add(time.Hour), 8)
+	if err != nil {
+		t.Fatalf("PruneRuns (floor): %v", err)
+	}
+	// 11 rows; newest 8 by started_at are kept — the in-flight row is
+	// oldest by started_at and is protected by finished_at, not the floor.
+	// Candidates: 11 - 8 = 3, minus the in-flight one = 2.
+	if n != 2 {
+		t.Errorf("pruned %d rows under the floor, want 2", n)
+	}
+	// Idempotent.
+	n, err = s.PruneRuns(ctx, acct.ID, base.Add(time.Hour), 8)
+	if err != nil || n != 0 {
+		t.Errorf("second prune = (%d, %v), want (0, nil)", n, err)
+	}
+}
