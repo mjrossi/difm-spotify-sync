@@ -833,3 +833,89 @@ func TestLoop_ReturnsWhenTheGrantIsRevoked(t *testing.T) {
 		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindSpotifyGrantRevoked)
 	}
 }
+
+// infoLines returns the Info-level lines in the harness log.
+func infoLines(h *harness) []string {
+	var out []string
+	for _, line := range strings.Split(h.Logs.String(), "\n") {
+		if strings.Contains(line, "level=INFO") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// An idle pass used to cost two Info lines that said nothing and did not
+// say when the next attempt was. Now it is one line that says both.
+func TestLoop_IdlePassLogsOneLineWithNextRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, nil)
+	clock := newFakeAfter()
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	syncer.SetNow(h.Engine, func() time.Time { return now })
+	const interval = 2 * time.Hour
+
+	done := startLoop(ctx, h, clock, interval)
+	<-clock.asked
+	h.Logs.Reset() // drop "starting sync loop"
+	clock.fire <- time.Time{}
+	<-clock.asked
+
+	// Captured before cancel: shutdown adds its own "sync loop stopped"
+	// Info line, a real once-per-process lifecycle event rather than
+	// idle-pass noise, and it would otherwise land in this same buffer.
+	lines := infoLines(h)
+	cancel()
+	<-done
+
+	if len(lines) != 1 || !strings.Contains(lines[0], "pass finished") {
+		t.Fatalf("idle pass logged %d Info line(s), want exactly one 'pass finished':\n%s", len(lines), h.Logs.String())
+	}
+	want := now.Add(interval).Format(time.RFC3339)
+	if !strings.Contains(lines[0], "next_run="+want) {
+		t.Errorf("line = %q, want next_run=%s", lines[0], want)
+	}
+	if !strings.Contains(lines[0], "clean=true") || !strings.Contains(lines[0], "fetched=0") {
+		t.Errorf("line = %q, want clean=true fetched=0", lines[0])
+	}
+}
+
+// An active pass keeps its detail: the summary line is in addition to,
+// not instead of, the lines that say what was matched.
+func TestLoop_ActivePassKeepsItsDetailLines(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked
+	h.Logs.Reset()
+	clock.fire <- time.Time{}
+	<-clock.asked
+	cancel()
+	<-done
+
+	log := h.Logs.String()
+	for _, want := range []string{"fetched likes", "sync complete", "pass finished", "added=1"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("active pass log lacks %q:\n%s", want, log)
+		}
+	}
+}
+
+// A one-shot with nothing to do says nothing at Info: the exit code is
+// the answer, and a cron or CI caller has nothing to read.
+func TestRunOnce_IdlePassIsQuietAtInfo(t *testing.T) {
+	h := newHarness(t, nil)
+	if _, err := h.Engine.RunOnce(context.Background(), false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if lines := infoLines(h); len(lines) != 0 {
+		t.Errorf("idle one-shot logged at Info:\n%s", strings.Join(lines, "\n"))
+	}
+}

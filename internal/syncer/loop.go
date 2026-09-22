@@ -93,6 +93,10 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 	if after == nil {
 		after = time.After
 	}
+	now := e.now
+	if now == nil {
+		now = time.Now
+	}
 	jitter := time.Duration(rand.Int64N(int64(interval / 4)))
 	e.Log.Info("starting sync loop", "interval", interval, "first_run_in", jitter)
 
@@ -112,7 +116,7 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 			}
 			return ctx.Err()
 		case <-wait:
-			_, err := e.RunOnce(ctx, dryRun)
+			stats, err := e.RunOnce(ctx, dryRun)
 			if errors.Is(err, spotify.ErrGrantRevoked) {
 				return err
 			}
@@ -127,6 +131,14 @@ func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) 
 			if delay != interval {
 				e.Log.Warn("rate limited; delaying next pass", "delay", delay, "interval", interval)
 			}
+			// The one line an idle pass leaves at Info. It carries the
+			// counts and the next attempt; the error text, when there is
+			// one, is on the "sync pass failed" line above and not here.
+			e.Log.Info("pass finished",
+				"fetched", stats.Fetched, "added", stats.Added,
+				"queued", stats.Queued, "skipped", stats.Skipped,
+				"clean", err == nil,
+				"next_run", now().Add(delay).Format(time.RFC3339))
 			wait = after(delay)
 		}
 	}

@@ -40,6 +40,9 @@ type Engine struct {
 	// after is the timer source Loop waits on; nil means time.After. A
 	// test injects one so the ticker can be driven without sleeping.
 	after func(time.Duration) <-chan time.Time
+
+	// now is the clock Loop stamps next_run with; nil means time.Now.
+	now func() time.Time
 }
 
 // RunOnce performs a single sync pass.
@@ -173,7 +176,14 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		return stats, err
 	}
 	stats.Fetched = len(likes)
-	e.Log.Info("fetched likes", "count", len(likes), "since", account.WatermarkLikedAt, "dry_run", dryRun)
+	// Info only when there is something to say. At a long interval an
+	// idle pass every tick is the whole log, and "count=0" answers
+	// nothing; Loop's summary line is the heartbeat.
+	fetchedLevel := slog.LevelDebug
+	if len(likes) > 0 {
+		fetchedLevel = slog.LevelInfo
+	}
+	e.Log.Log(ctx, fetchedLevel, "fetched likes", "count", len(likes), "since", account.WatermarkLikedAt, "dry_run", dryRun)
 
 	// Reconcile against the live playlist, not just the ledger. The two can
 	// legitimately disagree — a restored database, a `resync --forget`, or a
@@ -385,7 +395,11 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		return stats, fmt.Errorf("%w: %w", ErrPassIncomplete, stats.Err)
 	}
 
-	e.Log.Info("sync complete",
+	completeLevel := slog.LevelDebug
+	if stats.Fetched > 0 {
+		completeLevel = slog.LevelInfo
+	}
+	e.Log.Log(ctx, completeLevel, "sync complete",
 		"added", stats.Added, "queued", stats.Queued, "skipped", stats.Skipped)
 	return stats, nil
 }
