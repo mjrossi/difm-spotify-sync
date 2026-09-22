@@ -132,8 +132,22 @@ summary line deliberately does not.
   `LastSuccessAt string json:"last_success_at,omitempty"`,
   `ConsecutiveFailures int json:"consecutive_failures"`.
 - `Build` and `Handler` take `version string`; `main` passes
-  `buildVersion()`. The CLI `status` prints `version:` and
-  `last success:` lines and a `failures since:` count when non-zero.
+  `buildVersion()`. The CLI `status` prints `version:`, `last ok:` (or
+  `none in the last 20 runs`), and `failures:  N since the last clean
+  pass` when non-zero (`20+` at the cap).
+- The scan window is fixed in **both** directions. `Build` already
+  refused to let a small `--limit` narrow it; a large one widened it,
+  so `status --limit 50` could say healthy where `/healthz` said not.
+  `health` and `consecutiveFailures` now walk exactly `HealthScanLimit`
+  rows whatever the caller asked to see. `consecutive_failures` is
+  therefore at most 20 (20 means "at least 20"), and `last_success_at`
+  is absent once the last clean pass has fallen out of the window —
+  both stated where the fields are read.
+
+Follow-up noted, out of scope: on the *stale* path (clean row too old,
+failures stacked above it) the reason names the staleness, not the
+newest failure's kind; appending `describe(runs[0])` there would be
+kind-only and safe.
 
 `TestReportCarriesNoSecrets` is extended with the new fields in its
 fixture (they are derived values, but the test's job is to fail when a
