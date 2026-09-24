@@ -37,6 +37,10 @@ type Engine struct {
 	Thresholds Thresholds
 	Log        *slog.Logger
 
+	// Backups, when non-nil, takes one snapshot per UTC day after a
+	// clean pass. See backup.go.
+	Backups *Backups
+
 	// after is the timer source Loop waits on; nil means time.After. A
 	// test injects one so the ticker can be driven without sleeping.
 	after func(time.Duration) <-chan time.Time
@@ -394,6 +398,16 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		// clean stop; skipping the prune avoids a misleading Warn, and
 		// the next clean pass prunes anyway.
 		if ctx.Err() == nil {
+			// Before the run prune, so a snapshot is never taken of a
+			// database whose retention has just changed underneath it.
+			if e.Backups != nil && e.Backups.Dir != "" {
+				if dest, err := e.Backups.run(ctx, e.Store, account.Label); err != nil {
+					e.Log.Warn("could not take a backup", "dir", e.Backups.Dir, "err", err)
+				} else if dest != "" {
+					e.Log.Info("backup written", "path", dest)
+				}
+			}
+
 			before := time.Now().Add(-RunsRetention)
 			if n, err := e.Store.PruneRuns(ctx, account.ID, before, KeepRuns); err != nil {
 				e.Log.Warn("could not prune old sync runs", "err", err)
