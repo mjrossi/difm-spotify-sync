@@ -68,9 +68,28 @@ has just changed underneath it. The steps, in `internal/syncer/backup.go`:
    already exists, today's snapshot is done: return without work. This
    is what makes "daily" cheap to check and idempotent across restarts —
    no state beyond the directory listing.
-2. `MkdirAll(Dir, 0o700)`, then `store.BackupTo(ctx, path)` — the
-   existing `VACUUM INTO` + verify + rename that `difmsync backup`
-   already uses. **Reuse it; do not write a second snapshot path.**
+2. `MkdirAll(Dir, 0o700)`, then take the snapshot through the *same*
+   routine `difmsync backup` uses. That routine does not live where it
+   can be reused today: `Store.BackupTo` is the bare `VACUUM INTO`, and
+   everything that makes a snapshot safe — the `MkdirTemp` staging
+   directory (0700, so the refresh token is never world-readable while
+   the copy runs), the reopen-and-verify, the rename into place, the
+   refusal to overwrite — lives in `cmd/difmsync/backup.go`, which
+   `internal/syncer` must not import.
+
+   So the first step of this section is a **pure move**: lift that
+   routine into `internal/store/sqlite` as
+
+   ```go
+   // SnapshotTo writes a verified snapshot to dest, staging it in a
+   // private directory alongside and renaming it into place.
+   func (s *Store) SnapshotTo(ctx context.Context, dest, verifyLabel string) error
+   ```
+
+   with `BackupTo` staying as the raw primitive it wraps, and have
+   `difmsync backup` call it. Two snapshot paths is how one of them
+   silently loses the staging directory; the CLI's comments explaining
+   *why* each step exists move with the code.
 3. Prune: list `difmsync-*.db`, sort by name (ISO dates sort
    lexically), delete all but the newest `Keep`. `Keep <= 0` skips.
 
@@ -126,8 +145,11 @@ the deployment the README leads with.
   a second pass the same day writes nothing new; `Keep=2` leaves the
   two newest of five; `Keep=0` leaves all; a failure (unwritable dir)
   is a Warn and the pass still succeeds; a dry run writes nothing.
-- The snapshot is a real database: open it and read the account row
-  (`BackupTo` already verifies, so assert the file opens, not the bytes).
+- The snapshot is a real database: `SnapshotTo` verifies before the
+  rename, so assert that a file appears at the destination and opens,
+  and that a *failed* verify leaves nothing at the destination.
+- `difmsync backup` still behaves identically after the move: its
+  existing tests pass unchanged, including the refusal to overwrite.
 - `status`: `last_backup_at` is the newest file's date; absent when the
   directory is empty or unset; `/healthz` verdict unchanged either way.
 - Config surface: the two new variables appear in the README table and
