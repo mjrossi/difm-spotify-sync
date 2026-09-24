@@ -157,6 +157,16 @@ cmd. Pure move: same steps, same messages, same tests."
 
 ---
 
+> **Ordering note, learned the hard way.** This plan and its spec name
+> `DIFMSYNC_BACKUP_DIR`/`DIFMSYNC_BACKUP_KEEP`, and
+> `TestConfigSurfaceIsDocumentedAndConsistent` scans **every file in the
+> repo** for `DIFMSYNC_*` and fails any name no flag reads — "dead
+> config", which is exactly the trap it exists to catch. So the gate is
+> red from the moment these documents land until the flags exist. Tasks
+> 2 and 3 are therefore done together, in one stretch, rather than as
+> separate green checkpoints. A future plan that names a future variable
+> should expect the same.
+
 ### Task 2: `Engine.Backups` — one snapshot a day, keep N
 
 **Files:** `internal/syncer/backup.go` (new), `internal/syncer/engine.go`, `internal/syncer/backup_test.go` (new)
