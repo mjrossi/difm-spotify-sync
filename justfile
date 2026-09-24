@@ -56,6 +56,15 @@ lint-workflows:
 test:
     mise exec -- go test ./... -race -count=1
 
+# fuzz the matcher for a bounded time; seeds already run under `test`
+[group('build')]
+fuzz TIME="20s":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for f in FuzzNormalize FuzzParse FuzzScore; do
+        mise exec -- go test ./pkg/match -run '^$' -fuzz "^${f}\$" -fuzztime {{TIME}}
+    done
+
 # regenerate sqlc bindings from migrations-sqlite/ + queries/
 [group('build')]
 gen:

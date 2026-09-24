@@ -271,5 +271,22 @@ func splitArtists(s string) []string {
 			out = append(out, n)
 		}
 	}
+	if len(out) == 0 {
+		// The whole string can normalize to nothing here for two
+		// different reasons that must not be treated alike: a field
+		// that is genuinely empty or punctuation-only (no fallback
+		// helps — there was never a name), and a name that IS a
+		// separator token on its own, such as an artist literally
+		// called "X" or "AND". artistSplit's \bx\b / \band\b
+		// alternatives then match the *entire* string, and Split
+		// returns only the two empty pieces on either side of it,
+		// silently losing the one name that was there. Falling back to
+		// the normalized whole string recovers that second case without
+		// inventing a name for the first, since Normalize("") is still
+		// "".
+		if n := Normalize(s); n != "" {
+			out = append(out, n)
+		}
+	}
 	return out
 }
