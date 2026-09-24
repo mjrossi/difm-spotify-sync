@@ -38,7 +38,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it. An existing root-owned `/config/backups` left by that recipe is
   repaired automatically: `docker/entrypoint.sh` now repairs it by name
   on every start, the same way it already repairs the database and its
-  sidecars.
+  sidecars. **Remove the cron itself:** it writes the same file name, so
+  on days the daemon has already taken its snapshot it fails on the
+  existing file.
 - `sync_runs` is pruned after each clean pass: 90 days of history, never
   fewer than the newest 20 rows (the health scan window). Not
   configurable — see CLAUDE.md, Sync semantics.

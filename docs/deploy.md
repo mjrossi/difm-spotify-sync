@@ -551,9 +551,13 @@ backups, that cron used `docker compose exec`, which runs as root, so
 `/config/backups` and everything in it ended up root-owned. Nothing to
 do about that by hand: the entrypoint now repairs that directory, by
 name, on the next container start — the same way it already repairs the
-database and its sidecars — so an upgrade fixes it automatically. Remove
-the cron entry when convenient; it now only duplicates what the daemon
-already does with a correctly-owned result.
+database and its sidecars — so an upgrade fixes it automatically.
+
+**Remove the cron entry.** It does not merely duplicate the daemon: it
+writes the same `difmsync-YYYY-MM-DD.db` name, so on any day the daemon
+has already taken its snapshot, the cron's `backup` finds the file there,
+refuses to overwrite it, and exits non-zero, every night. Its `find
+-mtime` prune is redundant with `DIFMSYNC_BACKUP_KEEP` as well.
 
 For an on-demand copy — before an upgrade, or to pull one off the host by
 hand — `difmsync backup --to=<path>` is still there:
