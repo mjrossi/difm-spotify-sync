@@ -825,3 +825,71 @@ func TestEffectiveMaxAge(t *testing.T) {
 		})
 	}
 }
+
+// TestSyncBackupFlagsAreWired proves --backup-dir/--backup-keep exist on
+// `sync` with the right identity — the right env var and the right
+// default. It cannot go further and drive a one-shot `sync` end to end:
+// newEngine calls sp.PlaylistName over the real Spotify API before
+// RunOnce ever reaches Backups, and unlike internal/syncer's harness,
+// nothing here threads a stub Spotify server through the CLI layer —
+// seed's account has a refresh token but no client credentials that
+// resolve to anything real, and building a stub Spotify server for the
+// CLI layer just to exercise this one flag would duplicate the harness
+// internal/syncer already has. The write path itself — one snapshot a
+// day, pruning, the dry-run/failed-pass/backup-failure cases — is
+// already covered end to end by
+// internal/syncer/backup_test.go, which drives RunOnce directly against
+// a real store. TestConfigSurfaceIsDocumentedAndConsistent separately
+// pins the env var name, the README row and the Dockerfile default
+// against this flag's own default, so what remains to prove here is only
+// that the flag is actually defined on the command an operator runs.
+func TestSyncBackupFlagsAreWired(t *testing.T) {
+	app := newApp()
+	var sync *cli.Command
+	for _, c := range app.Commands {
+		if c.Name == "sync" {
+			sync = c
+		}
+	}
+	if sync == nil {
+		t.Fatal("no sync command registered")
+	}
+
+	var dirFlag, keepFlag cli.Flag
+	for _, f := range sync.Flags {
+		switch f.Names()[0] {
+		case "backup-dir":
+			dirFlag = f
+		case "backup-keep":
+			keepFlag = f
+		}
+	}
+
+	envVars := func(f cli.Flag) []string {
+		ev, ok := f.(interface{ GetEnvVars() []string })
+		if !ok {
+			t.Fatalf("%s does not expose GetEnvVars", f.Names()[0])
+		}
+		return ev.GetEnvVars()
+	}
+
+	if dirFlag == nil {
+		t.Fatal("--backup-dir is not defined on `sync`")
+	}
+	if got := envVars(dirFlag); len(got) != 1 || got[0] != "DIFMSYNC_BACKUP_DIR" {
+		t.Errorf("--backup-dir env vars = %v, want [DIFMSYNC_BACKUP_DIR]", got)
+	}
+	if sf, ok := dirFlag.(*cli.StringFlag); !ok || sf.Value != "" {
+		t.Errorf("--backup-dir default = %+v, want empty (disabled off the CLI)", dirFlag)
+	}
+
+	if keepFlag == nil {
+		t.Fatal("--backup-keep is not defined on `sync`")
+	}
+	if got := envVars(keepFlag); len(got) != 1 || got[0] != "DIFMSYNC_BACKUP_KEEP" {
+		t.Errorf("--backup-keep env vars = %v, want [DIFMSYNC_BACKUP_KEEP]", got)
+	}
+	if kf, ok := keepFlag.(*cli.IntFlag); !ok || kf.Value != 14 {
+		t.Errorf("--backup-keep default = %+v, want 14", keepFlag)
+	}
+}

@@ -411,6 +411,17 @@ func syncCommand() *cli.Command {
 				Sources: cli.EnvVars("DIFMSYNC_AUTH_HTTP_ADDR"),
 			},
 			maxAgeFlag("how stale the last clean pass may be before /healthz reports unhealthy"),
+			&cli.StringFlag{
+				Name: "backup-dir",
+				Usage: "take one verified snapshot per day into this directory after a clean pass " +
+					"(empty disables; the image defaults it to /config/backups)",
+				Sources: cli.EnvVars("DIFMSYNC_BACKUP_DIR"),
+			},
+			&cli.IntFlag{
+				Name: "backup-keep", Value: 14,
+				Usage:   "how many daily snapshots to keep; 0 keeps every one",
+				Sources: cli.EnvVars("DIFMSYNC_BACKUP_KEEP"),
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if err := requireFlags(c, "api-key", "member-id", "playlist-id",
@@ -488,6 +499,10 @@ func syncCommand() *cli.Command {
 							Review: c.Float("review-threshold"),
 						},
 						Log: log,
+						Backups: &syncer.Backups{
+							Dir:  c.String("backup-dir"),
+							Keep: c.Int("backup-keep"),
+						},
 					}, nil
 				}
 

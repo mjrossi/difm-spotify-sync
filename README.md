@@ -172,6 +172,8 @@ CLI defaults noted where they differ.
 | `DIFMSYNC_AUTH_HTTP_ADDR` | `--auth-http-addr` | `0.0.0.0:3437` (CLI: off) |
 | `DIFMSYNC_AUTH_BIND` | `--auth-bind` | `0.0.0.0` (CLI: the redirect URL's host) |
 | `DIFMSYNC_STATUS_MAX_AGE` | `--max-age` | `45m` (unset: 3 × `DIFMSYNC_INTERVAL`) |
+| `DIFMSYNC_BACKUP_DIR` | `--backup-dir` | `/config/backups` (CLI: off) |
+| `DIFMSYNC_BACKUP_KEEP` | `--backup-keep` | `14` |
 
 Container-level settings, following the usual self-hosted conventions:
 
