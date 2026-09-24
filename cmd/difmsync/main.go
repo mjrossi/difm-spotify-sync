@@ -540,6 +540,18 @@ func syncCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
+					// newEngine wires Backups unconditionally, so a
+					// one-shot `sync` (a `docker compose run` debugging
+					// invocation, most often) still takes today's
+					// snapshot — that write is harmless even here: same
+					// database, idempotent by day. Pruning the backup
+					// directory down to --backup-keep as a side effect
+					// of a debugging one-shot is not harmless, so it is
+					// disabled here; the loop path below is the only one
+					// that prunes.
+					if engine.Backups != nil {
+						engine.Backups.Keep = 0
+					}
 					_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
 					return err
 				}
@@ -861,14 +873,14 @@ func statusCommand() *cli.Command {
 					return enc.Encode(rep)
 				}
 
-				printStatus(rep)
+				printStatus(rep, c.String("backup-dir"))
 				return nil
 			})
 		},
 	}
 }
 
-func printStatus(rep status.Report) {
+func printStatus(rep status.Report, backupDir string) {
 	fmt.Printf("account:   %s\n", rep.Account)
 	fmt.Printf("playlist:  %s\n", rep.Playlist)
 	fmt.Printf("synced:    %d track(s)\n", rep.Synced)
@@ -900,11 +912,26 @@ func printStatus(rep status.Report) {
 	case rep.ConsecutiveFailures > 0:
 		fmt.Printf("failures:  %d since the last clean pass\n", rep.ConsecutiveFailures)
 	}
-	if rep.LastBackupAt != "" {
+	// rep.LastBackupAt alone cannot tell "backups off" from "configured
+	// but never succeeded" — both are the empty string, since Report's
+	// json:",omitempty" tag drops the field either way and status.json
+	// callers already depend on that wire shape. Rather than reshape
+	// Report to carry a second "was this configured" bit for a value
+	// nothing but this printer reads, the CLI recovers the distinction
+	// from the flag it already has: backupDir is exactly what decided
+	// whether Backups.run ever had anywhere to write, so only when it is
+	// set does silence mean something worth saying. /status.json and
+	// /healthz are unaffected — they still only ever have rep to go on.
+	switch {
+	case backupDir == "":
+		// Backups disabled; say nothing, same as before this fix.
+	case rep.LastBackupAt != "":
 		// "last backup:" is itself 12 characters, one past the 11-char
 		// column every label above lines up to, so the single space here
 		// is the closest match rather than a break from the pattern.
 		fmt.Printf("last backup: %s\n", rep.LastBackupAt)
+	default:
+		fmt.Printf("last backup: none\n")
 	}
 
 	// The runs table is the whole point of the command's usage string,

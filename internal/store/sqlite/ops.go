@@ -543,7 +543,20 @@ func (s *Store) SnapshotTo(ctx context.Context, dest, verifyLabel string) error 
 	// means an unusable snapshot never reaches the destination to be
 	// mistaken for a good one later.
 	if err := verifySnapshot(ctx, tmp, dest, verifyLabel); err != nil {
-		return fmt.Errorf("%w — check --db-path points at the database you meant", err)
+		// Used to say "check --db-path points at the database you
+		// meant" — a flag only `difmsync backup`'s operator ever typed.
+		// The daemon's own scheduled snapshot (backup.go's Backups.run)
+		// reaches this same code with the account row already guaranteed
+		// present — RunOnce reloaded it earlier in the same pass — so the
+		// only failure that can reach here on that path is "the source
+		// does not open as a database", and naming a flag nobody set is
+		// actively misleading in a daemon log. verifySnapshot's own two
+		// branches already name dest, the file this would have become;
+		// pointing back at "the database this was copied from" says what
+		// to check without claiming a specific flag caused it, and reads
+		// the same for `difmsync backup`, where --db-path is exactly
+		// that database.
+		return fmt.Errorf("%w — check that the database this was copied from is the one you meant", err)
 	}
 
 	// Publish only what has been verified. The check at the top is

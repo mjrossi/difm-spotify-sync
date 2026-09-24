@@ -777,6 +777,30 @@ func TestLastBackupAtReadsTheNewestSnapshot(t *testing.T) {
 	}
 }
 
+// TestLastBackupAtIgnoresNamesThatAreNotDates: a name matching
+// difmsync-*.db whose middle is not a date — a manual `--to=` backup, a
+// half-written file — must not be read as the newest snapshot. Today
+// "zzz" sorts lexically above every real ISO date, so before this fix the
+// report published exactly that string: an unvalidated filename fragment,
+// on an endpoint served unauthenticated to the LAN.
+func TestLastBackupAtIgnoresNamesThatAreNotDates(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "difmsync-zzz.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.LastBackupAt != "" {
+		t.Errorf("LastBackupAt = %q, want empty — %q is not a date", rep.LastBackupAt, "difmsync-zzz.db")
+	}
+}
+
 // TestLastBackupAtEmptyWhenNoSnapshot covers the directory states that are
 // not an error but still have nothing to report: unset, empty and missing.
 func TestLastBackupAtEmptyWhenNoSnapshot(t *testing.T) {

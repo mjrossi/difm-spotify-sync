@@ -135,6 +135,88 @@ func TestRunOnce_BackupFailureWarnsAndLeavesThePassClean(t *testing.T) {
 	}
 }
 
+// TestRunOnce_PruneIgnoresNamesThatAreNotDates is the regression for the
+// critical prune bug: a name that matches difmsync-*.db but whose middle
+// is not a date — a manual `--to=difmsync-before-upgrade.db`, or a
+// half-written file — used to sort lexically above every real ISO-dated
+// snapshot and get treated as "newest", so pruning to Keep=1 deleted every
+// real snapshot and kept only the junk. The daemon does not own files it
+// did not name, so those files must survive untouched.
+func TestRunOnce_PruneIgnoresNamesThatAreNotDates(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "backups")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	junk := []string{"difmsync-old.db", "difmsync-zzz.db", "difmsync-manual.db"}
+	for _, name := range junk {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("junk"), 0o600); err != nil {
+			t.Fatalf("seed junk %s: %v", name, err)
+		}
+	}
+	// One real dated snapshot from the past, which Keep=1 should prune
+	// once today's is taken.
+	oldReal := "difmsync-2026-01-01.db"
+	if err := os.WriteFile(filepath.Join(dir, oldReal), []byte("old"), 0o600); err != nil {
+		t.Fatalf("seed %s: %v", oldReal, err)
+	}
+
+	h := newHarness(t, nil)
+	h.Engine.Backups = &syncer.Backups{Dir: dir, Keep: 1}
+
+	if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	got := map[string]bool{}
+	for _, e := range entries {
+		got[e.Name()] = true
+	}
+
+	want := "difmsync-" + time.Now().UTC().Format("2006-01-02") + ".db"
+	if !got[want] {
+		t.Errorf("today's snapshot %q missing; have %v", want, got)
+	}
+	if got[oldReal] {
+		t.Errorf("old real snapshot %q survived Keep=1; have %v", oldReal, got)
+	}
+	for _, name := range junk {
+		if !got[name] {
+			t.Errorf("junk file %q was deleted; the daemon does not own files it did not name (have %v)", name, got)
+		}
+	}
+}
+
+// TestRunOnce_FailingBackupIsAttemptedOnlyOncePerDay: the daily gate used
+// to be "today's file exists", so an unwritable backup directory (a full
+// volume, say) was re-attempted on every pass and warned every pass — up
+// to 96 times a day at the default interval. A failed attempt must count
+// as the day's attempt, same as a successful one.
+func TestRunOnce_FailingBackupIsAttemptedOnlyOncePerDay(t *testing.T) {
+	ctx := context.Background()
+	// A *file* where the directory should be: MkdirAll fails every time.
+	blocked := filepath.Join(t.TempDir(), "backups")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	h := newHarness(t, nil)
+	h.Engine.Backups = &syncer.Backups{Dir: blocked, Keep: 14}
+
+	for range 3 {
+		if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+	}
+	if got := strings.Count(h.Logs.String(), "could not take a backup"); got != 1 {
+		t.Errorf("logged the backup failure %d time(s) across 3 same-day passes, want 1:\n%s",
+			got, h.Logs.String())
+	}
+}
+
 func TestRunOnce_DryRunAndFailedPassesTakeNoSnapshot(t *testing.T) {
 	ctx := context.Background()
 	t.Run("dry run", func(t *testing.T) {

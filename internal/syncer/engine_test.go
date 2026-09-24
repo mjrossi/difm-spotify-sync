@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1068,5 +1069,100 @@ func TestRunOnce_PruneRunsOnlyAfterTheLedgerCommits(t *testing.T) {
 	// Nothing pruned: seeded rows plus the pass's own row all survive.
 	if got := runCount(t, h); got != syncer.KeepRuns+11 {
 		t.Errorf("%d rows after a failed ledger write, want %d (nothing pruned)", got, syncer.KeepRuns+11)
+	}
+}
+
+// cancelAfterN wraps a context so its explicit Err() calls report nil for
+// the first n and context.Canceled after — without ever closing Done(),
+// so nothing that watches the context's cancellation channel (an
+// in-flight HTTP request, a database/sql call) is actually disturbed.
+// RunOnce checks ctx.Err() explicitly exactly twice in a pass that writes:
+// once before the ledger transaction and once before backup/prune. That
+// makes n a precise way to land a simulated shutdown between two specific
+// statements that no other technique can target without a real,
+// unreproducible race.
+type cancelAfterN struct {
+	context.Context
+	n     int
+	calls int
+}
+
+func (c *cancelAfterN) Err() error {
+	c.calls++
+	if c.calls > c.n {
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
+
+// TestRunOnce_NoBackupWhenContextCanceledAfterLedgerCommit pins the
+// ctx.Err() guard around the backup/prune housekeeping: a shutdown that
+// lands after the ledger transaction commits but before housekeeping runs
+// must skip the snapshot (and the prune), not attempt it against a
+// process that is already on its way out.
+func TestRunOnce_NoBackupWhenContextCanceledAfterLedgerCommit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "backups")
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.Engine.Backups = &syncer.Backups{Dir: dir, Keep: 14}
+
+	// The first ctx.Err() call (before the ledger tx) must read as not
+	// canceled, so the ledger commits; the second (before backup/prune)
+	// must read as canceled.
+	ctx := &cancelAfterN{Context: context.Background(), n: 1}
+	if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+		t.Fatalf("RunOnce: %v, want nil — a shutdown here is documented as a clean stop", err)
+	}
+	if got := h.reload(t).WatermarkLikedAt; !got.Equal(feb) {
+		t.Errorf("watermark = %s, want %s — the ledger commit must have completed before cancellation was observed", got, feb)
+	}
+	if got := snapshots(t, dir); len(got) != 0 {
+		t.Errorf("snapshot taken after the context was canceled: %v", got)
+	}
+}
+
+// TestRunOnce_BackupPrecedesPruneRuns pins the stated order in engine.go:
+// the snapshot is taken before PruneRuns runs, so a restore from that
+// day's file still carries the sync_runs rows the prune is about to
+// delete rather than the already-trimmed table. Pinned by reading the row
+// count back out of the snapshot file itself — an order flip would still
+// pass a test that only asserted the snapshot exists, since the prune
+// failing or succeeding doesn't stop the backup either way; only the
+// snapshot's actual contents distinguish the two orders.
+func TestRunOnce_BackupPrecedesPruneRuns(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "backups")
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.Engine.Backups = &syncer.Backups{Dir: dir, Keep: 14}
+	seeded := syncer.KeepRuns + 10
+	seedOldRuns(t, h, seeded)
+
+	if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := runCount(t, h); got != syncer.KeepRuns {
+		t.Fatalf("live rows after the pass = %d, want %d — prune did not run", got, syncer.KeepRuns)
+	}
+
+	dest := filepath.Join(dir, "difmsync-"+time.Now().UTC().Format("2006-01-02")+".db")
+	snap, err := sqlite.Open(dest)
+	if err != nil {
+		t.Fatalf("open snapshot: %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+	runs, err := snap.ListRuns(ctx, h.Engine.Account.ID, 1000)
+	if err != nil {
+		t.Fatalf("ListRuns on snapshot: %v", err)
+	}
+	// seeded rows, plus this pass's own row — none pruned yet at the
+	// moment the snapshot was taken.
+	if want := seeded + 1; len(runs) != want {
+		t.Errorf("snapshot carries %d run(s), want %d — the backup must run before PruneRuns "+
+			"so it still has the rows the prune is about to delete", len(runs), want)
 	}
 }

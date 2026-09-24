@@ -33,7 +33,29 @@ import (
 const (
 	snapshotPrefix = "difmsync-"
 	snapshotSuffix = ".db"
+	snapshotDay    = "2006-01-02"
 )
+
+// snapshotDate reports the date encoded in a scheduled snapshot's name,
+// and whether name actually has that shape. Matching the affixes is not
+// enough: an operator's `difmsync backup --to=difmsync-before-upgrade.db`,
+// or a half-copied file, matches difmsync-*.db without being a date, and
+// "zzz" sorts lexically above every real ISO date — so before this
+// existed, such a name could be read as "the newest backup" and published
+// verbatim as last_backup_at on an unauthenticated LAN endpoint. Kept in
+// sync with internal/syncer's own snapshotDate by
+// TestLastBackupAtIgnoresNamesThatAreNotDates rather than by import, for
+// the same cycle reason as the constants above.
+func snapshotDate(name string) (string, bool) {
+	if !strings.HasPrefix(name, snapshotPrefix) || !strings.HasSuffix(name, snapshotSuffix) {
+		return "", false
+	}
+	mid := strings.TrimSuffix(strings.TrimPrefix(name, snapshotPrefix), snapshotSuffix)
+	if _, err := time.Parse(snapshotDay, mid); err != nil {
+		return "", false
+	}
+	return mid, true
+}
 
 // DefaultRunLimit is how many sync_runs rows a report carries when the
 // caller does not ask for a specific number.
@@ -231,24 +253,22 @@ func lastBackupAt(backupDir string) string {
 	if err != nil {
 		return ""
 	}
-	var names []string
+	var days []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		name := e.Name()
-		if strings.HasPrefix(name, snapshotPrefix) && strings.HasSuffix(name, snapshotSuffix) {
-			names = append(names, name)
+		if day, ok := snapshotDate(e.Name()); ok {
+			days = append(days, day)
 		}
 	}
-	if len(names) == 0 {
+	if len(days) == 0 {
 		return ""
 	}
-	// ISO dates between the affixes: lexical order is chronological, so
-	// the greatest name is the newest snapshot.
-	sort.Strings(names)
-	newest := names[len(names)-1]
-	return strings.TrimSuffix(strings.TrimPrefix(newest, snapshotPrefix), snapshotSuffix)
+	// Validated ISO dates: lexical order is chronological, so the
+	// greatest one is the newest snapshot.
+	sort.Strings(days)
+	return days[len(days)-1]
 }
 
 // counts holds the three totals the report carries, read together because
