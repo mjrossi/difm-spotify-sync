@@ -832,6 +832,12 @@ func TestLastBackupAtEmptyWhenNoSnapshot(t *testing.T) {
 // because the backup directory is missing or unreadable is worse than a
 // report that just says nothing has been backed up yet.
 func TestLastBackupAtUnreadableDirDoesNotFailReport(t *testing.T) {
+	// Root reads through mode 000, so the directory is not unreadable
+	// and the fixture proves nothing — it would fail rather than skip in
+	// a root dev container, which is where `just check` often runs.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode 000 does not make a directory unreadable")
+	}
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, time.Minute, false, nil)
 
