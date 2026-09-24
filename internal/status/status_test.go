@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -163,7 +164,7 @@ func TestHealth(t *testing.T) {
 			s, account := newStore(t)
 			tt.setup(t, s, account.ID)
 
-			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 10, "")
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 10, "", "")
 			if err != nil {
 				t.Fatalf("Build: %v", err)
 			}
@@ -190,7 +191,7 @@ func TestReportCarriesNoSecrets(t *testing.T) {
 
 	// A real version string, so its presence in the body is a positive
 	// assertion rather than one that would pass vacuously with "".
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "v9.9.9-test", discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "v9.9.9-test", "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/status.json")
@@ -263,7 +264,7 @@ func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
 	// that could leak if a later edit interpolated the run.
 	recordFailedRun(t, s, account.ID, time.Minute, sqlite.KindDiFMUnauthorized, errWithMemberID)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 	defer srv.Close()
 
 	for _, path := range []string{"/status.json", "/healthz"} {
@@ -313,7 +314,7 @@ func TestReasonNamesTheFailureKind(t *testing.T) {
 			s, account := newStore(t)
 			recordFailedRun(t, s, account.ID, time.Minute, tc.kind, errWithMemberID)
 
-			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "")
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", "")
 			if err != nil {
 				t.Fatalf("Build: %v", err)
 			}
@@ -372,7 +373,7 @@ func TestStatusJSONDropsAnUnknownKind(t *testing.T) {
 		t.Fatalf("UPDATE sync_runs: %v", err)
 	}
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 	defer srv.Close()
 
 	for _, path := range []string{"/status.json", "/healthz"} {
@@ -402,7 +403,7 @@ func TestCLIKeepsTheErrorText(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, time.Minute, false, errPass)
 
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "")
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -443,7 +444,7 @@ func TestHealthzStatusCodes(t *testing.T) {
 			s, account := newStore(t)
 			recordRun(t, s, account.ID, tt.age, false, nil)
 
-			srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
+			srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 			defer srv.Close()
 
 			resp, err := http.Get(srv.URL + "/healthz")
@@ -474,7 +475,7 @@ func TestHealthzBeforeAuth(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/healthz")
@@ -493,7 +494,7 @@ func TestStatusJSONIs200WhenUnhealthy(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, 3*time.Hour, false, nil)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/status.json")
@@ -524,7 +525,7 @@ func TestReportCarriesRuns(t *testing.T) {
 	recordRun(t, s, account.ID, 2*time.Minute, false, nil)
 	recordRun(t, s, account.ID, time.Minute, false, errPass)
 
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "")
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -556,7 +557,7 @@ func TestHealthIgnoresRunLimit(t *testing.T) {
 	}
 
 	for _, limit := range []int{1, 2, 5, 50} {
-		rep, err := status.Build(ctx, s, testLabel, testMaxAge, limit, "")
+		rep, err := status.Build(ctx, s, testLabel, testMaxAge, limit, "", "")
 		if err != nil {
 			t.Fatalf("Build(limit=%d): %v", limit, err)
 		}
@@ -579,7 +580,7 @@ func TestInFlightRunIsStillListed(t *testing.T) {
 		t.Fatalf("StartRun: %v", err)
 	}
 
-	rep, err := status.Build(ctx, s, testLabel, testMaxAge, status.DefaultRunLimit, "")
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, status.DefaultRunLimit, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -619,7 +620,7 @@ func TestUnauthorizedAccountReportsWhyItIsUnhealthy(t *testing.T) {
 	// cannot, because there is no token for it to have used.
 	recordRun(t, s, account.ID, time.Minute, false, nil)
 
-	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "")
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -637,7 +638,7 @@ func TestUnauthorizedAccountReportsWhyItIsUnhealthy(t *testing.T) {
 	if err := s.SetSpotifyRefreshToken(ctx, account.ID, refreshToken); err != nil {
 		t.Fatalf("SetSpotifyRefreshToken: %v", err)
 	}
-	rep, err = status.Build(ctx, s, testLabel, testMaxAge, 0, "")
+	rep, err = status.Build(ctx, s, testLabel, testMaxAge, 0, "", "")
 	if err != nil {
 		t.Fatalf("Build after consent: %v", err)
 	}
@@ -662,7 +663,7 @@ func TestReportCarriesSuccessTimeAndFailureCount(t *testing.T) {
 		t.Fatalf("StartRun: %v", err)
 	}
 
-	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "v9.9.9-test")
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "v9.9.9-test", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -691,7 +692,7 @@ func TestConsecutiveFailuresIsZeroWhenTheNewestRunIsClean(t *testing.T) {
 	s, account := newStore(t)
 	recordFailedRun(t, s, account.ID, 20*time.Minute, sqlite.KindError, errPass)
 	recordRun(t, s, account.ID, 10*time.Minute, false, nil)
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "")
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -705,7 +706,7 @@ func TestConsecutiveFailuresWithNoCleanRunCountsTheWindow(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		recordFailedRun(t, s, account.ID, time.Duration(i)*time.Minute, sqlite.KindError, errPass)
 	}
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "")
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -729,7 +730,7 @@ func TestScanWindowIsFixedInBothDirections(t *testing.T) {
 	}
 
 	for _, limit := range []int{5, status.HealthScanLimit, 50} {
-		rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, limit, "")
+		rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, limit, "", "")
 		if err != nil {
 			t.Fatalf("Build(limit=%d): %v", limit, err)
 		}
@@ -742,5 +743,163 @@ func TestScanWindowIsFixedInBothDirections(t *testing.T) {
 		if rep.LastSuccessAt != "" {
 			t.Errorf("limit=%d: LastSuccessAt = %q, want empty", limit, rep.LastSuccessAt)
 		}
+	}
+}
+
+// TestLastBackupAtReadsTheNewestSnapshot: the report names the newest
+// snapshot's date, read straight from the directory listing rather than a
+// store column — there is no second place for it to disagree with what
+// backup.go actually wrote. Snapshot names are ISO-dated
+// (difmsync-YYYY-MM-DD.db), so a lexical sort over the filtered names is a
+// chronological one.
+func TestLastBackupAtReadsTheNewestSnapshot(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	dir := t.TempDir()
+	for _, name := range []string{
+		"difmsync-2026-01-05.db",
+		"difmsync-2026-01-06.db",
+		"difmsync-2026-01-04.db",
+		"not-a-snapshot.txt", // must be ignored rather than sorted in
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+	}
+
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.LastBackupAt != "2026-01-06" {
+		t.Errorf("LastBackupAt = %q, want 2026-01-06", rep.LastBackupAt)
+	}
+}
+
+// TestLastBackupAtEmptyWhenNoSnapshot covers the directory states that are
+// not an error but still have nothing to report: unset, empty and missing.
+func TestLastBackupAtEmptyWhenNoSnapshot(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	tests := []struct {
+		name string
+		dir  string
+	}{
+		{"unset", ""},
+		{"empty directory", t.TempDir()},
+		{"missing directory", filepath.Join(t.TempDir(), "does-not-exist")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", tt.dir)
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if rep.LastBackupAt != "" {
+				t.Errorf("LastBackupAt = %q, want empty", rep.LastBackupAt)
+			}
+		})
+	}
+}
+
+// TestLastBackupAtUnreadableDirDoesNotFailReport: a probe that 500s
+// because the backup directory is missing or unreadable is worse than a
+// report that just says nothing has been backed up yet.
+func TestLastBackupAtUnreadableDirDoesNotFailReport(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "backups")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "difmsync-2026-01-06.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	// Restore permissions so t.TempDir()'s own cleanup can remove it.
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+	if err != nil {
+		t.Fatalf("Build: %v, want no error over an unreadable backup directory", err)
+	}
+	if rep.LastBackupAt != "" {
+		t.Errorf("LastBackupAt = %q, want empty for an unreadable directory", rep.LastBackupAt)
+	}
+}
+
+// TestLastBackupAtDoesNotAffectHealth: a missing or unreadable backup
+// directory is not evidence that syncing has stopped, and must not change
+// the health verdict computed from sync_runs.
+func TestLastBackupAtDoesNotAffectHealth(t *testing.T) {
+	dirs := map[string]string{
+		"unset":     "",
+		"missing":   filepath.Join(t.TempDir(), "does-not-exist"),
+		"empty":     t.TempDir(),
+		"populated": t.TempDir(),
+	}
+	if err := os.WriteFile(filepath.Join(dirs["populated"], "difmsync-2026-01-06.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		age        time.Duration
+		wantHealth bool
+	}{
+		{"fresh clean run", time.Minute, true},
+		{"stale clean run", 3 * time.Hour, false},
+	} {
+		for dirName, dir := range dirs {
+			t.Run(tc.name+"/"+dirName, func(t *testing.T) {
+				s, account := newStore(t)
+				recordRun(t, s, account.ID, tc.age, false, nil)
+
+				rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+				if err != nil {
+					t.Fatalf("Build: %v", err)
+				}
+				if rep.Healthy != tc.wantHealth {
+					t.Errorf("Healthy = %v, want %v (backup dir %q must not affect the verdict)",
+						rep.Healthy, tc.wantHealth, dirName)
+				}
+			})
+		}
+	}
+}
+
+// TestReportCarriesLastBackupAt is the JSON-facing sibling of
+// TestLastBackupAtReadsTheNewestSnapshot: it belongs on the same struct
+// the secret checks above cover, so its presence in the encoded body gets
+// its own assertion rather than being inferred from Build's return value.
+func TestReportCarriesLastBackupAt(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "difmsync-2026-01-06.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", dir, discardLogger()))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/status.json")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(body), `"last_backup_at":"2026-01-06"`) {
+		t.Errorf("body does not carry last_backup_at: %s", body)
 	}
 }

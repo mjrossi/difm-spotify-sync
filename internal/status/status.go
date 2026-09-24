@@ -12,9 +12,27 @@ package status
 import (
 	"context"
 	"fmt"
+	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
+)
+
+// snapshotPrefix and snapshotSuffix bracket a scheduled snapshot's name,
+// exactly as internal/syncer/backup.go names them (difmsync-YYYY-MM-DD.db).
+//
+// Duplicated rather than imported. internal/syncer's own test file already
+// imports internal/status (TestKeepRunsIsTheHealthScanWindow), so an
+// import the other way would be a cycle that breaks both packages' tests.
+// Exporting the constants from syncer and importing them here would still
+// point the dependency the wrong way — status is the read-only reporting
+// package and must not know about the engine that writes what it reads.
+// Three lines of prefix/suffix matching is cheaper than that coupling.
+const (
+	snapshotPrefix = "difmsync-"
+	snapshotSuffix = ".db"
 )
 
 // DefaultRunLimit is how many sync_runs rows a report carries when the
@@ -71,6 +89,13 @@ type Report struct {
 	// than that row, within the scan window. In-flight rows are skipped.
 	// At most HealthScanLimit — the scan window — so 20 means at least 20.
 	ConsecutiveFailures int `json:"consecutive_failures"`
+	// LastBackupAt is the newest scheduled snapshot's date (YYYY-MM-DD),
+	// read straight from the backup directory listing — never from a
+	// store column, so there is no second place for it to disagree with
+	// what internal/syncer's Backups actually wrote. Empty when no
+	// backup directory is configured, it has no snapshots yet, or it
+	// could not be read; none of those states affect Healthy.
+	LastBackupAt string `json:"last_backup_at,omitempty"`
 }
 
 // Run is one recorded pass as the operator surface reports it.
@@ -148,6 +173,7 @@ func Build(
 	maxAge time.Duration,
 	runLimit int,
 	version string,
+	backupDir string,
 ) (Report, error) {
 	if runLimit <= 0 {
 		runLimit = DefaultRunLimit
@@ -183,7 +209,46 @@ func Build(
 	if len(runs) > runLimit {
 		runs = runs[:runLimit]
 	}
-	return assemble(account, counts, runs, authorized, healthy, reason, version, accepted, failures), nil
+	return assemble(account, counts, runs, authorized, healthy, reason, version,
+		accepted, failures, lastBackupAt(backupDir)), nil
+}
+
+// lastBackupAt reports the newest scheduled snapshot's date, or "" when
+// backupDir is unset, has no matching file, or cannot be read.
+//
+// A probe that fails because the backup directory is missing or
+// unreadable is worse than one that just reports no backup yet — a
+// misconfigured or not-yet-created backup directory must not turn into a
+// 500 on /status.json — so every error here is swallowed rather than
+// returned. The health verdict is computed entirely from sync_runs and
+// never touches this function, so a missing backup can never be read as
+// "syncing stopped".
+func lastBackupAt(backupDir string) string {
+	if backupDir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return ""
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, snapshotPrefix) && strings.HasSuffix(name, snapshotSuffix) {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	// ISO dates between the affixes: lexical order is chronological, so
+	// the greatest name is the newest snapshot.
+	sort.Strings(names)
+	newest := names[len(names)-1]
+	return strings.TrimSuffix(strings.TrimPrefix(newest, snapshotPrefix), snapshotSuffix)
 }
 
 // counts holds the three totals the report carries, read together because
@@ -243,6 +308,7 @@ func assemble(
 	version string,
 	accepted *sqlite.SyncRun,
 	failures int,
+	lastBackupAt string,
 ) Report {
 	// make, not a nil slice: an account with no runs should encode as
 	// "runs": [] rather than "runs": null.
@@ -263,6 +329,7 @@ func assemble(
 		Reason:              reason,
 		Version:             version,
 		ConsecutiveFailures: failures,
+		LastBackupAt:        lastBackupAt,
 	}
 	if accepted != nil {
 		r.LastSuccessAt = accepted.FinishedAt

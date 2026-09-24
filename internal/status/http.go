@@ -29,7 +29,7 @@ const handlerTimeout = 5 * time.Second
 // defensible because they cannot change anything and carry no secrets.
 // Approving a queued match stays a CLI action — it writes to Spotify, and
 // the ordering it depends on lives in `difmsync review --approve`.
-func Handler(store *sqlite.Store, label string, maxAge time.Duration, version string, log *slog.Logger) http.Handler {
+func Handler(store *sqlite.Store, label string, maxAge time.Duration, version, backupDir string, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +41,7 @@ func Handler(store *sqlite.Store, label string, maxAge time.Duration, version st
 		// /healthz disagree with `status --check` for the duration of every
 		// pass. Build no longer ties the two together; passing the same
 		// value as every other caller keeps that obvious.
-		rep, err := Build(ctx, store, label, maxAge, DefaultRunLimit, version)
+		rep, err := Build(ctx, store, label, maxAge, DefaultRunLimit, version, backupDir)
 		if err != nil {
 			writeText(w, http.StatusServiceUnavailable, err.Error(), log)
 			return
@@ -57,7 +57,7 @@ func Handler(store *sqlite.Store, label string, maxAge time.Duration, version st
 		ctx, cancel := context.WithTimeout(r.Context(), handlerTimeout)
 		defer cancel()
 
-		rep, err := Build(ctx, store, label, maxAge, DefaultRunLimit, version)
+		rep, err := Build(ctx, store, label, maxAge, DefaultRunLimit, version, backupDir)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)

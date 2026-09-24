@@ -383,6 +383,19 @@ func limitFlag(value int, usage string) cli.Flag {
 	return &cli.IntFlag{Name: "limit", Value: value, Usage: usage}
 }
 
+// backupDirFlag is shared by sync and status, the same way maxAgeFlag is.
+// sync takes snapshots there; status (and /status.json, /healthz) only
+// reads the directory listing to report the newest one's date. One
+// definition keeps the two defaults from drifting, which
+// TestConfigSurfaceIsDocumentedAndConsistent also asserts.
+func backupDirFlag(usage string) cli.Flag {
+	return &cli.StringFlag{
+		Name:    "backup-dir",
+		Usage:   usage,
+		Sources: cli.EnvVars("DIFMSYNC_BACKUP_DIR"),
+	}
+}
+
 func syncCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "sync",
@@ -411,12 +424,8 @@ func syncCommand() *cli.Command {
 				Sources: cli.EnvVars("DIFMSYNC_AUTH_HTTP_ADDR"),
 			},
 			maxAgeFlag("how stale the last clean pass may be before /healthz reports unhealthy"),
-			&cli.StringFlag{
-				Name: "backup-dir",
-				Usage: "take one verified snapshot per day into this directory after a clean pass " +
-					"(empty disables; the image defaults it to /config/backups)",
-				Sources: cli.EnvVars("DIFMSYNC_BACKUP_DIR"),
-			},
+			backupDirFlag("take one verified snapshot per day into this directory after a clean pass " +
+				"(empty disables; the image defaults it to /config/backups)"),
 			&cli.IntFlag{
 				Name: "backup-keep", Value: 14,
 				Usage:   "how many daily snapshots to keep; 0 keeps every one",
@@ -578,7 +587,8 @@ func syncCommand() *cli.Command {
 					return loop(ctx)
 				}
 				return serveWhile(ctx, addr,
-					status.Handler(store, c.String("account"), effectiveMaxAge(c), buildVersion(), log),
+					status.Handler(store, c.String("account"), effectiveMaxAge(c), buildVersion(),
+						c.String("backup-dir"), log),
 					log, loop)
 			})
 		},
@@ -823,11 +833,13 @@ func statusCommand() *cli.Command {
 			limitFlag(status.DefaultRunLimit, "how many recent runs to show"),
 			intervalFlag("the daemon's interval; --max-age defaults to three times it"),
 			maxAgeFlag("how stale the last clean pass may be before --check fails"),
+			backupDirFlag("read the newest snapshot's date from this directory for last backup: " +
+				"(empty reports none; the image defaults it to /config/backups)"),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			return withStore(ctx, c, func(store *sqlite.Store) error {
 				rep, err := status.Build(ctx, store, c.String("account"),
-					effectiveMaxAge(c), c.Int("limit"), buildVersion())
+					effectiveMaxAge(c), c.Int("limit"), buildVersion(), c.String("backup-dir"))
 				if err != nil {
 					return err
 				}
@@ -887,6 +899,12 @@ func printStatus(rep status.Report) {
 		fmt.Printf("failures:  %d+ since the last clean pass\n", status.HealthScanLimit)
 	case rep.ConsecutiveFailures > 0:
 		fmt.Printf("failures:  %d since the last clean pass\n", rep.ConsecutiveFailures)
+	}
+	if rep.LastBackupAt != "" {
+		// "last backup:" is itself 12 characters, one past the 11-char
+		// column every label above lines up to, so the single space here
+		// is the closest match rather than a break from the pattern.
+		fmt.Printf("last backup: %s\n", rep.LastBackupAt)
 	}
 
 	// The runs table is the whole point of the command's usage string,
