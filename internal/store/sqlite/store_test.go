@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -893,6 +894,74 @@ func TestOpenRefusesANonDatabaseFile(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Open error = %q, want it to contain %q", err, want)
 		}
+	}
+}
+
+// TestSnapshotToVerifiesBeforePublishing: the snapshot is what a restore
+// copies over the live database, so an unusable one must never reach the
+// destination to be mistaken for a good one later.
+func TestSnapshotToVerifiesBeforePublishing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	if _, err := s.EnsureAccount(ctx, "default", "111", "p"); err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	dir := t.TempDir()
+
+	dest := filepath.Join(dir, "good.db")
+	if err := s.SnapshotTo(ctx, dest, "default"); err != nil {
+		t.Fatalf("SnapshotTo: %v", err)
+	}
+	snap, err := sqlite.Open(dest)
+	if err != nil {
+		t.Fatalf("the snapshot does not open: %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+	if _, err := snap.GetAccount(ctx, "default"); err != nil {
+		t.Errorf("the snapshot has no account row: %v", err)
+	}
+
+	// A verify that cannot pass must leave nothing behind at all — not a
+	// partial file with a plausible name.
+	missing := filepath.Join(dir, "bad.db")
+	if err := s.SnapshotTo(ctx, missing, "no-such-account"); err == nil {
+		t.Fatal("SnapshotTo with an unknown account returned nil")
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a failed verify left %s behind (stat err = %v)", missing, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".difmsync-backup-") {
+			t.Errorf("staging directory %s left behind", e.Name())
+		}
+	}
+}
+
+func TestSnapshotToRefusesAnExistingDestination(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	if _, err := s.EnsureAccount(ctx, "default", "111", "p"); err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	dest := filepath.Join(t.TempDir(), "taken.db")
+	if err := os.WriteFile(dest, []byte("existing"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	err := s.SnapshotTo(ctx, dest, "default")
+	if err == nil {
+		t.Fatal("SnapshotTo overwrote an existing file")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("err = %v, want it to say the destination already exists", err)
+	}
+	// And the file it refused to overwrite is untouched.
+	b, err := os.ReadFile(dest)
+	if err != nil || string(b) != "existing" {
+		t.Errorf("the existing file was modified: %q, %v", b, err)
 	}
 }
 
