@@ -5,7 +5,7 @@ go 1.26.7
 require (
 	github.com/google/go-cmp v0.7.0
 	github.com/pressly/goose/v3 v3.28.0
-	github.com/urfave/cli/v3 v3.11.0
+	github.com/urfave/cli/v3 v3.13.0
 	golang.org/x/oauth2 v0.37.0
 	modernc.org/sqlite v1.58.0
 )
