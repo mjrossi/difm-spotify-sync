@@ -100,13 +100,27 @@ fi
 #     creates the sidecars next to the database, so the directory has to
 #     be writable even when the file itself is already right.
 #
-# Four named paths rather than a recursive walk, so this stays cheap
+# Five named paths rather than a recursive walk, so this stays cheap
 # enough to run on every start with a year of backups in /config.
 db="${DIFMSYNC_DB_PATH:-$CONFIG_DIR/difmsync.db}"
 repair_owner "$(dirname "$db")"
 repair_owner "$db"
 repair_owner "$db-wal"
 repair_owner "$db-shm"
+
+# The backup directory, for the same reason as the database above: the
+# runbook this replaced backed up via `docker compose exec`, which runs
+# as root, so an upgrading deployment can have a root-owned
+# DIFMSYNC_BACKUP_DIR that the daemon's own daily snapshot cannot write
+# into — it would mkdir/create inside it and fail permission denied,
+# forever, once per pass. Directory-level only, not recursive into
+# whatever snapshots root already left there: unlinking a root-owned
+# file only needs the directory's write bit, so pruning and new backups
+# both start working immediately without a walk.
+#
+# Same limitation as DIFMSYNC_DB_PATH above: a --backup-dir passed only
+# on the command line, not through the environment, is invisible here.
+repair_owner "${DIFMSYNC_BACKUP_DIR:-$CONFIG_DIR/backups}"
 
 log "starting as uid ${PUID} gid ${PGID}, umask ${UMASK}, TZ ${TZ:-UTC}, db ${DIFMSYNC_DB_PATH:-$CONFIG_DIR/difmsync.db}"
 

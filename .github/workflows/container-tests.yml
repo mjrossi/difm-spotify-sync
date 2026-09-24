@@ -324,6 +324,34 @@ jobs:
             exit 1
           fi
 
+      # The runbook this replaced backed up via a root cron running
+      # `docker compose exec`, so an upgrading deployment can have a
+      # root-owned DIFMSYNC_BACKUP_DIR that the daemon's own daily
+      # snapshot cannot write into — permission denied, once per pass,
+      # forever. A fresh volume has no backups directory at all and would
+      # pass this test whether or not the fix exists, so seed the
+      # root-owned directory explicitly first, the same way the restore
+      # case above seeds a root-owned database.
+      - name: a root-owned backup directory is repaired on start
+        run: |
+          set -uo pipefail
+          docker volume create difmsync-ci-backup-restore
+          docker run --rm -v difmsync-ci-backup-restore:/config alpine sh -c '
+            chown 1234:1234 /config
+            mkdir -p /config/backups
+            chown 0:0 /config/backups'
+
+          docker run --rm -v difmsync-ci-backup-restore:/config \
+            -e PUID=1234 -e PGID=1234 difm-spotify-sync:ci status >/dev/null 2>&1 || true
+
+          owner=$(docker run --rm -v difmsync-ci-backup-restore:/config alpine \
+                    stat -c '%u:%g' /config/backups)
+          if [ "$owner" != "1234:1234" ]; then
+            echo "::error::a root-owned /config/backups stayed owned by $owner, want 1234:1234"
+            echo "::error::the daemon's own daily backup silently stops working"
+            exit 1
+          fi
+
       # The engine's clean-stop path — finish the pass in flight, leave
       # the watermark where it was — depends on difmsync being pid 1 and
       # receiving SIGTERM directly. Lose the `exec` in the entrypoint and
