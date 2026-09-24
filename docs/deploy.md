@@ -259,11 +259,15 @@ docker compose exec difmsync /difmsync resync --forget=<id>
 `/difmsync`, not `/app/difmsync`. `docker exec` runs as the image user,
 which is root, while the service runs as `PUID` — so a command that
 writes leaves root-owned files behind that the service cannot then touch.
-`backup` is the one that lasts: run as root it creates `/config/backups`
-root-owned `0750`, and every snapshot after that. `/difmsync` is the same
-binary with the privilege drop in front, and the entrypoint's own repair
-covers only the database and its sidecars, not an arbitrary path some
-root process created.
+`backup` used to be the one that lasted: run as root it created
+`/config/backups` root-owned `0750`, and every snapshot after that stayed
+that way until someone fixed it by hand. The entrypoint now repairs that
+directory by name on every start, the same way it repairs the database
+and its sidecars, so a root-owned `/config/backups` left by `/app/difmsync
+backup` — or by an old host-cron job; see Backups below — is fixed on the
+next restart rather than lasting indefinitely. `/difmsync` is still the
+one to use day to day: it avoids creating the root-owned window at all,
+rather than waiting for a restart to close it.
 
 If you do use `docker compose run`, do **not** add `-v difmsync-data:/config`.
 Compose namespaces volumes by project, so the real one is
@@ -314,6 +318,17 @@ Prefer Docker's own `user:` (or `--user`)? That works too — the
 entrypoint detects that it is already unprivileged, skips the chown, and
 ignores `PUID`/`PGID`. You are then responsible for the directory's
 ownership yourself.
+
+The container needs a handful of Linux capabilities to do that repair
+and then drop to `PUID:PGID` — `CHOWN`, `DAC_OVERRIDE`, `SETUID` and
+`SETGID` — and nothing else. Both `compose.yaml` and the README's
+`docker run` snippet drop every capability first (`cap_drop: ALL`,
+`no-new-privileges:true`) and add back only those four; a fifth,
+`FOWNER`, was tried and left out because the entrypoint never needs it.
+CI proves the set rather than assuming it stays correct: each of the
+four is checked with its own negative control in
+`container-tests.yml` — dropping any one of them fails a specific,
+identifiable step, not a generic permission error.
 
 ## Upgrading
 
@@ -493,47 +508,69 @@ carries at most that much of `sync_runs` — the ledger, review queue and
 watermark are what a restore actually depends on, and none of those are
 pruned.
 
+**The daemon backs itself up.** After every clean, non-dry sync pass it
+takes one verified snapshot per UTC day into `DIFMSYNC_BACKUP_DIR` (the
+published image defaults this to `/config/backups`; set it explicitly if
+you run from a checkout, where the CLI default is off) and keeps
+`DIFMSYNC_BACKUP_KEEP` of them, oldest first (default 14; `0` keeps every
+one). There is nothing to schedule — no cron, no sidecar, no
+`docker exec` on a timer — and the result is owned by the service, not
+root, because the service writes it itself.
+
+Snapshots are named `difmsync-YYYY-MM-DD.db`. That name is also how both
+the prune and `difmsync status` recognize one — each parses the date out
+of it rather than just matching the prefix and suffix. **A file in that
+directory under any other name is left strictly alone**: never deleted
+by the prune, and never reported as the last backup. `docker cp` a copy
+in from elsewhere, or save a manual snapshot as
+`difmsync-before-upgrade.db`, and it sits there indefinitely — which is
+the point, since the whole reason to give it a distinct name is so the
+automatic prune won't later delete it out from under you. (Naming a
+manual snapshot in the exact `difmsync-YYYY-MM-DD.db` shape does the
+opposite: it becomes indistinguishable from an automatic one and is
+eligible for pruning like any other.)
+
+A failed attempt — a full volume, a directory the daemon can't write to
+— still counts as that day's attempt, so a standing problem warns once a
+day in the logs rather than once a pass. It's retried the next UTC day,
+or sooner if the container restarts; the "did we already try today"
+marker lives only in memory.
+
+`difmsync status` (and `--json`, and `/status.json`) reports the newest
+snapshot's date as `last backup:`. `last backup: none` means a directory
+is configured but holds no snapshot yet — check the logs for a warning
+rather than assuming one is about to appear.
+
+A one-shot `difmsync sync` (run without `--loop`, the way a
+`docker compose run` debugging invocation would) still writes the day's
+snapshot, but never prunes — so it can't quietly trim the retention the
+running daemon is managing.
+
+**Migration note.** If an earlier deployment ran a host cron job for
+backups, that cron used `docker compose exec`, which runs as root, so
+`/config/backups` and everything in it ended up root-owned. Nothing to
+do about that by hand: the entrypoint now repairs that directory, by
+name, on the next container start — the same way it already repairs the
+database and its sidecars — so an upgrade fixes it automatically. Remove
+the cron entry when convenient; it now only duplicates what the daemon
+already does with a correctly-owned result.
+
+For an on-demand copy — before an upgrade, or to pull one off the host by
+hand — `difmsync backup --to=<path>` is still there:
+
 ```sh
-docker compose exec difmsync /difmsync backup --to=/config/backups/difmsync-$(date +%F).db
+docker compose exec difmsync /difmsync backup --to=/config/backups/difmsync-before-upgrade.db
+docker compose cp difmsync:/config/backups/difmsync-before-upgrade.db ./difmsync-backup.db
 ```
 
-`$(date)` expands in *your* shell, which is what you want. That writes
-into the volume — either let whatever backs up your Docker volumes pick
-it up, or pull it onto the host:
+`/difmsync`, not `/app/difmsync` — see Day-2 commands above; going
+through the bare binary via `docker exec` creates the file as root.
 
-```sh
-docker compose cp difmsync:/config/backups/difmsync-$(date +%F).db ./difmsync-backup.db
-```
-
-As a nightly cron on the host:
-
-```cron
-15 4 * * * cd /srv/difm-spotify-sync && docker compose exec -T difmsync \
-  /difmsync backup --to=/config/backups/difmsync-$(date +\%F).db
-```
-
-`-T` disables TTY allocation, which cron needs. Note the escaped `\%` —
-cron treats a bare `%` as a newline.
-
-**Pair it with a prune.** Nothing rotates these, and `VACUUM INTO` writes
-a full copy every night into the same volume as the live database — so an
-unpruned schedule fills that volume and then stops SQLite writing, which
-takes the sync down. The backup command hardens against a full volume
-(that is why it stages and verifies before publishing), but hardening
-only means the *backup* fails cleanly; the database it shares the volume
-with still has nowhere to write.
-
-```cron
-30 4 * * * docker compose exec -T difmsync \
-  find /config/backups -name 'difmsync-*.db' -mtime +14 -delete
-```
-
-Fourteen days is arbitrary; size it against how much room the volume
-actually has.
-
-Three things the backup command refuses to do, all for the same reason —
-the output is often the only copy of a refresh token, and restoring one
-means writing it *over* the live database:
+Both routes — the daemon's own daily snapshot and `backup --to` — go
+through the same verified-snapshot routine, so three things are refused
+either way, all for the same reason: the output is often the only copy
+of a refresh token, and restoring one means writing it *over* the live
+database:
 
 - **Overwrite an existing destination.** Pick another `--to`, or move the
   old file away first.

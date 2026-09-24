@@ -274,6 +274,23 @@ like reaching or missing durable state, so invariant 2 does not apply to it.
 `PruneRuns` also leaves every unfinished row alone regardless of age — one
 per hard crash, kept rather than guessed at.
 
+The daemon's own scheduled backup (`internal/syncer/backup.go`, wired as
+`Engine.Backups`) rides the same guard as the run prune and runs inside
+it, before the prune rather than after: `passClean && !dryRun` and
+`ctx.Err() == nil`, so a snapshot is only ever taken after a fully clean
+pass and never of a database whose retention has just changed underneath
+it. A failed snapshot attempt is logged at Warn and does not mark the
+pass incomplete, for the same reason a failed run-prune does not: it is
+not a like reaching or missing durable state, so invariant 2 does not
+apply to it. The daily gate has two parts and neither is durable: a
+snapshot is skipped once `difmsync-<today>.db` already exists on disk
+(survives a restart), and an *attempt* — landed or failed — is recorded
+only in an in-memory `lastAttempt` field on `*Backups` (does not survive
+one). That split is deliberate: a permanent failure (an unwritable
+directory) should warn once a day rather than once a pass, but should not
+need surviving a restart to be retried, since the cause may have been
+transient and cleared in the meantime.
+
 ## Testing
 
 - `pkg/match` is where matching quality is proven. Any weight or
@@ -319,8 +336,11 @@ per hard crash, kept rather than guessed at.
   production**: that the database ends up owned by `PUID` rather than
   root, that a root-run healthcheck leaves nothing root-owned behind,
   that a root-owned restored database is repaired rather than
-  crash-looping, that difmsync is pid 1 and exits 0 on SIGTERM, and that
-  the arm64 image runs at all. Add to that list when a new startup
+  crash-looping, that a root-owned backup directory (seeded to make the
+  fixture non-vacuous, the way the healthcheck negative control is) is
+  likewise repaired rather than leaving the daemon's own daily snapshot
+  silently broken, that difmsync is pid 1 and exits 0 on SIGTERM, and
+  that the arm64 image runs at all. Add to that list when a new startup
   behaviour can fail quietly.
 
   They live in `.github/workflows/container-tests.yml`, which `ci.yml`
@@ -366,11 +386,16 @@ wrong:
   `/app/difmsync` is internal. The wrapper drops to `PUID:PGID`;
   `docker/healthcheck.sh` goes through it rather than repeating the drop.
   A root process that creates a file under `/config` leaves it
-  root-owned, and the entrypoint repairs the database and its sidecars by
-  name but nothing else — its directory chown re-runs only when `/config`
-  *itself* has the wrong owner, which in steady state it does not.
-  `backup` is the case that lasts: run as root it creates
-  `/config/backups` root-owned and every snapshot in it.
+  root-owned, and the directory chown re-runs only when `/config`
+  *itself* has the wrong owner, which in steady state it does not — so a
+  file some other root process created is not fixed by that chown alone.
+  `backup` run as `/app/difmsync` (or the host-cron recipe the runbook
+  used to document) is the case that used to last: it created
+  `/config/backups` root-owned, and every snapshot in it, with nothing to
+  repair it short of a manual `chown`. It no longer lasts — see the fifth
+  repaired path below — but `/difmsync` still avoids creating the
+  root-owned window in the first place, which is why it stays the
+  documented way in.
 
   So: any new exec-based entry point goes through `/difmsync`, and any
   doc that tells an operator to exec names `/difmsync`. A path documented
@@ -383,9 +408,33 @@ wrong:
   `DIFMSYNC_DB_PATH`. That is what makes the documented restore work at
   all: `docker cp` lands the file root-owned `0600` inside a correctly-
   owned `/config`, which the conditional chown skips. It also covers a
-  `DIFMSYNC_DB_PATH` pointed outside `/config` entirely. Four named paths
-  rather than a recursive walk, so it stays cheap with a year of backups
-  in `/config`.
+  `DIFMSYNC_DB_PATH` pointed outside `/config` entirely. The fifth named
+  path is `DIFMSYNC_BACKUP_DIR` itself (`/config/backups` by default),
+  repaired directory-level only rather than by walking its contents —
+  unlinking a root-owned file only needs the directory's write bit, so a
+  bare chown of the directory is enough to let the daemon's own daily
+  snapshot and its prune both write again, without a recursive pass over
+  a year of accumulated snapshots. Five named paths rather than a
+  recursive walk, so it stays cheap with a year of backups in `/config`.
+
+- **The privilege drop needs a narrow, proven capability set.**
+  `docker/entrypoint.sh` runs as root only long enough to chown and drop;
+  what it does in that window is `chown` (by path, never recursively
+  except the top-level `/config` fallback) and `su-exec`'s switch to
+  `PUID:PGID`. `compose.yaml` and the README's `docker run` snippet grant
+  exactly `CHOWN` (the repair itself), `DAC_OVERRIDE` (`chown -R` has to
+  read into a directory it does not yet own to recurse into it —
+  enumerating is gated separately from the chown syscall itself, which
+  `CAP_CHOWN` alone covers), `SETUID` and `SETGID` (`su-exec`'s drop to
+  `PUID`/`PGID`), under `cap_drop: ALL` and `no-new-privileges:true`.
+  `FOWNER` was tried and left out: it gates `chmod`/`utimes`/`unlink` on
+  paths the caller does not own, and the entrypoint only ever stats and
+  chowns, so dropping it and repeating every scenario in
+  `container-tests.yml` still repaired ownership correctly. Each of the
+  four granted capabilities is proven load-bearing by its own negative
+  control in `container-tests.yml` — dropping just that one capability
+  fails a specific step in a specific way, not a generic permission
+  error, so the set is not guesswork that happens to work today.
 
 - **`sqlite.Open` refuses a database SQLite cannot read.** Two different
   paths reach `ErrCorrupt`, and both matter because they catch different

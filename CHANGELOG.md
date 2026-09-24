@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The daemon now takes its own scheduled backups: one verified snapshot
+  per UTC day into `DIFMSYNC_BACKUP_DIR` (`--backup-dir` /
+  `DIFMSYNC_BACKUP_DIR`, image default `/config/backups`) after every
+  clean pass, pruned to `--backup-keep` / `DIFMSYNC_BACKUP_KEEP` (default
+  14). Owned by the service rather than root, since the service writes
+  it itself — no host cron required. `difmsync status`, `--json` and
+  `/status.json` gain `last_backup_at`, the newest snapshot's date.
+- `compose.yaml` and the README's `docker run` snippet now drop every
+  Linux capability and add back only the four the entrypoint's privilege
+  drop needs (`CHOWN`, `DAC_OVERRIDE`, `SETUID`, `SETGID`), each proven
+  load-bearing by its own negative control in `container-tests.yml`.
 - `sqlite.Open` now refuses a database SQLite cannot read — a truncated
   or non-SQLite file, or one that fails `PRAGMA quick_check` in place —
   instead of surfacing as whatever query happens to touch it first. The
@@ -21,6 +32,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `docs/deploy.md`'s Backups section no longer documents a host cron
+  recipe (`docker compose exec ... backup` plus a `find -mtime +14
+  -delete` prune) — the daemon's own scheduled backup, above, replaces
+  it. An existing root-owned `/config/backups` left by that recipe is
+  repaired automatically: `docker/entrypoint.sh` now repairs it by name
+  on every start, the same way it already repairs the database and its
+  sidecars.
 - `sync_runs` is pruned after each clean pass: 90 days of history, never
   fewer than the newest 20 rows (the health scan window). Not
   configurable — see CLAUDE.md, Sync semantics.
