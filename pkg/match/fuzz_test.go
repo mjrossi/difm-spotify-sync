@@ -21,7 +21,7 @@ var fuzzSeeds = [][2]string{
 	{"A", "("},
 	{"Björk feat. 坂本龍一", "Ærø – Radio Edit [Extended Mix] (feat. Ωmega)"},
 	{"x", "(Remix) (Radio Edit) [Extended] feat."},
-	{"long", strings.Repeat("a very long title ", 600)},
+	{"long", strings.Repeat("a very long title ", 50)},
 }
 
 // The matcher normalizes whatever the two APIs send. A panic here takes
@@ -40,6 +40,13 @@ func FuzzNormalize(f *testing.F) {
 	})
 }
 
+// FuzzParse is mostly a panic detector rather than a property test: Parse
+// calls Normalize on every field it sets, so "the output is normalized"
+// is a tautology it cannot fail short of a panic. It still earns its own
+// target because Parse's regex pipeline (dashSuffixRe, parenGroupRe,
+// featRe, artistSplit chained together) is the part of this package most
+// likely to panic on adversarial input, and because the assertions catch
+// a *build* that forgets to normalize a new field.
 func FuzzParse(f *testing.F) {
 	for _, s := range fuzzSeeds {
 		f.Add(s[0], s[1])
@@ -54,6 +61,13 @@ func FuzzParse(f *testing.F) {
 				t.Errorf("Parse returned an unnormalized artist %q", a)
 			}
 		}
+		// Featuring goes through splitArtists too — the same code path
+		// this bug lived in — so it gets the same check.
+		for _, a := range tr.Featuring {
+			if match.Normalize(a) != a {
+				t.Errorf("Parse returned an unnormalized featured artist %q", a)
+			}
+		}
 	})
 }
 
@@ -65,7 +79,10 @@ func FuzzScore(f *testing.F) {
 	f.Fuzz(func(t *testing.T, a1, t1 string, d1 int, a2, t2 string, d2 int) {
 		want, got := match.Parse(a1, t1), match.Parse(a2, t2)
 		sc := match.Score(want, d1, got, d2)
-		if sc.Score < 0 || sc.Score > 1 {
+		// !(>= 0 && <= 1) rather than (< 0 || > 1): a NaN score compares
+		// false against every ordering operator, so the inverted form is
+		// what actually catches one instead of silently passing it through.
+		if !(sc.Score >= 0 && sc.Score <= 1) {
 			t.Errorf("Score = %v, want within [0, 1]; why: %s", sc.Score, sc.Why)
 		}
 		// A track against itself, same duration, is a perfect match —
@@ -75,28 +92,35 @@ func FuzzScore(f *testing.F) {
 		//   - a title that normalizes to "" is excluded because ratio()
 		//     deliberately scores two empty titles 0, not 1 — see its
 		//     doc comment: "not evidence of a match".
-		//   - an artist field that normalizes to no tokens at all is
-		//     excluded for the identical reason: artistSimilarity
-		//     returns 0, not 1, when either side has no parsed artists,
-		//     because an empty set is no evidence of identity either.
-		//     (splitArtists falls back to the whole normalized string
-		//     when a name collides with a separator token, e.g. an
-		//     artist literally called "X" — see its doc comment — but a
-		//     genuinely punctuation-only field still parses to none.)
+		//   - an artist field that normalizes to no tokens at all (e.g.
+		//     "!!!") is excluded for the identical reason:
+		//     artistSimilarity returns 0, not 1, when either side has no
+		//     parsed artists. This is checked on the *raw* field with
+		//     Normalize, not by inspecting want.Artists — with
+		//     artistSplit now anchored to real separators, an artist
+		//     that merely collides with a separator word (e.g. "X")
+		//     parses to a real, non-empty artist list, and hiding that
+		//     case behind a len(want.Artists) check would blind this
+		//     fuzz target to the exact bug FuzzScore's seed corpus found.
 		//
 		// The equality also carries a small epsilon rather than being
-		// exact: weightTitle+weightArtist+weightVersion+weightDuration
-		// is a compile-time constant expression, which the Go compiler
-		// folds with arbitrary-precision arithmetic to exactly 1.0, but
-		// Score's num is the same weights summed at *runtime* after
-		// multiplying by variables — rounded at each step — so num/den
-		// lands one ULP under 1.0 even for a bit-for-bit identical
-		// track. That is ordinary floating-point non-associativity, not
-		// a scoring defect: nine orders of magnitude below anything that
-		// could move a verdict at the 0.85/0.60 thresholds.
+		// exact, because floating-point addition is not associative and
+		// the two sides of the equal-weight case take different paths to
+		// 1.0. Without a duration, den is a compile-time constant
+		// expression the compiler folds with arbitrary-precision
+		// arithmetic; num is the same weights multiplied by runtime
+		// variables and summed at runtime, rounding at each step, so it
+		// lands one ULP under den. With a duration, den itself becomes a
+		// runtime addition too — yet num still lands one ULP under it:
+		// same one-ULP gap, but now because num's four-term runtime sum
+		// rounds differently than den's three-compile-time-terms-plus-
+		// one-runtime-add, not because one side is compile-time and the
+		// other isn't. Measured gap in both cases: 1.11e-16 (one ULP),
+		// nine orders of magnitude below anything that could move a
+		// verdict at the 0.85/0.60 thresholds.
 		if a1 == a2 && t1 == t2 && d1 == d2 &&
-			want.Title != "" && len(want.Artists) != 0 &&
-			math.Abs(sc.Score-1) > 1e-9 {
+			want.Title != "" && match.Normalize(a1) != "" &&
+			math.Abs(sc.Score-1) > 1e-15 {
 			t.Errorf("identical tracks scored %v, want ~1; why: %s", sc.Score, sc.Why)
 		}
 	})

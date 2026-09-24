@@ -71,9 +71,16 @@ var (
 	parenGroupRe = regexp.MustCompile(`\s*[\(\[]([^)\]]*)[\)\]]\s*`)
 	dashSuffixRe = regexp.MustCompile(`(?i)\s+-\s+([^-]*?(?:mix|edit|remix|version|dub|vip|bootleg|instrumental|live|acoustic))\s*$`)
 	featRe       = regexp.MustCompile(`(?i)\s*\b(?:feat\.?|ft\.?|featuring)\s+(.+)$`)
-	artistSplit  = regexp.MustCompile(`(?i)\s*(?:,|&|\+|\bx\b|\bvs\.?\b|\band\b|\bwith\b)\s*`)
-	nonAlnumRe   = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
-	spaceRe      = regexp.MustCompile(`\s+`)
+	// A word separator has to sit *between* two things; punctuation
+	// does not. Unanchored, the \bx\b / \band\b alternatives matched a
+	// field that is nothing but the token — an artist called X parsed
+	// to no artists at all — and, worse, ate the leading word of real
+	// names: "X Ambassadors" became "ambassadors", so a collaboration
+	// like "X & Beta" collapsed to "beta" and auto-matched a different
+	// artist's track at 1.0 in an add-only sync.
+	artistSplit = regexp.MustCompile(`(?i)(?:\s*(?:,|&|\+)\s*|\s+(?:x|vs\.?|and|with)\s+)`)
+	nonAlnumRe  = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
+	spaceRe     = regexp.MustCompile(`\s+`)
 	// Apostrophes are elisions, not word boundaries — "D'Void" is one
 	// token and "Don't" is one word. Stripped before the general
 	// punctuation rule, which would otherwise split them.
@@ -268,23 +275,6 @@ func splitArtists(s string) []string {
 	var out []string
 	for _, part := range artistSplit.Split(s, -1) {
 		if n := Normalize(part); n != "" {
-			out = append(out, n)
-		}
-	}
-	if len(out) == 0 {
-		// The whole string can normalize to nothing here for two
-		// different reasons that must not be treated alike: a field
-		// that is genuinely empty or punctuation-only (no fallback
-		// helps — there was never a name), and a name that IS a
-		// separator token on its own, such as an artist literally
-		// called "X" or "AND". artistSplit's \bx\b / \band\b
-		// alternatives then match the *entire* string, and Split
-		// returns only the two empty pieces on either side of it,
-		// silently losing the one name that was there. Falling back to
-		// the normalized whole string recovers that second case without
-		// inventing a name for the first, since Normalize("") is still
-		// "".
-		if n := Normalize(s); n != "" {
 			out = append(out, n)
 		}
 	}

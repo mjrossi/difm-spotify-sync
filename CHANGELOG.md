@@ -42,6 +42,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--limit` used to widen it, so `difmsync status --limit 50` could
   report healthy in a case where `/healthz` — which always uses the
   fixed window — reported unhealthy.
+- An artist whose name is or begins with a separator word (`X
+  Ambassadors`, `And One`, `With Confidence`) was parsed with that word
+  dropped. This both prevented genuine matches and, worse, could let a
+  collaboration auto-add as one member's solo track — `X & Beta`
+  parsed as just `Beta` and matched that artist's recording at full
+  confidence.
 
 ### Database
 

@@ -62,7 +62,7 @@ fuzz TIME="20s":
     #!/usr/bin/env bash
     set -euo pipefail
     for f in FuzzNormalize FuzzParse FuzzScore; do
-        mise exec -- go test ./pkg/match -run '^$' -fuzz "^${f}\$" -fuzztime {{TIME}}
+        mise exec -- go test ./pkg/match -run '^$' -fuzz "^${f}\$" -fuzztime "{{TIME}}"
     done
 
 # regenerate sqlc bindings from migrations-sqlite/ + queries/
