@@ -82,7 +82,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dropped. This both prevented genuine matches and, worse, could let a
   collaboration auto-add as one member's solo track — `X & Beta`
   parsed as just `Beta` and matched that artist's recording at full
-  confidence.
+  confidence. A list with an Oxford comma (`A, B, and C`) still splits
+  into three artists.
 
 ### Database
 
