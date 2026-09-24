@@ -148,7 +148,15 @@ func TestRunOnce_PruneIgnoresNamesThatAreNotDates(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	junk := []string{"difmsync-old.db", "difmsync-zzz.db", "difmsync-manual.db"}
+	junk := []string{
+		"difmsync-old.db", "difmsync-zzz.db", "difmsync-manual.db",
+		// The other direction: a name that sorts *below* every date was
+		// the prune's first victim rather than its survivor — an
+		// operator's versioned pre-upgrade copy, deleted silently.
+		"difmsync-1.0.0-pre-upgrade.db",
+		// Near misses: a date and then some, and one that is not a date.
+		"difmsync-2026-01-01-manual.db", "difmsync-2026-13-01.db",
+	}
 	for _, name := range junk {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("junk"), 0o600); err != nil {
 			t.Fatalf("seed junk %s: %v", name, err)
