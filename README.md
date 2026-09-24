@@ -53,9 +53,16 @@ docker run -d --name difmsync \
   -e DIFMSYNC_SPOTIFY_CLIENT_ID=... \
   -e DIFMSYNC_SPOTIFY_CLIENT_SECRET=... \
   -e DIFMSYNC_PLAYLIST_ID=... \
+  --security-opt no-new-privileges:true --cap-drop ALL \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID \
   --restart unless-stopped \
   ghcr.io/mjrossi/difm-spotify-sync:latest
 ```
+
+The image starts as root for the few milliseconds it takes to fix `/config`'s
+ownership before dropping to `PUID`/`PGID`; the flags above narrow that root
+window to exactly the four capabilities that step needs, rather than leaving
+it with the full default set.
 
 or with Compose:
 

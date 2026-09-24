@@ -137,6 +137,63 @@ jobs:
             exit 1
           fi
 
+      # compose.yaml and the README's `docker run` example both narrow the
+      # image's root window to CHOWN, DAC_OVERRIDE, SETUID and SETGID —
+      # the capabilities docker/entrypoint.sh actually exercises to repair
+      # ownership and drop privileges. A capability missing from that list
+      # fails at chown in a way `restart: unless-stopped` turns into a
+      # silent loop, so the set is proven here rather than left to
+      # inspection of the entrypoint.
+      - name: the dropped-capability set is enough to repair a foreign-owned volume
+        run: |
+          set -euxo pipefail
+          vol="$(mktemp -d)"
+          # A bind mount owned by someone else is the case PUID/PGID
+          # exists for, and mktemp's default 0700 mode is exactly the
+          # restrictive case that needs DAC_OVERRIDE, not just CHOWN, to
+          # recurse into.
+          sudo chown 4242:4242 "$vol"
+          docker run --rm \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE \
+            --cap-add SETUID --cap-add SETGID \
+            -e PUID=1000 -e PGID=1000 \
+            -e DIFMSYNC_DB_PATH=/config/difmsync.db \
+            -v "$vol:/config" \
+            difm-spotify-sync:ci status --check || true
+          owner="$(sudo stat -c '%u:%g' "$vol/difmsync.db")"
+          if [ "$owner" != "1000:1000" ]; then
+            echo "::error::database owned by $owner, want 1000:1000"
+            exit 1
+          fi
+
+      # Without the control above, the assertion above passes whether or
+      # not CHOWN was ever load-bearing — it would pass identically on a
+      # volume the image happened to already own. Drop exactly CHOWN and
+      # assert the repair fails instead.
+      - name: and CHOWN is load-bearing — the negative control
+        run: |
+          set -euxo pipefail
+          vol="$(mktemp -d)"
+          sudo chown 4242:4242 "$vol"
+          out=$(docker run --rm \
+            --cap-drop ALL \
+            --cap-add DAC_OVERRIDE \
+            --cap-add SETUID --cap-add SETGID \
+            -e PUID=1000 -e PGID=1000 \
+            -e DIFMSYNC_DB_PATH=/config/difmsync.db \
+            -v "$vol:/config" \
+            difm-spotify-sync:ci status --check 2>&1) || true
+          echo "$out"
+          # Without CAP_CHOWN the entrypoint cannot repair ownership.
+          # Assert the failure rather than the exit code, since
+          # `status --check` exits non-zero on a fresh volume regardless.
+          if ! printf '%s' "$out" | grep -qiE 'chown|permission denied|operation not permitted'; then
+            echo "::error::expected a chown failure without CAP_CHOWN; got the output above"
+            exit 1
+          fi
+
       # Deliberately NOT reusing difmsync-ci-data. That volume already
       # holds a cleanly-closed, PUID-owned database, and against one of
       # those a root-run check creates no new file and SQLite deletes its
