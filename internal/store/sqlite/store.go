@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/pressly/goose/v3"
-	_ "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
+	sqlitedriver "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
 
 	sqlitegen "github.com/mjrossi/difm-spotify-sync/internal/store/sqlite/gen"
 	migrations "github.com/mjrossi/difm-spotify-sync/migrations-sqlite"
@@ -28,6 +28,22 @@ import (
 // TimeFormat matches the strftime() default in the migrations so
 // timestamps written by Go and by SQLite round-trip identically.
 const TimeFormat = "2006-01-02T15:04:05.000Z"
+
+// ErrCorrupt reports a database SQLite will not read: a truncated or
+// half-written restore, a file that is not a database at all, or one
+// whose pages no longer form a valid tree. Callers branch on it to
+// suppress advice that does not apply — a corrupt file is not a
+// permissions problem, and telling an operator to check both at once
+// is worse than telling them neither.
+var ErrCorrupt = errors.New("sqlite: database is unreadable")
+
+// restoreHint is the one next step that applies to every ErrCorrupt.
+// A path into docs/ is useless from the published image, which ships
+// the binary and three scripts and nothing else — the same reason the
+// engine's DI.fm line points at the README (engine.go) rather than a
+// repo path.
+const restoreHint = "restore from a backup — see the Restoring section of the deployment runbook, " +
+	"https://github.com/mjrossi/difm-spotify-sync/blob/main/docs/deploy.md#restoring"
 
 // Store wraps a *sql.DB with the sqlc-generated Queries.
 type Store struct {
@@ -49,6 +65,9 @@ type Store struct {
 //
 // Open does not apply migrations — call Migrate explicitly so callers
 // decide when schema changes run.
+//
+// Open also refuses a database SQLite cannot read — truncated,
+// non-SQLite, or failing its own integrity check — returning ErrCorrupt.
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("sqlite.Open: empty path")
@@ -64,30 +83,54 @@ func Open(path string) (*Store, error) {
 	db.SetMaxIdleConns(1)
 
 	// sql.Open is lazy — Ping eagerly so a bad path fails at boot with a
-	// clear error instead of leaking into the first query. 10s rather
-	// than 2s: quick_check below shares this context, and a large
-	// database on slow storage (a network-backed /config volume) should
-	// not be misreported as unopenable just because it is big.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// clear error instead of leaking into the first query.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
+		// SQLITE_CORRUPT (11) and SQLITE_NOTADB (26) are what a bad
+		// restore produces — a truncated or half-written docker cp, or a
+		// file that is not a SQLite database at all. Both surface here
+		// rather than at quick_check below, because SQLite validates the
+		// page header when the connection opens, before any pragma runs.
+		var derr *sqlitedriver.Error
+		if errors.As(err, &derr) && (derr.Code() == 11 || derr.Code() == 26) {
+			return nil, fmt.Errorf("sqlite.Open: %s: %w (%w); %s", path, ErrCorrupt, err, restoreHint)
+		}
 		return nil, fmt.Errorf("sqlite.Open: ping: %w", err)
 	}
 
 	// quick_check is integrity_check without the index pass: cheap enough
 	// to run on every open, including the healthcheck's, and it is what
-	// turns a truncated docker cp into a message that names the file and
-	// the runbook instead of a driver error from inside the first query.
+	// turns an in-place bit-flip (survives the ping above, since the
+	// header is intact) into a message that names the file and the
+	// runbook instead of a driver error from inside the first query.
+	//
+	// Its own budget rather than the ping's above: a slow ping must not
+	// eat the time quick_check needs to walk a large database, and
+	// separating them is what makes the 10s ceiling here safe rather than
+	// generous — a 307 MB database checks in ~166ms, so 10s is headroom
+	// for slow storage, not the expected case.
+	qctx, qcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer qcancel()
 	var verdict string
-	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&verdict); err != nil {
+	if err := db.QueryRowContext(qctx, "PRAGMA quick_check").Scan(&verdict); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("sqlite.Open: %s: integrity check could not run: %w", path, err)
+		return nil, fmt.Errorf("sqlite.Open: %s: integrity check did not finish (%w); the database may be large or the storage slow — check DIFMSYNC_DB_PATH",
+			path, err)
 	}
 	if verdict != "ok" {
 		_ = db.Close()
-		return nil, fmt.Errorf("sqlite.Open: %s failed integrity check (%s); restore from a backup — docs/deploy.md, Restoring",
-			path, verdict)
+		// verdict's first line is the constant banner "*** in database
+		// main ***"; the real diagnosis is line two onward (e.g. "Tree 12
+		// page 16: btreeInitPage() returns error code 11"). Drop the
+		// banner rather than concatenate it — it carries no information
+		// an operator can act on, only the detail does.
+		_, detail, ok := strings.Cut(verdict, "\n")
+		if !ok {
+			detail = verdict
+		}
+		return nil, fmt.Errorf("sqlite.Open: %s: %w (%s); %s", path, ErrCorrupt, detail, restoreHint)
 	}
 
 	return &Store{

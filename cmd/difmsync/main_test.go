@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -370,6 +371,36 @@ func TestOpenStoreRestrictsPermissions(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("db mode = %o, want 600", perm)
+	}
+}
+
+// TestOpenStoreSuppressesMountDiagnosticForACorruptDatabase: a corrupt
+// database is not a permissions problem, and mountDiagnostic's advice
+// (check the volume's uid/gid) contradicts sqlite.ErrCorrupt's own
+// (restore from a backup). openStore must report only the one that
+// applies.
+func TestOpenStoreSuppressesMountDiagnosticForACorruptDatabase(t *testing.T) {
+	dbPath, _ := seed(t)
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if err := os.Truncate(dbPath, info.Size()/2); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	err = runCLI(t, dbPath, "status")
+	if err == nil {
+		t.Fatal("status succeeded against a truncated database")
+	}
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("error = %q, want errors.Is ErrCorrupt", err)
+	}
+	if !strings.Contains(err.Error(), "Restoring") {
+		t.Errorf("error = %q, want it to name the restore runbook", err)
+	}
+	if strings.Contains(err.Error(), "volume ownership") || strings.Contains(err.Error(), "this process runs as uid") {
+		t.Errorf("error = %q, carries the mount diagnostic alongside ErrCorrupt's own advice", err)
 	}
 }
 

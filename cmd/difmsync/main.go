@@ -255,6 +255,13 @@ func openStore(ctx context.Context, c *cli.Command) (*sqlite.Store, error) {
 
 	store, err := sqlite.Open(path)
 	if err != nil {
+		// A corrupt database is not a permissions problem, and its own
+		// error already names the restore path — appending the mount
+		// diagnostic would hand the operator two contradictory next
+		// steps for one failure.
+		if errors.Is(err, sqlite.ErrCorrupt) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w%s", err, mountDiagnostic(path))
 	}
 	store.SetLogger(newLogger(c))

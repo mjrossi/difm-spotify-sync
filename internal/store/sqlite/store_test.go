@@ -780,6 +780,27 @@ func TestPruneRunsIsScopedToTheAccount(t *testing.T) {
 func TestOpenRefusesACorruptDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "corrupt.db")
 	s := openAt(t, path)
+
+	// A freshly-migrated, insert-only database has nothing to free, so
+	// there is no freelist page for the corrupting write below to land
+	// on harmlessly — every page in size/2's neighborhood is live. Asked
+	// over a second raw connection to the same file: Store exposes no
+	// pragma escape hatch, and WAL allows the concurrent reader.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	var freelist int
+	if err := raw.QueryRowContext(context.Background(), "PRAGMA freelist_count").Scan(&freelist); err != nil {
+		t.Fatalf("freelist_count: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	if freelist != 0 {
+		t.Fatalf("freelist_count = %d, want 0 (corrupting write may land on a free page)", freelist)
+	}
+
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -807,7 +828,68 @@ func TestOpenRefusesACorruptDatabase(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open succeeded on a corrupt database")
 	}
-	for _, want := range []string{"integrity check", path, "Restoring"} {
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("Open error = %q, want errors.Is ErrCorrupt", err)
+	}
+	for _, want := range []string{path, "Restoring"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Open error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestOpenRefusesATruncatedDatabase covers the case the check exists
+// for: an interrupted docker cp. SQLite validates the page header when
+// the connection opens, before quick_check ever runs, so a truncated
+// file fails at the ping — with the old message, that read
+// "sqlite.Open: ping: database disk image is malformed (11)" and gave
+// no path and no next step.
+func TestOpenRefusesATruncatedDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncated.db")
+	s := openAt(t, path)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if err := os.Truncate(path, info.Size()/2); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	_, err = sqlite.Open(path)
+	if err == nil {
+		t.Fatal("Open succeeded on a truncated database")
+	}
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("Open error = %q, want errors.Is ErrCorrupt", err)
+	}
+	for _, want := range []string{path, "Restoring"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Open error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestOpenRefusesANonDatabaseFile covers a restore landing the wrong
+// file entirely — the header check trips exactly as it does for a
+// truncated one.
+func TestOpenRefusesANonDatabaseFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-database.db")
+	if err := os.WriteFile(path, []byte("this is not a database"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := sqlite.Open(path)
+	if err == nil {
+		t.Fatal("Open succeeded on a non-database file")
+	}
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("Open error = %q, want errors.Is ErrCorrupt", err)
+	}
+	for _, want := range []string{path, "Restoring"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Open error = %q, want it to contain %q", err, want)
 		}
@@ -823,6 +905,7 @@ func openAt(t *testing.T, path string) *sqlite.Store {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
