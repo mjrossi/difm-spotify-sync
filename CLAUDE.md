@@ -258,11 +258,42 @@ rather than leaving it alone or clearing it outright: leaving it makes the
 command do nothing, and clearing it resets all of history, which is a much
 larger instruction than the operator gave.
 
+`sync_runs` is pruned after each clean pass, to `RunsRetention` (90 days),
+never below `KeepRuns` (`internal/syncer/loop.go`) — a floor asserted equal
+to `status.HealthScanLimit` by `TestKeepRunsIsTheHealthScanWindow`, so
+housekeeping can never delete a row the health rule is about to read. It is
+not a flag: a retention period is not a knob a self-hoster needs, and every
+flag is a README row and a Dockerfile line the config-drift test then
+polices. The prune runs in `engine.go` after the ledger transaction commits
+and before the `!passClean` return — `TestRunOnce_PruneRunsOnlyAfterTheLedgerCommits`
+pins the placement — guarded by `passClean && !dryRun` and `ctx.Err() ==
+nil`, so it never runs on a failed or dry pass, and a shutdown landing right
+after the commit skips it rather than logging a misleading warning. A prune
+failure is logged at Warn and never marks the pass incomplete: it is not a
+like reaching or missing durable state, so invariant 2 does not apply to it.
+`PruneRuns` also leaves every unfinished row alone regardless of age — one
+per hard crash, kept rather than guessed at.
+
 ## Testing
 
 - `pkg/match` is where matching quality is proven. Any weight or
   threshold change must keep both directions passing: wrong edits stay
   below the auto bar, and genuine matches stay above it.
+- `pkg/match/fuzz_test.go` fuzzes `Normalize`, `Parse` and `Score`: no
+  panic, `Normalize` is idempotent, and a score lies in `[0, 1]`. The
+  seed corpus runs as ordinary test cases in `just check`; `just fuzz`
+  spends real wall-clock time exploring beyond it and is not part of the
+  gate. A crasher it finds is committed under `pkg/match/testdata/fuzz/`
+  as a permanent seed alongside the fix, not deleted once green — that
+  corpus is what caught `artistSplit` treating a separator word as a
+  match anywhere in a name rather than only between two names, which
+  parsed `X Ambassadors` down to `ambassadors` and collapsed `X & Beta`
+  to `beta`, auto-matching a different artist's track at full confidence.
+  The fix — a separator word must have whitespace on both sides to
+  count as one — is pinned by named cases in `match_test.go`
+  (`TestParse`), not only by the fuzz property that found it; a property
+  general enough to catch the bug is not specific enough to prevent a
+  regression from reading as intentional.
 - The DI.fm client tests run against a recorded fixture
   (`pkg/difm/testdata/`), never the live API.
 - `just check` (lint + workflow lint + race tests + codegen, go.mod and
@@ -355,6 +386,21 @@ wrong:
   `DIFMSYNC_DB_PATH` pointed outside `/config` entirely. Four named paths
   rather than a recursive walk, so it stays cheap with a year of backups
   in `/config`.
+
+- **`sqlite.Open` refuses a database SQLite cannot read.** Two different
+  paths reach `ErrCorrupt`, and both matter because they catch different
+  damage: connecting classifies the driver's own codes 11
+  (`SQLITE_CORRUPT`) and 26 (`SQLITE_NOTADB`), which is where a truncated
+  or non-SQLite file fails — before any pragma runs, because SQLite
+  validates the page header at connect time — and `PRAGMA quick_check`,
+  on its own budget after that, catches in-place corruption that leaves
+  the header intact. Both return `ErrCorrupt` with the same one-line
+  restore pointer, so `cmd/difmsync` suppresses its usual
+  volume-ownership hint for it — a corrupt file is not a permissions
+  problem, and handing an operator two contradictory next steps for one
+  failure is worse than handing them one. The healthcheck opens the
+  database the same way, so a corrupt file fails `status --check` (and
+  `/healthz`) too, not just the next query that happens to touch it.
 
 - **The image declares its own `HEALTHCHECK`.** It lived only in
   `compose.yaml`, which left the `docker run` deployment the README leads

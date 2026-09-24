@@ -6,7 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `sqlite.Open` now refuses a database SQLite cannot read — a truncated
+  or non-SQLite file, or one that fails `PRAGMA quick_check` in place —
+  instead of surfacing as whatever query happens to touch it first. The
+  error names the file and points at the Restoring section of
+  `docs/deploy.md`. The healthcheck and `backup` open the database the
+  same way, so a corrupt file now fails `status --check`/`/healthz` and
+  `backup` before either does anything else.
+- `just fuzz` runs the matcher's fuzz targets (`Normalize`, `Parse`,
+  `Score`) for a bounded time; their seed corpus already runs as ordinary
+  test cases in `just check`.
+
 ### Changed
+
+- `sync_runs` is pruned after each clean pass: 90 days of history, never
+  fewer than the newest 20 rows (the health scan window). Not
+  configurable — see CLAUDE.md, Sync semantics.
 
 - `DIFMSYNC_STATUS_MAX_AGE`, left unset, now follows the interval — three
   times `DIFMSYNC_INTERVAL` — instead of a fixed 45m regardless of it, so

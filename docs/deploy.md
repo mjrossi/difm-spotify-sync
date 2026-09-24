@@ -488,6 +488,11 @@ The database is the only copy of the Spotify refresh token, and losing it
 means redoing the one interactive step in the whole system. It also holds
 the ledger, the review queue and the watermark.
 
+Run history is pruned to 90 days on every clean pass, so a snapshot
+carries at most that much of `sync_runs` — the ledger, review queue and
+watermark are what a restore actually depends on, and none of those are
+pruned.
+
 ```sh
 docker compose exec difmsync /difmsync backup --to=/config/backups/difmsync-$(date +%F).db
 ```
@@ -538,6 +543,14 @@ means writing it *over* the live database:
   someone who never saw the error.
 - **Write it world-readable.** The snapshot is `chmod 600`.
 
+It also refuses to run at all against a corrupt *source*: opening the live
+database first runs the same integrity check described under Restoring
+below, so a damaged database fails before `backup` writes anything —
+never as a snapshot that opens fine and only turns out empty or wrong
+later. That is the check doing its job, not a backup regression; if it
+happens, the source database is already damaged and the answer is your
+last good backup, not this command.
+
 ### Restoring
 
 ```sh
@@ -554,6 +567,24 @@ docker compose exec difmsync /difmsync status
 
 Stop first: copying over a database with a live writer attached is how
 you get a corrupt one.
+
+If the file you copied in is itself bad — a short or interrupted copy, or
+one that landed corrupt in place — the daemon refuses it at startup
+rather than crash-looping partway into a query. Both shapes are caught,
+by two different checks, but they end in the same message:
+
+```
+sqlite.Open: /config/difmsync.db: sqlite: database is unreadable (<reason>);
+restore from a backup — see the Restoring section of the deployment runbook,
+https://github.com/mjrossi/difm-spotify-sync/blob/main/docs/deploy.md#restoring
+```
+
+`<reason>` differs — a truncated or not-a-database file gives SQLite's own
+open error, an in-place-corrupt one gives its `quick_check` diagnosis —
+but the fix is the same either way: get a fresh copy of the backup, don't
+retry the file that's already in `/config`. The healthcheck opens the
+database the same way, so this also shows up as an unhealthy container,
+not only as a startup crash.
 
 `docker cp` chowns what it copies to the container's user, which is root,
 and `difmsync backup` wrote the snapshot `0600` — so the restored file
