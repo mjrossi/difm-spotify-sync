@@ -144,6 +144,14 @@ jobs:
       # fails at chown in a way `restart: unless-stopped` turns into a
       # silent loop, so the set is proven here rather than left to
       # inspection of the entrypoint.
+      #
+      # FOWNER is deliberately not in the set. It gates chmod/utimes/
+      # unlink on files the caller does not own; the entrypoint only
+      # stats and chowns, which the kernel gates on CAP_CHOWN alone. It
+      # was tested and found unnecessary — every scenario below, run a
+      # second time with FOWNER also dropped, still repaired ownership
+      # correctly — so if you are wondering whether to add it back, the
+      # answer already has an answer: no.
       - name: the dropped-capability set is enough to repair a foreign-owned volume
         run: |
           set -euxo pipefail
@@ -191,6 +199,57 @@ jobs:
           # `status --check` exits non-zero on a fresh volume regardless.
           if ! printf '%s' "$out" | grep -qiE 'chown|permission denied|operation not permitted'; then
             echo "::error::expected a chown failure without CAP_CHOWN; got the output above"
+            exit 1
+          fi
+
+      # A second, different control, not a repeat of the one above: CHOWN
+      # gates the chown(2) syscall itself, which fails with "Operation not
+      # permitted" (EPERM, a capability check). DAC_OVERRIDE gates
+      # `chown -R`'s recursion, which has to opendir/readdir a directory
+      # whose mode bits exclude us to enumerate it, and that fails with
+      # "Permission denied" (EACCES, a DAC check) before chown(2) is even
+      # reached. Trimming DAC_OVERRIDE as "surely CHOWN already covers
+      # this" is exactly the reasoning that made FOWNER look necessary,
+      # and nothing else here would catch it.
+      - name: and DAC_OVERRIDE is load-bearing — a second, different control
+        run: |
+          set -euxo pipefail
+          vol="$(mktemp -d)"
+          sudo chown 4242:4242 "$vol"
+          out=$(docker run --rm \
+            --cap-drop ALL \
+            --cap-add CHOWN \
+            --cap-add SETUID --cap-add SETGID \
+            -e PUID=1000 -e PGID=1000 \
+            -e DIFMSYNC_DB_PATH=/config/difmsync.db \
+            -v "$vol:/config" \
+            difm-spotify-sync:ci status --check 2>&1) || true
+          echo "$out"
+          if ! printf '%s' "$out" | grep -qi 'permission denied'; then
+            echo "::error::expected a permission-denied traversal failure without CAP_DAC_OVERRIDE; got the output above"
+            exit 1
+          fi
+
+      # SETUID/SETGID are not about repairing ownership at all — they are
+      # what lets su-exec itself drop from root to PUID/PGID. Proven
+      # against a volume that is already correctly owned, so the chown
+      # path never runs and cannot be what fails: only the privilege drop
+      # can be.
+      - name: and SETUID/SETGID are load-bearing — su-exec cannot drop without them
+        run: |
+          set -euxo pipefail
+          vol="$(mktemp -d)"
+          sudo chown 1000:1000 "$vol"
+          out=$(docker run --rm \
+            --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE \
+            -e PUID=1000 -e PGID=1000 \
+            -e DIFMSYNC_DB_PATH=/config/difmsync.db \
+            -v "$vol:/config" \
+            difm-spotify-sync:ci status --check 2>&1) || true
+          echo "$out"
+          if ! printf '%s' "$out" | grep -qi 'setgroups\|su-exec'; then
+            echo "::error::expected su-exec to fail dropping privileges without CAP_SETUID/CAP_SETGID; got the output above"
             exit 1
           fi
 
