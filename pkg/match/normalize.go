@@ -78,7 +78,13 @@ var (
 	// names: "X Ambassadors" became "ambassadors", so a collaboration
 	// like "X & Beta" collapsed to "beta" and auto-matched a different
 	// artist's track at 1.0 in an add-only sync.
-	artistSplit = regexp.MustCompile(`(?i)(?:\s*(?:,|&|\+)\s*|\s+(?:x|vs\.?|and|with)\s+)`)
+	//
+	// A comma may carry a following "and" with it — the Oxford comma in
+	// "A, B, and C". The punctuation branch consumes the space after the
+	// comma, so the word branch's leading \s+ can no longer match and
+	// "and c" survived as an artist. Only "and": absorbing "x" here would
+	// reopen the bug above for "A, X Ambassadors".
+	artistSplit = regexp.MustCompile(`(?i)(?:\s*,\s*(?:and\s+)?|\s*[&+]\s*|\s+(?:x|vs\.?|and|with)\s+)`)
 	nonAlnumRe  = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
 	spaceRe     = regexp.MustCompile(`\s+`)
 	// Apostrophes are elisions, not word boundaries — "D'Void" is one

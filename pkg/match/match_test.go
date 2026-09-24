@@ -196,6 +196,29 @@ func TestParse(t *testing.T) {
 				Title:   "rain",
 			},
 		},
+		{
+			// Pins the Oxford comma. Requiring whitespace before a word
+			// separator broke it: the comma branch eats the space, so
+			// "and" had none in front and "and c" parsed as an artist.
+			name:   "an Oxford comma before and still splits cleanly",
+			artist: "Alpha, Beta, and Gamma",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"alpha", "beta", "gamma"},
+				Title:   "rain",
+			},
+		},
+		{
+			// The comma absorbs "and", never "x": a name that starts with
+			// a separator word must survive coming after a comma too.
+			name:   "a separator word leading a name after a comma is kept whole",
+			artist: "Alpha, X Ambassadors",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"alpha", "x ambassadors"},
+				Title:   "rain",
+			},
+		},
 	}
 
 	for _, tc := range tests {
