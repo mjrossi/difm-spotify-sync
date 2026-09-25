@@ -31,8 +31,11 @@ type syncRunner struct {
 	// spotify.ErrNoCredentials when there is no consent server to run.
 	await func(ctx context.Context, account sqlite.Account) error
 	// loop builds an engine for the account and runs it until ctx is
-	// canceled or the grant is revoked.
-	loop func(ctx context.Context, account sqlite.Account) error
+	// canceled or the grant is revoked. It also returns the refresh token
+	// the engine held when it stopped: the one it was built from, or the
+	// last one Spotify rotated it to. That, not account, is the token a
+	// revocation was a verdict on.
+	loop func(ctx context.Context, account sqlite.Account) (held string, err error)
 }
 
 func (r syncRunner) run(ctx context.Context) error {
@@ -77,7 +80,7 @@ func (r syncRunner) run(ctx context.Context) error {
 			}
 		}
 
-		err = r.loop(ctx, account)
+		held, err := r.loop(ctx, account)
 		if !errors.Is(err, spotify.ErrGrantRevoked) {
 			return err
 		}
@@ -86,25 +89,37 @@ func (r syncRunner) run(ctx context.Context) error {
 		// literal, and so `difmsync status` reports "awaiting consent"
 		// rather than a stale "authorized". awaitConsent polls the
 		// store, so `auth --manual` in a sidecar remains a way out.
-		r.log.Error("Spotify revoked the refresh token; consent is required again",
-			"err", err)
-		// Unconditional, not a compare-and-clear keyed on this account
-		// copy. A token written by `auth --manual` in a sidecar between
-		// Spotify revoking the grant and this goroutine noticing gets
-		// cleared too, because the engine that hit ErrGrantRevoked was
-		// still holding the old one — that copy has no way to tell a
-		// rotation apart from the revocation it already observed. A CAS
-		// would be wrong here: after a rotation the copy is stale, the
-		// compare matches nothing, the dead-per-this-copy token survives
-		// uncleared, and consent is never re-entered. One extra consent
-		// round trip is cheaper than that.
+		//
+		// Compare-and-clear on held, not an unconditional clear. The
+		// engine keeps its token in memory for its whole life, and
+		// `review --approve`, a one-shot `sync` or `auth --manual` may
+		// store a newer one meanwhile — by rotating the same grant, or
+		// by a fresh consent. Spotify rejecting the engine's copy says
+		// nothing about that one, and clearing it would demand a
+		// re-consent for a grant that was never revoked. held is the
+		// engine's own current token, rotations included, so a match
+		// means the stored token is the one Spotify just rejected.
 		//
 		// WithoutCancel, as FinishRun's close does: this is a tiny local
 		// write that must land even when shutdown arrives mid-step,
 		// otherwise the next boot starts with the same dead token and
 		// does a jittered failing pass before ever reaching consent.
-		if err := r.store.SetSpotifyRefreshToken(context.WithoutCancel(ctx), account.ID, ""); err != nil {
-			return fmt.Errorf("clear revoked refresh token: %w", err)
+		cleared, cerr := r.store.ClearSpotifyRefreshTokenIf(context.WithoutCancel(ctx), account.ID, held)
+		if cerr != nil {
+			return fmt.Errorf("clear revoked refresh token: %w", cerr)
 		}
+		if !cleared {
+			// Something replaced the token after this engine read it.
+			// Go round again with the stored one: a new engine probes
+			// the token endpoint before its first pass, so if that
+			// token is dead too, the next revocation is a verdict on
+			// it and clears it. Each retry needs another write to have
+			// landed, so this cannot spin.
+			r.log.Warn("Spotify rejected a refresh token that has since been replaced; "+
+				"retrying with the stored one", "err", err)
+			continue
+		}
+		r.log.Error("Spotify revoked the refresh token; consent is required again",
+			"err", err)
 	}
 }

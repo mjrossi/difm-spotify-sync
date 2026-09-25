@@ -92,6 +92,23 @@ func (s *Store) SetSpotifyRefreshToken(ctx context.Context, accountID int64, tok
 	}))
 }
 
+// ClearSpotifyRefreshTokenIf clears the stored token only while it is
+// still rejected, and reports whether it did. It is the one way the daemon
+// deletes a credential, after Spotify answered invalid_grant to the
+// token the engine was holding. That token can be stale: `review
+// --approve`, a one-shot `sync` or `auth --manual` in another process may
+// have stored a newer one since, and clearing that on the strength of a
+// rejection of the old one would force a re-consent for a grant that was
+// never revoked. The compare happens inside the UPDATE, so nothing can
+// land between it and the clear.
+func (s *Store) ClearSpotifyRefreshTokenIf(ctx context.Context, accountID int64, rejected string) (bool, error) {
+	n, err := s.q.ClearSpotifyRefreshTokenIf(ctx, sqlitegen.ClearSpotifyRefreshTokenIfParams{
+		ID:                  accountID,
+		SpotifyRefreshToken: rejected,
+	})
+	return n > 0, opErr("ClearSpotifyRefreshTokenIf", err)
+}
+
 // HasSpotifyRefreshToken reports whether consent has been stored for the
 // account, without reading the token itself.
 //

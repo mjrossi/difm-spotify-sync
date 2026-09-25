@@ -197,7 +197,11 @@ attempted, so a pass or two may first fail with a plain 401), or
 immediately at its next restart if the token was already dead. It then
 logs `Spotify revoked the refresh token; consent is
 required again`, clears the stored token, and brings the listener back up
-with a new URL and a new nonce. Click it as you did the first time;
+with a new URL and a new nonce. (If something else stored a newer token
+meanwhile — `review --approve` renewing the grant, or `auth --manual` —
+the daemon logs `Spotify rejected a refresh token that has since been
+replaced` and tries that one first; it only asks for consent once the
+stored token has itself been rejected.) Click it as you did the first time;
 nothing needs restarting. `auth --manual` works here too, exactly as on
 first run.
 

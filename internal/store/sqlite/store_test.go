@@ -130,6 +130,42 @@ func TestEnsureAccountUpsertsAndPreservesToken(t *testing.T) {
 	}
 }
 
+// The clear is a compare-and-clear: a token some other process stored
+// after the rejected one must survive, because nothing has rejected it.
+func TestClearSpotifyRefreshTokenIfClearsOnlyTheRejectedToken(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	acct, err := s.EnsureAccount(ctx, "default", "111", "playlistA")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	if err := s.SetSpotifyRefreshToken(ctx, acct.ID, "newer"); err != nil {
+		t.Fatalf("SetSpotifyRefreshToken: %v", err)
+	}
+
+	cleared, err := s.ClearSpotifyRefreshTokenIf(ctx, acct.ID, "older")
+	if err != nil {
+		t.Fatalf("ClearSpotifyRefreshTokenIf(older): %v", err)
+	}
+	if cleared {
+		t.Error("cleared = true for a token that is no longer stored")
+	}
+	if got, _ := s.GetAccount(ctx, "default"); got.SpotifyRefreshToken != "newer" {
+		t.Errorf("token = %q after a stale clear, want newer untouched", got.SpotifyRefreshToken)
+	}
+
+	cleared, err = s.ClearSpotifyRefreshTokenIf(ctx, acct.ID, "newer")
+	if err != nil {
+		t.Fatalf("ClearSpotifyRefreshTokenIf(newer): %v", err)
+	}
+	if !cleared {
+		t.Error("cleared = false for the stored token")
+	}
+	if got, _ := s.GetAccount(ctx, "default"); got.SpotifyRefreshToken != "" {
+		t.Errorf("token = %q, want cleared", got.SpotifyRefreshToken)
+	}
+}
+
 func TestWatermarkRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

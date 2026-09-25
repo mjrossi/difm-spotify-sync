@@ -9,6 +9,28 @@ import (
 	"context"
 )
 
+const clearSpotifyRefreshTokenIf = `-- name: ClearSpotifyRefreshTokenIf :execrows
+UPDATE accounts SET spotify_refresh_token = ''
+WHERE id = ? AND spotify_refresh_token = ?
+`
+
+type ClearSpotifyRefreshTokenIfParams struct {
+	ID                  int64
+	SpotifyRefreshToken string
+}
+
+// Clears the token only if it is still the one the caller names. The
+// daemon holds its token in memory for a whole engine lifetime, and any
+// other process may store a newer one meanwhile; an unconditional clear
+// would erase that live token on the strength of a rejection of the old.
+func (q *Queries) ClearSpotifyRefreshTokenIf(ctx context.Context, arg ClearSpotifyRefreshTokenIfParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, clearSpotifyRefreshTokenIf, arg.ID, arg.SpotifyRefreshToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const clearWatermark = `-- name: ClearWatermark :exec
 UPDATE accounts SET watermark_liked_at = '' WHERE id = ?
 `

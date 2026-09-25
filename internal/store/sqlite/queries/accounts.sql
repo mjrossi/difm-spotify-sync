@@ -16,6 +16,14 @@ RETURNING id, label, difm_member_id, spotify_playlist_id,
 -- name: SetSpotifyRefreshToken :exec
 UPDATE accounts SET spotify_refresh_token = ? WHERE id = ?;
 
+-- Clears the token only if it is still the one the caller names. The
+-- daemon holds its token in memory for a whole engine lifetime, and any
+-- other process may store a newer one meanwhile; an unconditional clear
+-- would erase that live token on the strength of a rejection of the old.
+-- name: ClearSpotifyRefreshTokenIf :execrows
+UPDATE accounts SET spotify_refresh_token = ''
+WHERE id = ? AND spotify_refresh_token = ?;
+
 -- name: SetWatermark :exec
 UPDATE accounts SET watermark_liked_at = ? WHERE id = ?;
 

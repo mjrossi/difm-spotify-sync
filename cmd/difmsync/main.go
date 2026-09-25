@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -499,14 +500,24 @@ func syncCommand() *cli.Command {
 				// Spotify client can exist at all. Both callers below reach it
 				// with a refresh token already in hand, so nothing downstream
 				// has to reason about a half-authenticated engine.
-				newEngine := func(ctx context.Context, account sqlite.Account) (*syncer.Engine, error) {
+				//
+				// rotated, when non-nil, is told each rotated refresh token
+				// once it is persisted, so the caller knows which token the
+				// engine is presenting; see syncRunner.loop.
+				newEngine := func(ctx context.Context, account sqlite.Account, rotated func(string)) (*syncer.Engine, error) {
 					// Persist a rotated refresh token as Spotify issues it. Held
 					// only in memory, a rotation survives until the next restart
 					// and then leaves the daemon presenting a dead token — with
 					// the interactive consent step as the only way back.
 					sp, err := auth.Client(ctx, account.SpotifyRefreshToken, func(tok string) error {
 						log.Info("spotify rotated the refresh token; persisting")
-						return store.SetSpotifyRefreshToken(ctx, account.ID, tok)
+						if err := store.SetSpotifyRefreshToken(ctx, account.ID, tok); err != nil {
+							return err
+						}
+						if rotated != nil {
+							rotated(tok)
+						}
+						return nil
 					})
 					if err != nil {
 						return nil, err
@@ -560,7 +571,7 @@ func syncCommand() *cli.Command {
 							"is served only by the sync loop (use `difmsync auth` for a one-shot)",
 							"addr", c.String("auth-http-addr"))
 					}
-					engine, err := newEngine(ctx, account)
+					engine, err := newEngine(ctx, account, nil)
 					if err != nil {
 						return err
 					}
@@ -597,12 +608,28 @@ func syncCommand() *cli.Command {
 						}
 						return awaitConsent(ctx, authAddr, c.String("spotify-redirect-url"), flow, log)
 					},
-					loop: func(ctx context.Context, account sqlite.Account) error {
-						engine, err := newEngine(ctx, account)
-						if err != nil {
-							return err
+					loop: func(ctx context.Context, account sqlite.Account) (string, error) {
+						// The token this engine presents: the stored one it
+						// is built from, until Spotify rotates it. Guarded
+						// because the token source calls back from whichever
+						// goroutine needed a fresh access token.
+						var mu sync.Mutex
+						held := account.SpotifyRefreshToken
+						heldNow := func() string {
+							mu.Lock()
+							defer mu.Unlock()
+							return held
 						}
-						return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
+						engine, err := newEngine(ctx, account, func(tok string) {
+							mu.Lock()
+							defer mu.Unlock()
+							held = tok
+						})
+						if err != nil {
+							return heldNow(), err
+						}
+						err = engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
+						return heldNow(), err
 					},
 				}
 				loop := runner.run

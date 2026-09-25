@@ -519,6 +519,21 @@ rather than a convenience.
   the same wait. The daemon heals the way it bootstraps, through the same
   `consentFlow`, with no new code path. Clearing first is what keeps this
   sentence literal.
+
+  The clear is a **compare-and-clear on the token the engine held**
+  (`ClearSpotifyRefreshTokenIf`), not an unconditional one. The engine
+  keeps its token in memory for its whole life, while `review
+  --approve`, a one-shot `sync` or `auth --manual` in another process
+  may store a newer one; a rejection of the engine's copy is no verdict
+  on that. "Held" means the engine's *current* token — the one it was
+  built from, updated on every rotation it persists — because comparing
+  against the built-from copy instead would never match after a
+  rotation and leave a genuinely revoked token uncleared. A mismatch
+  sends the runner round again with the stored token, whose engine
+  probes the token endpoint at once; if that one is dead too, the next
+  rejection clears it. `TestSyncRunnerRetriesATokenReplacedWhileTheEngineRan`
+  and `TestSyncRunnerClearsATokenTheEngineRotatedItself` pin the two
+  directions.
 - Starting a flow requires a **nonce** generated when the wait begins
   and emitted once, to the log — one per consent wait, valid until that
   consent completes, rather than one per attempt. A daemon whose grant is

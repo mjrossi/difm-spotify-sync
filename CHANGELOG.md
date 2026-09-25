@@ -62,7 +62,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A refresh token that Spotify revokes mid-life no longer needs a human
   to run `difmsync auth` and restart the container. The daemon clears the
   dead token, brings the consent server back up with a fresh URL and
-  nonce, and resumes once you click it.
+  nonce, and resumes once you click it. It clears only the token Spotify
+  actually rejected: one stored by another process in the meantime
+  (`review --approve`, `auth --manual`) is tried first, not erased.
 - A 429 from either API now delays the next pass by the `Retry-After`
   the server sent (clamped to 1m–24h) instead of a full interval.
 - A rejected DI.fm API key gets its own log line and its own `/healthz`

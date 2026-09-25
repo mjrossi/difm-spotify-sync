@@ -45,13 +45,14 @@ func newRunnerFixture(t *testing.T, loopResults []error) *runnerFixture {
 			// consentFlow.Complete writes one.
 			return store.SetSpotifyRefreshToken(ctx, account.ID, fmt.Sprintf("token-%d", f.awaitCalls))
 		},
-		loop: func(_ context.Context, account sqlite.Account) error {
+		loop: func(_ context.Context, account sqlite.Account) (string, error) {
 			f.loopCalls++
 			f.tokenSeenByLoop = append(f.tokenSeenByLoop, account.SpotifyRefreshToken)
 			if f.loopCalls > len(loopResults) {
 				t.Fatalf("loop called %d times, only %d results scripted", f.loopCalls, len(loopResults))
 			}
-			return loopResults[f.loopCalls-1]
+			// An engine that never rotated holds what it was built from.
+			return account.SpotifyRefreshToken, loopResults[f.loopCalls-1]
 		},
 	}
 	return f
@@ -169,10 +170,10 @@ func TestSyncRunnerClearsTheTokenEvenWhenCanceledMidStep(t *testing.T) {
 	if err := f.store.SetSpotifyRefreshToken(context.Background(), 1, "original"); err != nil {
 		t.Fatalf("seed token: %v", err)
 	}
-	f.runner.loop = func(context.Context, sqlite.Account) error {
+	f.runner.loop = func(_ context.Context, account sqlite.Account) (string, error) {
 		f.loopCalls++
 		cancel()
-		return errRevoked
+		return account.SpotifyRefreshToken, errRevoked
 	}
 
 	if err := f.runner.run(ctx); err != nil {
@@ -180,5 +181,77 @@ func TestSyncRunnerClearsTheTokenEvenWhenCanceledMidStep(t *testing.T) {
 	}
 	if got := storedToken(t, f.store); got != "" {
 		t.Errorf("stored token = %q, want cleared even though ctx was canceled first", got)
+	}
+}
+
+// The engine holds its token in memory; another process — `review
+// --approve` rotating the grant, `auth --manual` re-consenting — may
+// store a newer one meanwhile. Spotify rejecting the engine's copy is no
+// verdict on that one, so it must survive and be tried, not cleared.
+func TestSyncRunnerRetriesATokenReplacedWhileTheEngineRan(t *testing.T) {
+	ctx := context.Background()
+	f := newRunnerFixture(t, nil)
+	if err := f.store.SetSpotifyRefreshToken(ctx, 1, "original"); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	f.runner.loop = func(ctx context.Context, account sqlite.Account) (string, error) {
+		f.loopCalls++
+		f.tokenSeenByLoop = append(f.tokenSeenByLoop, account.SpotifyRefreshToken)
+		if f.loopCalls == 1 {
+			// Another process stores a fresh token mid-run, then
+			// Spotify rejects the one this engine still holds.
+			if err := f.store.SetSpotifyRefreshToken(ctx, account.ID, "replaced"); err != nil {
+				t.Fatalf("replace token: %v", err)
+			}
+			return account.SpotifyRefreshToken, errRevoked
+		}
+		return account.SpotifyRefreshToken, nil
+	}
+
+	if err := f.runner.run(ctx); err != nil {
+		t.Fatalf("run returned %v, want nil", err)
+	}
+	if f.awaitCalls != 0 {
+		t.Errorf("await ran %d times, want 0: a live token was stored all along", f.awaitCalls)
+	}
+	want := []string{"original", "replaced"}
+	if diff := cmp.Diff(want, f.tokenSeenByLoop); diff != "" {
+		t.Errorf("tokens seen by loop (-want +got):\n%s", diff)
+	}
+	if got := storedToken(t, f.store); got != "replaced" {
+		t.Errorf("stored token = %q, want the replacement untouched", got)
+	}
+}
+
+// The converse: a token the engine rotated to itself is the one it
+// holds, so a rejection of it is a real revocation and clears it — the
+// compare must key on the engine's current token, not the one it was
+// built from, or a revoked grant after any rotation is never cleared.
+func TestSyncRunnerClearsATokenTheEngineRotatedItself(t *testing.T) {
+	ctx := context.Background()
+	f := newRunnerFixture(t, nil)
+	if err := f.store.SetSpotifyRefreshToken(ctx, 1, "original"); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	f.runner.loop = func(ctx context.Context, account sqlite.Account) (string, error) {
+		f.loopCalls++
+		if f.loopCalls == 1 {
+			// The engine's own rotation, persisted as newEngine does.
+			if err := f.store.SetSpotifyRefreshToken(ctx, account.ID, "rotated"); err != nil {
+				t.Fatalf("rotate token: %v", err)
+			}
+			return "rotated", errRevoked
+		}
+		return account.SpotifyRefreshToken, nil
+	}
+
+	if err := f.runner.run(ctx); err != nil {
+		t.Fatalf("run returned %v, want nil", err)
+	}
+	if f.awaitCalls != 1 {
+		t.Fatalf("await ran %d times, want 1", f.awaitCalls)
+	}
+	if f.tokenSeenByAwait[0] != "" {
+		t.Errorf("await found token %q stored, want the rotated token cleared", f.tokenSeenByAwait[0])
 	}
 }
