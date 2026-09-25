@@ -945,3 +945,24 @@ func TestBuildEngineWiresBackups(t *testing.T) {
 		})
 	}
 }
+
+// The image logs JSON, and slog's JSON handler writes a time.Duration as
+// integer nanoseconds: "interval":7200000000000 for a 2h interval. Every
+// duration the daemon logs must read the way the operator configured it.
+func TestJSONLogsWriteDurationsReadably(t *testing.T) {
+	var buf bytes.Buffer
+	log := newLoggerTo(&buf, "json", "info")
+	log.Info("starting sync loop", "interval", 2*time.Hour, "first_run_in", 19*time.Minute+14*time.Second)
+	log.WithGroup("retry").Info("rate limited", "after", 90*time.Second)
+
+	out := buf.String()
+	for _, want := range []string{
+		`"interval":"2h0m0s"`,
+		`"first_run_in":"19m14s"`,
+		`"retry":{"after":"1m30s"}`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output lacks %s:\n%s", want, out)
+		}
+	}
+}

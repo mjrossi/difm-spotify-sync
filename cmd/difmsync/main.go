@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -211,21 +212,27 @@ func newApp() *cli.Command {
 }
 
 func newLogger(c *cli.Command) *slog.Logger {
+	return newLoggerTo(os.Stderr, c.String("log-format"), c.String("log-level"))
+}
+
+// newLoggerTo is newLogger with its inputs spelled out, so a test can
+// read what the handler actually writes.
+func newLoggerTo(w io.Writer, format, levelName string) *slog.Logger {
 	var (
 		level slog.Level
 		bad   string
 	)
-	if err := level.UnmarshalText([]byte(c.String("log-level"))); err != nil {
-		bad = c.String("log-level")
+	if err := level.UnmarshalText([]byte(levelName)); err != nil {
+		bad = levelName
 		level = slog.LevelInfo
 	}
-	opts := &slog.HandlerOptions{Level: level}
+	opts := &slog.HandlerOptions{Level: level, ReplaceAttr: readableDuration}
 
 	var log *slog.Logger
-	if strings.EqualFold(c.String("log-format"), "text") {
-		log = slog.New(slog.NewTextHandler(os.Stderr, opts))
+	if strings.EqualFold(format, "text") {
+		log = slog.New(slog.NewTextHandler(w, opts))
 	} else {
-		log = slog.New(slog.NewJSONHandler(os.Stderr, opts))
+		log = slog.New(slog.NewJSONHandler(w, opts))
 	}
 	if bad != "" {
 		// A typo'd DIFMSYNC_LOG_LEVEL that silently becomes "info" is the
@@ -233,6 +240,19 @@ func newLogger(c *cli.Command) *slog.Logger {
 		log.Warn("unrecognized log level; using info", "requested", bad)
 	}
 	return log
+}
+
+// readableDuration writes a time.Duration as Go's own "2h0m0s" rather
+// than the integer nanoseconds slog's JSON handler emits by default. The
+// JSON format is what the image logs in, and an operator reading
+// "interval":7200000000000 for the first time has to stop and count
+// digits. The text handler already formats durations this way, so this
+// only changes JSON output.
+func readableDuration(_ []string, a slog.Attr) slog.Attr {
+	if a.Value.Kind() == slog.KindDuration {
+		a.Value = slog.StringValue(a.Value.Duration().String())
+	}
+	return a
 }
 
 // mountDiagnostic turns SQLite's "unable to open database file (14)" —
@@ -939,6 +959,7 @@ func printStatus(rep status.Report, backupDir string) {
 		fmt.Printf("health:    NOT OK — %s\n", rep.Reason)
 	}
 	fmt.Printf("version:   %s\n", rep.Version)
+	fmt.Printf("schema:    %d\n", rep.SchemaVersion)
 	switch {
 	case rep.LastSuccessAt != "":
 		fmt.Printf("last ok:   %s\n", rep.LastSuccessAt)

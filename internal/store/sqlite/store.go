@@ -181,6 +181,30 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// SchemaVersion reports the newest migration applied to this database, as
+// goose's own version table records it.
+//
+// A direct query rather than goose's Provider.GetDBVersion, because that
+// is not a read: it runs ensureVersionTable first, creating the table on a
+// database that lacks one. The status endpoints call this unauthenticated,
+// against whatever database they are handed — restored or hand-edited
+// included — so it must not be able to write. The query is the one
+// goose's own SQLite store runs for the same answer. Not in queries/:
+// the table is goose's, outside the schema sqlc generates from.
+//
+// A database goose has never touched has no table, and this returns the
+// error rather than reporting version 0.
+func (s *Store) SchemaVersion(ctx context.Context) (int64, error) {
+	var v sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, "SELECT MAX(version_id) FROM goose_db_version").Scan(&v); err != nil {
+		return 0, fmt.Errorf("sqlite.SchemaVersion: %w", err)
+	}
+	if !v.Valid {
+		return 0, errors.New("sqlite.SchemaVersion: goose_db_version is empty")
+	}
+	return v.Int64, nil
+}
+
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
