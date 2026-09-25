@@ -365,7 +365,10 @@ docker compose up -d
 ```
 
 Migrations are embedded and applied on every boot, so there is no
-separate migration step. The build needs BuildKit — the Dockerfile uses
+separate migration step. To confirm which one the database is at
+afterwards, `docker compose exec difmsync /difmsync status` prints it as
+`schema:`, and `/status.json` carries it as `schema_version` — the
+number goose recorded in the database, not the one the binary ships. The build needs BuildKit — the Dockerfile uses
 `RUN --mount=type=cache` and `TARGETARCH`, so a host with
 `DOCKER_BUILDKIT=0` fails immediately rather than subtly.
 
@@ -446,8 +449,10 @@ the same verdict `/healthz` gives; `version` names the build that
 answered; `last_success_at` is the finished time of the pass the health
 rule accepted, absent once that pass has fallen out of the last 20
 `sync_runs` rows; `consecutive_failures` counts errored passes since
-then, capped at 20 (`20` means "at least 20"); and `runs[].error_kind`
-names why each recent pass failed, never the error text.
+then, capped at 20 (`20` means "at least 20"); `last_backup_at` is the
+newest daily snapshot's date; `schema_version` is the newest migration
+applied to the database; and `runs[].error_kind` names why each recent
+pass failed, never the error text.
 
 The container healthcheck runs `/healthcheck.sh`, which is `status
 --check` with a privilege drop in front of it. It is deliberately not a

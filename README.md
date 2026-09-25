@@ -273,7 +273,7 @@ serves the same verdict over HTTP, for a dashboard:
 | Endpoint | Answer |
 |---|---|
 | `GET /healthz` | `200 ok`, or `503` and the reason |
-| `GET /status.json` | the full report; always `200`, with `"healthy": false` when it is not — `version`, `last_success_at` and `consecutive_failures` included |
+| `GET /status.json` | the full report; always `200`, with `"healthy": false` when it is not — `version`, `schema_version`, `last_success_at`, `consecutive_failures`, `last_backup_at` and each run's `error_kind` included |
 
 Both are **read-only and carry no secrets**, which is what makes them safe to
 expose on a LAN unauthenticated. Anything that writes — approving a queued

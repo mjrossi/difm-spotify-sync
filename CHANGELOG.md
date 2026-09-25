@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `difmsync status` prints `schema:` and `/status.json` carries
+  `schema_version`: the newest migration applied to the database, as
+  goose recorded it. Confirming a migration ran no longer needs `sqlite3`
+  and a copy of the database.
+
 ## [1.1.0] - 2026-09-25
 
 ### Added

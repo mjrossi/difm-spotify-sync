@@ -610,6 +610,14 @@ Two consequences for code:
   `consecutive_failures` walks the same fixed window, capped at
   `HealthScanLimit` (20 means "at least 20").
 
+  `schema_version` is `Store.SchemaVersion`: a direct `SELECT
+  MAX(version_id)` on goose's table, deliberately not goose's
+  `Provider.GetDBVersion`, which runs `ensureVersionTable` first and so
+  creates the table on a database that lacks one. The endpoints answer
+  from whatever database they are handed, so the read path must not be
+  able to write; `TestSchemaVersionDoesNotCreateTheVersionTable` caught
+  exactly that when the Provider was tried.
+
   What the endpoints *may* say is the kind: `describe()` switches on
   `sync_runs.error_kind` first. A kind is an enum the engine chose from
   its own sentinels, so naming it is not interpolation. A new reason

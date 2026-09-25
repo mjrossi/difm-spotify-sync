@@ -118,6 +118,11 @@ type Report struct {
 	// backup directory is configured, it has no snapshots yet, or it
 	// could not be read; none of those states affect Healthy.
 	LastBackupAt string `json:"last_backup_at,omitempty"`
+	// SchemaVersion is the newest migration applied to the database this
+	// report was read from — the number goose recorded, not the one this
+	// binary embeds. Every entry point migrates on open, so the two only
+	// differ when something is wrong, and this is where that shows.
+	SchemaVersion int64 `json:"schema_version"`
 }
 
 // Run is one recorded pass as the operator surface reports it.
@@ -201,7 +206,7 @@ func Build(
 		runLimit = DefaultRunLimit
 	}
 
-	account, counts, runs, err := read(ctx, store, label, max(runLimit, HealthScanLimit))
+	account, counts, runs, schema, err := read(ctx, store, label, max(runLimit, HealthScanLimit))
 	if err != nil {
 		return Report{}, err
 	}
@@ -232,7 +237,7 @@ func Build(
 		runs = runs[:runLimit]
 	}
 	return assemble(account, counts, runs, authorized, healthy, reason, version,
-		accepted, failures, lastBackupAt(backupDir)), nil
+		accepted, failures, lastBackupAt(backupDir), schema), nil
 }
 
 // lastBackupAt reports the newest scheduled snapshot's date, or "" when
@@ -283,32 +288,37 @@ type counts struct {
 // three decisions it makes rather than as five sequential store calls with
 // the decisions buried among them.
 func read(ctx context.Context, store *sqlite.Store, label string, scan int) (
-	sqlite.Account, counts, []sqlite.SyncRun, error,
+	sqlite.Account, counts, []sqlite.SyncRun, int64, error,
 ) {
 	account, err := store.GetAccount(ctx, label)
 	if err != nil {
-		return sqlite.Account{}, counts{}, nil, fmt.Errorf(
+		return sqlite.Account{}, counts{}, nil, 0, fmt.Errorf(
 			"no account %q yet — run `difmsync auth` first: %w", label, err)
 	}
 
 	var c counts
 	if c.synced, err = store.CountSynced(ctx, account.ID); err != nil {
-		return sqlite.Account{}, counts{}, nil, err
+		return sqlite.Account{}, counts{}, nil, 0, err
 	}
 	// COUNT(*), not len() of a capped listing: a queue past the cap
 	// previously reported the cap as its size.
 	if c.pending, err = store.CountReview(ctx, account.ID, "pending"); err != nil {
-		return sqlite.Account{}, counts{}, nil, err
+		return sqlite.Account{}, counts{}, nil, 0, err
 	}
 	if c.actionable, err = store.CountActionableReview(ctx, account.ID); err != nil {
-		return sqlite.Account{}, counts{}, nil, err
+		return sqlite.Account{}, counts{}, nil, 0, err
 	}
 
 	runs, err := store.ListRuns(ctx, account.ID, scan)
 	if err != nil {
-		return sqlite.Account{}, counts{}, nil, err
+		return sqlite.Account{}, counts{}, nil, 0, err
 	}
-	return account, c, runs, nil
+
+	schema, err := store.SchemaVersion(ctx)
+	if err != nil {
+		return sqlite.Account{}, counts{}, nil, 0, err
+	}
+	return account, c, runs, schema, nil
 }
 
 // assemble builds the report field by field from typed values.
@@ -329,6 +339,7 @@ func assemble(
 	accepted *sqlite.SyncRun,
 	failures int,
 	lastBackupAt string,
+	schema int64,
 ) Report {
 	// make, not a nil slice: an account with no runs should encode as
 	// "runs": [] rather than "runs": null.
@@ -350,6 +361,7 @@ func assemble(
 		Version:             version,
 		ConsecutiveFailures: failures,
 		LastBackupAt:        lastBackupAt,
+		SchemaVersion:       schema,
 	}
 	if accepted != nil {
 		r.LastSuccessAt = accepted.FinishedAt

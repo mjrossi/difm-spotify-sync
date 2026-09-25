@@ -939,6 +939,7 @@ func printStatus(rep status.Report, backupDir string) {
 		fmt.Printf("health:    NOT OK — %s\n", rep.Reason)
 	}
 	fmt.Printf("version:   %s\n", rep.Version)
+	fmt.Printf("schema:    %d\n", rep.SchemaVersion)
 	switch {
 	case rep.LastSuccessAt != "":
 		fmt.Printf("last ok:   %s\n", rep.LastSuccessAt)

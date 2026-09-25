@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,69 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	// Migrate runs on every boot; a second call must be a no-op.
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatalf("second Migrate: %v", err)
+	}
+}
+
+// newestMigration is the highest version among the embedded migration
+// files, read from their names so a new migration does not need this
+// test edited to stay true.
+func newestMigration(t *testing.T) int64 {
+	t.Helper()
+	names, err := fs.Glob(migrations.FS, "*.sql")
+	if err != nil || len(names) == 0 {
+		t.Fatalf("glob migrations: %v (%d files)", err, len(names))
+	}
+	var newest int64
+	for _, name := range names {
+		prefix, _, _ := strings.Cut(name, "_")
+		v, err := strconv.ParseInt(prefix, 10, 64)
+		if err != nil {
+			t.Fatalf("migration %q has no numeric prefix: %v", name, err)
+		}
+		newest = max(newest, v)
+	}
+	return newest
+}
+
+func TestSchemaVersionIsTheNewestMigration(t *testing.T) {
+	s := newTestStore(t)
+	got, err := s.SchemaVersion(context.Background())
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if want := newestMigration(t); got != want {
+		t.Errorf("SchemaVersion = %d, want %d", got, want)
+	}
+}
+
+// SchemaVersion is served by unauthenticated endpoints, so it must only
+// read: asked about a database goose has never touched, it errors rather
+// than creating its version table.
+func TestSchemaVersionDoesNotCreateTheVersionTable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "unmigrated.db")
+	s, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if _, err := s.SchemaVersion(ctx); err == nil {
+		t.Error("SchemaVersion on an unmigrated database = nil error, want one")
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'goose_db_version'").Scan(&n); err != nil {
+		t.Fatalf("query sqlite_master: %v", err)
+	}
+	if n != 0 {
+		t.Error("SchemaVersion created goose_db_version; it must only read")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -228,6 +229,13 @@ func TestReportCarriesNoSecrets(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"consecutive_failures":0`) {
 		t.Errorf("body does not carry consecutive_failures: %s", body)
+	}
+	schema, err := s.SchemaVersion(context.Background())
+	if err != nil || schema == 0 {
+		t.Fatalf("SchemaVersion = %d, %v; want a migrated store", schema, err)
+	}
+	if want := fmt.Sprintf(`"schema_version":%d`, schema); !strings.Contains(string(body), want) {
+		t.Errorf("body does not carry %s: %s", want, body)
 	}
 }
 
@@ -669,6 +677,11 @@ func TestReportCarriesSuccessTimeAndFailureCount(t *testing.T) {
 	}
 	if rep.Version != "v9.9.9-test" {
 		t.Errorf("Version = %q", rep.Version)
+	}
+	// What the database says, not what the binary embeds — the store's
+	// own test pins that the two agree after a migrate.
+	if want, err := s.SchemaVersion(ctx); err != nil || rep.SchemaVersion != want || want == 0 {
+		t.Errorf("SchemaVersion = %d, want %d (err %v)", rep.SchemaVersion, want, err)
 	}
 	if rep.ConsecutiveFailures != 2 {
 		t.Errorf("ConsecutiveFailures = %d, want 2 (dry run and in-flight row excluded)", rep.ConsecutiveFailures)
