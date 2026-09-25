@@ -16,9 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/urfave/cli/v3"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
+	"github.com/mjrossi/difm-spotify-sync/internal/syncer"
 )
 
 // The CLI layer had no tests, and three of its bugs lived precisely
@@ -828,21 +831,13 @@ func TestEffectiveMaxAge(t *testing.T) {
 
 // TestSyncBackupFlagsAreWired proves --backup-dir/--backup-keep exist on
 // `sync` with the right identity — the right env var and the right
-// default. It cannot go further and drive a one-shot `sync` end to end:
-// newEngine calls sp.PlaylistName over the real Spotify API before
-// RunOnce ever reaches Backups, and unlike internal/syncer's harness,
-// nothing here threads a stub Spotify server through the CLI layer —
-// seed's account has a refresh token but no client credentials that
-// resolve to anything real, and building a stub Spotify server for the
-// CLI layer just to exercise this one flag would duplicate the harness
-// internal/syncer already has. The write path itself — one snapshot a
-// day, pruning, the dry-run/failed-pass/backup-failure cases — is
-// already covered end to end by
+// default. TestBuildEngineWiresBackups proves the engine is handed what
+// they say; the write path itself — one snapshot a day, pruning, the
+// dry-run/failed-pass/backup-failure cases — is covered end to end by
 // internal/syncer/backup_test.go, which drives RunOnce directly against
 // a real store. TestConfigSurfaceIsDocumentedAndConsistent separately
 // pins the env var name, the README row and the Dockerfile default
-// against this flag's own default, so what remains to prove here is only
-// that the flag is actually defined on the command an operator runs.
+// against this flag's own default.
 func TestSyncBackupFlagsAreWired(t *testing.T) {
 	app := newApp()
 	var sync *cli.Command
@@ -891,5 +886,62 @@ func TestSyncBackupFlagsAreWired(t *testing.T) {
 	}
 	if kf, ok := keepFlag.(*cli.IntFlag); !ok || kf.Value != 14 {
 		t.Errorf("--backup-keep default = %+v, want 14", keepFlag)
+	}
+}
+
+// TestBuildEngineWiresBackups drives the real sync command's flag set
+// into buildEngine — the action is swapped out only because the real one
+// probes Spotify before it gets that far. Backups are the one engine
+// field whose absence nothing notices: the daemon runs and syncs, and
+// the missing snapshots surface on the day a restore needs one.
+func TestBuildEngineWiresBackups(t *testing.T) {
+	clearEnv(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want syncer.Backups
+	}{
+		{
+			"daemon backs up and prunes",
+			[]string{"--loop", "--backup-dir", "/b", "--backup-keep", "3"},
+			syncer.Backups{Dir: "/b", Keep: 3},
+		},
+		// A debugging one-shot may take today's snapshot but must not
+		// prune the directory down to --backup-keep as a side effect.
+		{
+			"one-shot never prunes",
+			[]string{"--backup-dir", "/b", "--backup-keep", "3"},
+			syncer.Backups{Dir: "/b", Keep: 0},
+		},
+		{
+			"no dir, no backups",
+			[]string{"--loop"},
+			syncer.Backups{Dir: "", Keep: 14},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newApp()
+			var engine *syncer.Engine
+			for _, c := range app.Commands {
+				if c.Name == "sync" {
+					c.Action = func(_ context.Context, c *cli.Command) error {
+						engine = buildEngine(c, nil, nil, nil, sqlite.Account{}, nil)
+						return nil
+					}
+				}
+			}
+			if err := app.Run(context.Background(), append([]string{"difmsync", "sync"}, tc.args...)); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if engine == nil {
+				t.Fatal("sync action never ran")
+			}
+			if engine.Backups == nil {
+				t.Fatal("engine.Backups = nil; the daemon would never take a snapshot")
+			}
+			if diff := cmp.Diff(tc.want, *engine.Backups, cmpopts.IgnoreUnexported(syncer.Backups{})); diff != "" {
+				t.Errorf("Backups (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

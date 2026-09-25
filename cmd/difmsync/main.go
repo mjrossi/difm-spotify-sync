@@ -92,6 +92,45 @@ func buildVersion() string {
 	return "dev"
 }
 
+// buildEngine assembles a sync engine from the sync command's flags and
+// clients already built from them. It is split out of the command so a
+// test can check what the engine is actually given — backups above all,
+// whose absence nothing else notices: the daemon runs and syncs, and the
+// operator discovers there are no snapshots on the day one is needed.
+func buildEngine(c *cli.Command, store *sqlite.Store, dfm *difm.Client, sp *spotify.Client,
+	account sqlite.Account, log *slog.Logger,
+) *syncer.Engine {
+	return &syncer.Engine{
+		DiFM:       dfm,
+		Spotify:    sp,
+		Store:      store,
+		Account:    account,
+		PlaylistID: account.SpotifyPlaylistID,
+		Thresholds: syncer.Thresholds{
+			Auto:   c.Float("auto-threshold"),
+			Review: c.Float("review-threshold"),
+		},
+		Log:     log,
+		Backups: backupsFrom(c),
+	}
+}
+
+// backupsFrom reads the daily-snapshot settings off the sync command.
+//
+// A one-shot `sync` (a `docker compose run` debugging invocation, most
+// often) still takes today's snapshot — that write is harmless even
+// there: same database, idempotent by day. Pruning the backup directory
+// down to --backup-keep as a side effect of a debugging one-shot is not
+// harmless, so Keep is zero without --loop; the daemon is the only path
+// that prunes.
+func backupsFrom(c *cli.Command) *syncer.Backups {
+	b := &syncer.Backups{Dir: c.String("backup-dir")}
+	if c.Bool("loop") {
+		b.Keep = c.Int("backup-keep")
+	}
+	return b
+}
+
 // newApp builds the command tree. Separated from run so tests can drive
 // the real flag parsing, env-var fallbacks and subcommand wiring rather
 // than reaching past them.
@@ -497,22 +536,7 @@ func syncCommand() *cli.Command {
 						log.Info("target playlist", "id", account.SpotifyPlaylistID, "name", name)
 					}
 
-					return &syncer.Engine{
-						DiFM:       difmClient,
-						Spotify:    sp,
-						Store:      store,
-						Account:    account,
-						PlaylistID: account.SpotifyPlaylistID,
-						Thresholds: syncer.Thresholds{
-							Auto:   c.Float("auto-threshold"),
-							Review: c.Float("review-threshold"),
-						},
-						Log: log,
-						Backups: &syncer.Backups{
-							Dir:  c.String("backup-dir"),
-							Keep: c.Int("backup-keep"),
-						},
-					}, nil
+					return buildEngine(c, store, difmClient, sp, account, log), nil
 				}
 
 				if !c.Bool("loop") {
@@ -539,18 +563,6 @@ func syncCommand() *cli.Command {
 					engine, err := newEngine(ctx, account)
 					if err != nil {
 						return err
-					}
-					// newEngine wires Backups unconditionally, so a
-					// one-shot `sync` (a `docker compose run` debugging
-					// invocation, most often) still takes today's
-					// snapshot — that write is harmless even here: same
-					// database, idempotent by day. Pruning the backup
-					// directory down to --backup-keep as a side effect
-					// of a debugging one-shot is not harmless, so it is
-					// disabled here; the loop path below is the only one
-					// that prunes.
-					if engine.Backups != nil {
-						engine.Backups.Keep = 0
 					}
 					_, err = engine.RunOnce(ctx, c.Bool("dry-run"))
 					return err
