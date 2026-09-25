@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -90,6 +91,45 @@ func buildVersion() string {
 		return v
 	}
 	return "dev"
+}
+
+// buildEngine assembles a sync engine from the sync command's flags and
+// clients already built from them. It is split out of the command so a
+// test can check what the engine is actually given — backups above all,
+// whose absence nothing else notices: the daemon runs and syncs, and the
+// operator discovers there are no snapshots on the day one is needed.
+func buildEngine(c *cli.Command, store *sqlite.Store, dfm *difm.Client, sp *spotify.Client,
+	account sqlite.Account, log *slog.Logger,
+) *syncer.Engine {
+	return &syncer.Engine{
+		DiFM:       dfm,
+		Spotify:    sp,
+		Store:      store,
+		Account:    account,
+		PlaylistID: account.SpotifyPlaylistID,
+		Thresholds: syncer.Thresholds{
+			Auto:   c.Float("auto-threshold"),
+			Review: c.Float("review-threshold"),
+		},
+		Log:     log,
+		Backups: backupsFrom(c),
+	}
+}
+
+// backupsFrom reads the daily-snapshot settings off the sync command.
+//
+// A one-shot `sync` (a `docker compose run` debugging invocation, most
+// often) still takes today's snapshot — that write is harmless even
+// there: same database, idempotent by day. Pruning the backup directory
+// down to --backup-keep as a side effect of a debugging one-shot is not
+// harmless, so Keep is zero without --loop; the daemon is the only path
+// that prunes.
+func backupsFrom(c *cli.Command) *syncer.Backups {
+	b := &syncer.Backups{Dir: c.String("backup-dir")}
+	if c.Bool("loop") {
+		b.Keep = c.Int("backup-keep")
+	}
+	return b
 }
 
 // newApp builds the command tree. Separated from run so tests can drive
@@ -255,6 +295,13 @@ func openStore(ctx context.Context, c *cli.Command) (*sqlite.Store, error) {
 
 	store, err := sqlite.Open(path)
 	if err != nil {
+		// A corrupt database is not a permissions problem, and its own
+		// error already names the restore path — appending the mount
+		// diagnostic would hand the operator two contradictory next
+		// steps for one failure.
+		if errors.Is(err, sqlite.ErrCorrupt) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w%s", err, mountDiagnostic(path))
 	}
 	store.SetLogger(newLogger(c))
@@ -310,6 +357,22 @@ func requireAccount(ctx context.Context, c *cli.Command, store *sqlite.Store) (s
 	return account, nil
 }
 
+// nonEmptyEnv is cli.EnvVars with one difference: a variable that is
+// present but empty counts as absent. urfave/cli marks a flag set the
+// moment the variable exists, even when the value is "" and the parse is
+// skipped, so DIFMSYNC_STATUS_MAX_AGE= in a compose file or .env.local
+// would silently pin max-age to the declared 45m instead of deriving it.
+type nonEmptyEnv string
+
+func (e nonEmptyEnv) Lookup() (string, bool) {
+	v, ok := os.LookupEnv(string(e))
+	return v, ok && strings.TrimSpace(v) != ""
+}
+func (e nonEmptyEnv) IsFromEnv() bool  { return true }
+func (e nonEmptyEnv) Key() string      { return string(e) }
+func (e nonEmptyEnv) String() string   { return fmt.Sprintf("environment variable %q", string(e)) }
+func (e nonEmptyEnv) GoString() string { return fmt.Sprintf("nonEmptyEnv(%q)", string(e)) }
+
 // Flags defined on more than one subcommand, built here rather than written
 // out per command. --max-age was two literals with the same env source, which
 // is the shape of drift TestConfigSurfaceIsDocumentedAndConsistent now also
@@ -318,9 +381,38 @@ func requireAccount(ctx context.Context, c *cli.Command, store *sqlite.Store) (s
 func maxAgeFlag(usage string) cli.Flag {
 	return &cli.DurationFlag{
 		Name: "max-age", Value: 45 * time.Minute,
-		Usage:   usage,
-		Sources: cli.EnvVars("DIFMSYNC_STATUS_MAX_AGE"),
+		Usage:       usage,
+		DefaultText: "3 × --interval; 45m at the default 15m",
+		Sources:     cli.NewValueSourceChain(nonEmptyEnv("DIFMSYNC_STATUS_MAX_AGE")),
 	}
+}
+
+// intervalFlag is shared by sync and status. status needs it only to
+// derive max-age (see effectiveMaxAge); one definition keeps the two
+// defaults from drifting, which the config-drift test also asserts.
+func intervalFlag(usage string) cli.Flag {
+	return &cli.DurationFlag{
+		Name: "interval", Value: 15 * time.Minute,
+		Usage:   usage,
+		Sources: cli.EnvVars("DIFMSYNC_INTERVAL"),
+	}
+}
+
+// effectiveMaxAge returns the freshness window the health rule uses.
+// Unset, it follows the interval: a probe that is red between every
+// pair of passes at a long interval is wrong, not strict, and restart
+// policies ignore health, so the mistake is silent. Set, it is the
+// operator's number. The declared default stays 45m, which is 3 × the
+// default interval — so the README, the Dockerfile and the config-drift
+// test are untouched and an unchanged deployment sees no difference.
+// The interval is clamped to syncer.MinInterval first, the same floor
+// Loop applies, so an unreasonably small --interval doesn't also produce
+// an unreasonably small derived max-age.
+func effectiveMaxAge(c *cli.Command) time.Duration {
+	if c.IsSet("max-age") {
+		return c.Duration("max-age")
+	}
+	return 3 * max(c.Duration("interval"), syncer.MinInterval)
 }
 
 func jsonFlag(usage string) cli.Flag {
@@ -329,6 +421,19 @@ func jsonFlag(usage string) cli.Flag {
 
 func limitFlag(value int, usage string) cli.Flag {
 	return &cli.IntFlag{Name: "limit", Value: value, Usage: usage}
+}
+
+// backupDirFlag is shared by sync and status, the same way maxAgeFlag is.
+// sync takes snapshots there; status (and /status.json, /healthz) only
+// reads the directory listing to report the newest one's date. One
+// definition keeps the two defaults from drifting, which
+// TestConfigSurfaceIsDocumentedAndConsistent also asserts.
+func backupDirFlag(usage string) cli.Flag {
+	return &cli.StringFlag{
+		Name:    "backup-dir",
+		Usage:   usage,
+		Sources: cli.EnvVars("DIFMSYNC_BACKUP_DIR"),
+	}
 }
 
 func syncCommand() *cli.Command {
@@ -344,10 +449,7 @@ func syncCommand() *cli.Command {
 				Name:  "loop",
 				Usage: "run continuously on --interval instead of exiting after one pass",
 			},
-			&cli.DurationFlag{
-				Name: "interval", Value: 15 * time.Minute,
-				Sources: cli.EnvVars("DIFMSYNC_INTERVAL"),
-			},
+			intervalFlag("how often the loop runs a pass"),
 			&cli.StringFlag{
 				Name: "http-addr",
 				Usage: "serve the read-only /healthz and /status.json endpoints on this " +
@@ -362,6 +464,13 @@ func syncCommand() *cli.Command {
 				Sources: cli.EnvVars("DIFMSYNC_AUTH_HTTP_ADDR"),
 			},
 			maxAgeFlag("how stale the last clean pass may be before /healthz reports unhealthy"),
+			backupDirFlag("take one verified snapshot per day into this directory after a clean pass " +
+				"(empty disables; the image defaults it to /config/backups)"),
+			&cli.IntFlag{
+				Name: "backup-keep", Value: 14,
+				Usage:   "how many daily snapshots to keep; 0 keeps every one",
+				Sources: cli.EnvVars("DIFMSYNC_BACKUP_KEEP"),
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if err := requireFlags(c, "api-key", "member-id", "playlist-id",
@@ -391,14 +500,24 @@ func syncCommand() *cli.Command {
 				// Spotify client can exist at all. Both callers below reach it
 				// with a refresh token already in hand, so nothing downstream
 				// has to reason about a half-authenticated engine.
-				newEngine := func(ctx context.Context, account sqlite.Account) (*syncer.Engine, error) {
+				//
+				// rotated, when non-nil, is told each rotated refresh token
+				// once it is persisted, so the caller knows which token the
+				// engine is presenting; see syncRunner.loop.
+				newEngine := func(ctx context.Context, account sqlite.Account, rotated func(string)) (*syncer.Engine, error) {
 					// Persist a rotated refresh token as Spotify issues it. Held
 					// only in memory, a rotation survives until the next restart
 					// and then leaves the daemon presenting a dead token — with
 					// the interactive consent step as the only way back.
 					sp, err := auth.Client(ctx, account.SpotifyRefreshToken, func(tok string) error {
 						log.Info("spotify rotated the refresh token; persisting")
-						return store.SetSpotifyRefreshToken(ctx, account.ID, tok)
+						if err := store.SetSpotifyRefreshToken(ctx, account.ID, tok); err != nil {
+							return err
+						}
+						if rotated != nil {
+							rotated(tok)
+						}
+						return nil
 					})
 					if err != nil {
 						return nil, err
@@ -407,6 +526,17 @@ func syncCommand() *cli.Command {
 					// Name the playlist in the log before writing to it, so a
 					// misconfigured id is obvious rather than silently wrong.
 					if name, err := sp.PlaylistName(ctx, account.SpotifyPlaylistID); err != nil {
+						// A dead grant is not a wrong playlist id — the probe
+						// already asked the token endpoint, and it said no.
+						// Returning it typed rather than logging and carrying
+						// on lets syncRunner clear the token and re-enter
+						// consent right now, instead of after a jittered
+						// failing pass discovers the same thing on its own.
+						// The one-shot path exits with this same typed
+						// error, which is what it wants too.
+						if errors.Is(err, spotify.ErrGrantRevoked) {
+							return nil, err
+						}
 						// Logged, not swallowed: this is the loudest early signal
 						// that the deployment is pointed at the wrong playlist, or
 						// that the grant lost its scopes. Discarding it defeats
@@ -417,18 +547,7 @@ func syncCommand() *cli.Command {
 						log.Info("target playlist", "id", account.SpotifyPlaylistID, "name", name)
 					}
 
-					return &syncer.Engine{
-						DiFM:       difmClient,
-						Spotify:    sp,
-						Store:      store,
-						Account:    account,
-						PlaylistID: account.SpotifyPlaylistID,
-						Thresholds: syncer.Thresholds{
-							Auto:   c.Float("auto-threshold"),
-							Review: c.Float("review-threshold"),
-						},
-						Log: log,
-					}, nil
+					return buildEngine(c, store, difmClient, sp, account, log), nil
 				}
 
 				if !c.Bool("loop") {
@@ -452,7 +571,7 @@ func syncCommand() *cli.Command {
 							"is served only by the sync loop (use `difmsync auth` for a one-shot)",
 							"addr", c.String("auth-http-addr"))
 					}
-					engine, err := newEngine(ctx, account)
+					engine, err := newEngine(ctx, account, nil)
 					if err != nil {
 						return err
 					}
@@ -460,66 +579,67 @@ func syncCommand() *cli.Command {
 					return err
 				}
 
-				loop := func(ctx context.Context) error {
-					// The one step that cannot run headless, handled in-process.
-					//
-					// Returning ErrNoCredentials here is what made a missing
-					// token a crash loop rather than a prompt: the process
-					// exits, `restart: unless-stopped` starts it again, and the
-					// operator sees the same line forever with nothing to act
-					// on. With --auth-http-addr set the daemon instead serves
-					// the consent flow and waits, so the whole deployment is
-					// `up -d` plus one click.
-					//
-					// Unset, the old behavior is preserved exactly, which is
-					// what a workstation running `difmsync sync --loop` wants:
-					// fail loudly and tell the operator to run `difmsync auth`.
-					if account.SpotifyRefreshToken == "" {
+				// The one step that cannot run headless, handled in-process.
+				//
+				// Returning ErrNoCredentials from await is what made a
+				// missing token a crash loop rather than a prompt: the
+				// process exits, `restart: unless-stopped` starts it again,
+				// and the operator sees the same line forever with nothing
+				// to act on. With --auth-http-addr set the daemon instead
+				// serves the consent flow and waits, so the whole
+				// deployment is `up -d` plus one click.
+				//
+				// Unset, the old behavior is preserved exactly, which is
+				// what a workstation running `difmsync sync --loop` wants:
+				// fail loudly and tell the operator to run `difmsync auth`.
+				runner := syncRunner{
+					store: store,
+					label: c.String("account"),
+					log:   log,
+					await: func(ctx context.Context, account sqlite.Account) error {
 						authAddr := c.String("auth-http-addr")
 						if authAddr == "" {
-							return spotify.ErrNoCredentials
+							return fmt.Errorf("%w; set --auth-http-addr for the daemon to serve consent itself",
+								spotify.ErrNoCredentials)
 						}
 						flow, err := newConsentFlow(auth, store, account.ID)
 						if err != nil {
 							return err
 						}
-						if err := awaitConsent(ctx, authAddr,
-							c.String("spotify-redirect-url"), flow, log); err != nil {
-							// A shutdown while waiting is a clean stop, not a
-							// failure — the same verdict Engine.Loop reaches
-							// on a canceled context. Without this the process
-							// contract disagrees with itself: an authorized
-							// daemon exits 0 on SIGTERM and one still waiting
-							// for consent exits 1, which reads as a crash to
-							// anything watching exit codes.
-							if errors.Is(err, context.Canceled) {
-								return nil
-							}
-							return err
+						return awaitConsent(ctx, authAddr, c.String("spotify-redirect-url"), flow, log)
+					},
+					loop: func(ctx context.Context, account sqlite.Account) (string, error) {
+						// The token this engine presents: the stored one it
+						// is built from, until Spotify rotates it. Guarded
+						// because the token source calls back from whichever
+						// goroutine needed a fresh access token.
+						var mu sync.Mutex
+						held := account.SpotifyRefreshToken
+						heldNow := func() string {
+							mu.Lock()
+							defer mu.Unlock()
+							return held
 						}
-						// Re-read rather than patching the local copy. The token
-						// was written through the store, and everything below
-						// keys off this struct — an in-memory field set by hand
-						// here would work until someone adds a second thing
-						// consent changes.
-						updated, err := store.GetAccount(ctx, c.String("account"))
+						engine, err := newEngine(ctx, account, func(tok string) {
+							mu.Lock()
+							defer mu.Unlock()
+							held = tok
+						})
 						if err != nil {
-							return err
+							return heldNow(), err
 						}
-						account = updated
-					}
-					engine, err := newEngine(ctx, account)
-					if err != nil {
-						return err
-					}
-					return engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
+						err = engine.Loop(ctx, c.Duration("interval"), c.Bool("dry-run"))
+						return heldNow(), err
+					},
 				}
+				loop := runner.run
 				addr := c.String("http-addr")
 				if addr == "" {
 					return loop(ctx)
 				}
 				return serveWhile(ctx, addr,
-					status.Handler(store, c.String("account"), c.Duration("max-age"), log),
+					status.Handler(store, c.String("account"), effectiveMaxAge(c), buildVersion(),
+						c.String("backup-dir"), log),
 					log, loop)
 			})
 		},
@@ -762,12 +882,15 @@ func statusCommand() *cli.Command {
 					"(this is the container healthcheck)",
 			},
 			limitFlag(status.DefaultRunLimit, "how many recent runs to show"),
+			intervalFlag("the daemon's interval; --max-age defaults to three times it"),
 			maxAgeFlag("how stale the last clean pass may be before --check fails"),
+			backupDirFlag("read the newest snapshot's date from this directory for last backup: " +
+				"(empty reports none; the image defaults it to /config/backups)"),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			return withStore(ctx, c, func(store *sqlite.Store) error {
 				rep, err := status.Build(ctx, store, c.String("account"),
-					c.Duration("max-age"), c.Int("limit"))
+					effectiveMaxAge(c), c.Int("limit"), buildVersion(), c.String("backup-dir"))
 				if err != nil {
 					return err
 				}
@@ -789,14 +912,14 @@ func statusCommand() *cli.Command {
 					return enc.Encode(rep)
 				}
 
-				printStatus(rep)
+				printStatus(rep, c.String("backup-dir"))
 				return nil
 			})
 		},
 	}
 }
 
-func printStatus(rep status.Report) {
+func printStatus(rep status.Report, backupDir string) {
 	fmt.Printf("account:   %s\n", rep.Account)
 	fmt.Printf("playlist:  %s\n", rep.Playlist)
 	fmt.Printf("synced:    %d track(s)\n", rep.Synced)
@@ -815,6 +938,40 @@ func printStatus(rep status.Report) {
 	} else {
 		fmt.Printf("health:    NOT OK — %s\n", rep.Reason)
 	}
+	fmt.Printf("version:   %s\n", rep.Version)
+	switch {
+	case rep.LastSuccessAt != "":
+		fmt.Printf("last ok:   %s\n", rep.LastSuccessAt)
+	case len(rep.Runs) > 0:
+		fmt.Printf("last ok:   none in the last %d runs\n", status.HealthScanLimit)
+	}
+	switch {
+	case rep.ConsecutiveFailures == status.HealthScanLimit && rep.LastSuccessAt == "":
+		fmt.Printf("failures:  %d+ since the last clean pass\n", status.HealthScanLimit)
+	case rep.ConsecutiveFailures > 0:
+		fmt.Printf("failures:  %d since the last clean pass\n", rep.ConsecutiveFailures)
+	}
+	// rep.LastBackupAt alone cannot tell "backups off" from "configured
+	// but never succeeded" — both are the empty string, since Report's
+	// json:",omitempty" tag drops the field either way and status.json
+	// callers already depend on that wire shape. Rather than reshape
+	// Report to carry a second "was this configured" bit for a value
+	// nothing but this printer reads, the CLI recovers the distinction
+	// from the flag it already has: backupDir is exactly what decided
+	// whether Backups.run ever had anywhere to write, so only when it is
+	// set does silence mean something worth saying. /status.json and
+	// /healthz are unaffected — they still only ever have rep to go on.
+	switch {
+	case backupDir == "":
+		// Backups disabled; say nothing, same as before this fix.
+	case rep.LastBackupAt != "":
+		// "last backup:" is itself 12 characters, one past the 11-char
+		// column every label above lines up to, so the single space here
+		// is the closest match rather than a break from the pattern.
+		fmt.Printf("last backup: %s\n", rep.LastBackupAt)
+	default:
+		fmt.Printf("last backup: none\n")
+	}
 
 	// The runs table is the whole point of the command's usage string,
 	// and until now it promised something it never printed. An empty
@@ -824,8 +981,8 @@ func printStatus(rep status.Report) {
 		fmt.Println("no sync runs recorded yet")
 		return
 	}
-	fmt.Printf("%-20s  %-5s  %5s  %5s  %5s  %s\n",
-		"STARTED", "DRY", "ADDED", "QUEUE", "SKIP", "ERROR")
+	fmt.Printf("%-20s  %-5s  %5s  %5s  %5s  %-21s  %s\n",
+		"STARTED", "DRY", "ADDED", "QUEUE", "SKIP", "KIND", "ERROR")
 	for _, run := range rep.Runs {
 		dry := ""
 		if run.DryRun {
@@ -835,7 +992,7 @@ func printStatus(rep status.Report) {
 		if len(started) > 19 {
 			started = started[:19]
 		}
-		fmt.Printf("%-20s  %-5s  %5d  %5d  %5d  %s\n",
-			started, dry, run.Added, run.Queued, run.Skipped, run.Error)
+		fmt.Printf("%-20s  %-5s  %5d  %5d  %5d  %-21s  %s\n",
+			started, dry, run.Added, run.Queued, run.Skipped, run.ErrorKind, run.Error)
 	}
 }

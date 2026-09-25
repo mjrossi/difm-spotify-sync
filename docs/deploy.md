@@ -172,11 +172,12 @@ deployment will mount.**
 
 Two things, and they are different guards for different reasons.
 
-The **nonce** in the start URL is generated at startup and emitted once,
-to the log. Reaching the port is not enough to begin a flow — without
-this, anyone who could reach it could complete consent with *their*
-Spotify account and bind your sync to a stranger's playlist. The endpoint
-is unauthenticated by necessity, since you have no session with it yet.
+The **nonce** in the start URL is generated when the daemon starts
+waiting for consent and emitted once, to the log. Reaching the port is
+not enough to begin a flow — without this, anyone who could reach it
+could complete consent with *their* Spotify account and bind your sync
+to a stranger's playlist. The endpoint is unauthenticated by necessity,
+since you have no session with it yet.
 
 The **callback** is guarded by the OAuth `state` parameter instead,
 because Spotify redirects a browser to it and will not carry an extra
@@ -184,9 +185,25 @@ parameter. That is the standard protection, and the same one `difmsync
 auth` relies on.
 
 The listener exists only while there is no refresh token and shuts down
-for the life of the process once there is one. A *failed* consent
+once there is one; it comes back only if the grant is later revoked and
+the token cleared (below). A *failed* consent
 deliberately leaves it up — a denied grant or a mistyped state has to be
 retryable by clicking the URL again, not by restarting the container.
+
+If Spotify later revokes the grant — a password change, or removing the
+app under Spotify's *Manage apps* — the daemon notices within about an
+hour (the cached access token has to expire before a refresh is
+attempted, so a pass or two may first fail with a plain 401), or
+immediately at its next restart if the token was already dead. It then
+logs `Spotify revoked the refresh token; consent is
+required again`, clears the stored token, and brings the listener back up
+with a new URL and a new nonce. (If something else stored a newer token
+meanwhile — `review --approve` renewing the grant, or `auth --manual` —
+the daemon logs `Spotify rejected a refresh token that has since been
+replaced` and tries that one first; it only asks for consent once the
+stored token has itself been rejected.) Click it as you did the first time;
+nothing needs restarting. `auth --manual` works here too, exactly as on
+first run.
 
 ## Running it
 
@@ -231,6 +248,21 @@ the service will look like it started fine. `DIFMSYNC_AUTH_BIND` must be
 `0.0.0.0`, because a published port forwards to the container's eth0
 address rather than its loopback.
 
+Override by environment variable, never by a flag appended to
+`command:`. The image's `HEALTHCHECK` runs `status --check` as its own
+process, and the entrypoint reads its paths before the daemon starts;
+both see the environment and neither sees the daemon's command line. A
+flag therefore configures the daemon and nothing that watches or repairs
+it:
+
+- `--interval=1h` stretches `/healthz`'s window to 3h, while the
+  Docker healthcheck, still deriving from the 15m default, allows 45m
+  and flaps unhealthy between passes. `DIFMSYNC_INTERVAL=1h` moves
+  both.
+- `--db-path` and `--backup-dir` point the daemon somewhere the
+  entrypoint never repairs, and the healthcheck opens a different
+  database from the one being synced.
+
 ### Day-2 commands
 
 Use `exec`, so you reach the container that is already running with the
@@ -246,11 +278,15 @@ docker compose exec difmsync /difmsync resync --forget=<id>
 `/difmsync`, not `/app/difmsync`. `docker exec` runs as the image user,
 which is root, while the service runs as `PUID` — so a command that
 writes leaves root-owned files behind that the service cannot then touch.
-`backup` is the one that lasts: run as root it creates `/config/backups`
-root-owned `0750`, and every snapshot after that. `/difmsync` is the same
-binary with the privilege drop in front, and the entrypoint's own repair
-covers only the database and its sidecars, not an arbitrary path some
-root process created.
+`backup` used to be the one that lasted: run as root it created
+`/config/backups` root-owned `0750`, and every snapshot after that stayed
+that way until someone fixed it by hand. The entrypoint now repairs that
+directory by name on every start, the same way it repairs the database
+and its sidecars, so a root-owned `/config/backups` left by `/app/difmsync
+backup` — or by an old host-cron job; see Backups below — is fixed on the
+next restart rather than lasting indefinitely. `/difmsync` is still the
+one to use day to day: it avoids creating the root-owned window at all,
+rather than waiting for a restart to close it.
 
 If you do use `docker compose run`, do **not** add `-v difmsync-data:/config`.
 Compose namespaces volumes by project, so the real one is
@@ -301,6 +337,17 @@ Prefer Docker's own `user:` (or `--user`)? That works too — the
 entrypoint detects that it is already unprivileged, skips the chown, and
 ignores `PUID`/`PGID`. You are then responsible for the directory's
 ownership yourself.
+
+The container needs a handful of Linux capabilities to do that repair
+and then drop to `PUID:PGID` — `CHOWN`, `DAC_OVERRIDE`, `SETUID` and
+`SETGID` — and nothing else. Both `compose.yaml` and the README's
+`docker run` snippet drop every capability first (`cap_drop: ALL`,
+`no-new-privileges:true`) and add back only those four; a fifth,
+`FOWNER`, was tried and left out because the entrypoint never needs it.
+CI proves the set rather than assuming it stays correct: each of the
+four is checked with its own negative control in
+`container-tests.yml` — dropping any one of them fails a specific,
+identifiable step, not a generic permission error.
 
 ## Upgrading
 
@@ -383,8 +430,9 @@ credentials simply stops syncing, quietly.
 
 One rule answers it, and everything below uses that same rule: **the
 newest pass that finished, recorded no error, and was not a dry run must
-be within `DIFMSYNC_STATUS_MAX_AGE`** (45m by default — three ticks of
-the 15m interval, so one missed pass is tolerated and two are not).
+be within `DIFMSYNC_STATUS_MAX_AGE`** (unset, three times
+`DIFMSYNC_INTERVAL` — 45m at the default 15m — so one missed pass is
+tolerated and two are not, whatever the interval; set it to override).
 
 ```sh
 docker compose ps                                            # healthy / unhealthy
@@ -392,6 +440,14 @@ docker compose exec difmsync /difmsync status --check   # the same verdict, with
 curl -s http://<host>:3436/healthz                           # 200 ok, or 503 and the reason
 curl -s http://<host>:3436/status.json | jq                  # the full report
 ```
+
+The JSON report's own fields worth knowing: `healthy` and `reason` are
+the same verdict `/healthz` gives; `version` names the build that
+answered; `last_success_at` is the finished time of the pass the health
+rule accepted, absent once that pass has fallen out of the last 20
+`sync_runs` rows; `consecutive_failures` counts errored passes since
+then, capped at 20 (`20` means "at least 20"); and `runs[].error_kind`
+names why each recent pass failed, never the error text.
 
 The container healthcheck runs `/healthcheck.sh`, which is `status
 --check` with a privilege drop in front of it. It is deliberately not a
@@ -423,6 +479,12 @@ Point a dashboard (Uptime Kuma, Homepage, anything that polls a URL) at
 `/healthz`. Both endpoints are read-only and carry no secrets, which is
 what makes them safe to expose on a LAN without authentication.
 
+Reading `docker compose logs -f difmsync` directly, a healthy idle
+interval shows as one `pass finished` line per tick, carrying `next_run`
+for when the next one fires — nothing more, unless a like was actually
+fetched. A pass that swallowed something logs `clean=false` on that same
+line and names the `kind` alongside it, matching the reason table below.
+
 ### When it goes red
 
 `/healthz` and `--check` both name the reason. Match it:
@@ -433,6 +495,10 @@ what makes them safe to expose on a LAN without authentication.
 | `no account "default" yet` | Nothing has ever run against this volume | Start the container; it creates the row |
 | `no sync pass has run yet` | The container started but has not completed a pass | Wait one interval; then read the logs |
 | `newest run errored — run …` | A pass failed and the watermark was held back | `difmsync status` for the error text |
+| `awaiting Spotify consent` (after a revoked grant) | The refresh token was rejected; the daemon cleared it and brought the consent server back up. The `KIND` column / `error_kind` says `spotify_grant_revoked` | Open the new consent URL from the log |
+| `newest run found the Spotify grant revoked` | Consent was re-given (by you, or a sidecar `auth --manual`) and the first pass since has not completed yet | Wait one interval; if it persists, open the consent URL or run `difmsync auth` |
+| `newest run had its DI.fm API key rejected` | `DIFMSYNC_API_KEY` no longer works | [Rotate the key](#rotating-the-difm-key) |
+| `newest run was rate limited` | An API answered 429; the loop backs off by its `Retry-After` | Nothing — it recovers on its own |
 | `last clean pass finished Nh ago` | Passes stopped completing | `docker compose logs --tail=100 difmsync` |
 | `newest run is still in flight` | A pass is running, or was killed mid-run | Wait; if it persists, restart the container |
 
@@ -456,47 +522,78 @@ The database is the only copy of the Spotify refresh token, and losing it
 means redoing the one interactive step in the whole system. It also holds
 the ledger, the review queue and the watermark.
 
+Run history is pruned to 90 days on every clean pass, so a snapshot
+carries at most that much of `sync_runs` — the ledger, review queue and
+watermark are what a restore actually depends on, and none of those are
+pruned.
+
+**The daemon backs itself up.** After every clean, non-dry sync pass it
+takes one verified snapshot per UTC day into `DIFMSYNC_BACKUP_DIR` (the
+published image defaults this to `/config/backups`; set it explicitly if
+you run from a checkout, where the CLI default is off) and keeps
+`DIFMSYNC_BACKUP_KEEP` of them, oldest first (default 14; `0` keeps every
+one). There is nothing to schedule — no cron, no sidecar, no
+`docker exec` on a timer — and the result is owned by the service, not
+root, because the service writes it itself.
+
+Snapshots are named `difmsync-YYYY-MM-DD.db`. That name is also how both
+the prune and `difmsync status` recognize one — each parses the date out
+of it rather than just matching the prefix and suffix. **A file in that
+directory under any other name is left strictly alone**: never deleted
+by the prune, and never reported as the last backup. `docker cp` a copy
+in from elsewhere, or save a manual snapshot as
+`difmsync-before-upgrade.db`, and it sits there indefinitely — which is
+the point, since the whole reason to give it a distinct name is so the
+automatic prune won't later delete it out from under you. (Naming a
+manual snapshot in the exact `difmsync-YYYY-MM-DD.db` shape does the
+opposite: it becomes indistinguishable from an automatic one and is
+eligible for pruning like any other.)
+
+A failed attempt — a full volume, a directory the daemon can't write to
+— still counts as that day's attempt, so a standing problem warns once a
+day in the logs rather than once a pass. It's retried the next UTC day,
+or sooner if the container restarts; the "did we already try today"
+marker lives only in memory.
+
+`difmsync status` (and `--json`, and `/status.json`) reports the newest
+snapshot's date as `last backup:`. `last backup: none` means a directory
+is configured but holds no snapshot yet — check the logs for a warning
+rather than assuming one is about to appear.
+
+A one-shot `difmsync sync` (run without `--loop`, the way a
+`docker compose run` debugging invocation would) still writes the day's
+snapshot, but never prunes — so it can't quietly trim the retention the
+running daemon is managing.
+
+**Migration note.** If an earlier deployment ran a host cron job for
+backups, that cron used `docker compose exec`, which runs as root, so
+`/config/backups` and everything in it ended up root-owned. Nothing to
+do about that by hand: the entrypoint now repairs that directory, by
+name, on the next container start — the same way it already repairs the
+database and its sidecars — so an upgrade fixes it automatically.
+
+**Remove the cron entry.** It does not merely duplicate the daemon: it
+writes the same `difmsync-YYYY-MM-DD.db` name, so on any day the daemon
+has already taken its snapshot, the cron's `backup` finds the file there,
+refuses to overwrite it, and exits non-zero, every night. Its `find
+-mtime` prune is redundant with `DIFMSYNC_BACKUP_KEEP` as well.
+
+For an on-demand copy — before an upgrade, or to pull one off the host by
+hand — `difmsync backup --to=<path>` is still there:
+
 ```sh
-docker compose exec difmsync /difmsync backup --to=/config/backups/difmsync-$(date +%F).db
+docker compose exec difmsync /difmsync backup --to=/config/backups/difmsync-before-upgrade.db
+docker compose cp difmsync:/config/backups/difmsync-before-upgrade.db ./difmsync-backup.db
 ```
 
-`$(date)` expands in *your* shell, which is what you want. That writes
-into the volume — either let whatever backs up your Docker volumes pick
-it up, or pull it onto the host:
+`/difmsync`, not `/app/difmsync` — see Day-2 commands above; going
+through the bare binary via `docker exec` creates the file as root.
 
-```sh
-docker compose cp difmsync:/config/backups/difmsync-$(date +%F).db ./difmsync-backup.db
-```
-
-As a nightly cron on the host:
-
-```cron
-15 4 * * * cd /srv/difm-spotify-sync && docker compose exec -T difmsync \
-  /difmsync backup --to=/config/backups/difmsync-$(date +\%F).db
-```
-
-`-T` disables TTY allocation, which cron needs. Note the escaped `\%` —
-cron treats a bare `%` as a newline.
-
-**Pair it with a prune.** Nothing rotates these, and `VACUUM INTO` writes
-a full copy every night into the same volume as the live database — so an
-unpruned schedule fills that volume and then stops SQLite writing, which
-takes the sync down. The backup command hardens against a full volume
-(that is why it stages and verifies before publishing), but hardening
-only means the *backup* fails cleanly; the database it shares the volume
-with still has nowhere to write.
-
-```cron
-30 4 * * * docker compose exec -T difmsync \
-  find /config/backups -name 'difmsync-*.db' -mtime +14 -delete
-```
-
-Fourteen days is arbitrary; size it against how much room the volume
-actually has.
-
-Three things the backup command refuses to do, all for the same reason —
-the output is often the only copy of a refresh token, and restoring one
-means writing it *over* the live database:
+Both routes — the daemon's own daily snapshot and `backup --to` — go
+through the same verified-snapshot routine, so three things are refused
+either way, all for the same reason: the output is often the only copy
+of a refresh token, and restoring one means writing it *over* the live
+database:
 
 - **Overwrite an existing destination.** Pick another `--to`, or move the
   old file away first.
@@ -505,6 +602,14 @@ means writing it *over* the live database:
   plausible-looking file left behind is how it gets restored later by
   someone who never saw the error.
 - **Write it world-readable.** The snapshot is `chmod 600`.
+
+It also refuses to run at all against a corrupt *source*: opening the live
+database first runs the same integrity check described under Restoring
+below, so a damaged database fails before `backup` writes anything —
+never as a snapshot that opens fine and only turns out empty or wrong
+later. That is the check doing its job, not a backup regression; if it
+happens, the source database is already damaged and the answer is your
+last good backup, not this command.
 
 ### Restoring
 
@@ -522,6 +627,24 @@ docker compose exec difmsync /difmsync status
 
 Stop first: copying over a database with a live writer attached is how
 you get a corrupt one.
+
+If the file you copied in is itself bad — a short or interrupted copy, or
+one that landed corrupt in place — the daemon refuses it at startup
+rather than crash-looping partway into a query. Both shapes are caught,
+by two different checks, but they end in the same message:
+
+```
+sqlite.Open: /config/difmsync.db: sqlite: database is unreadable (<reason>);
+restore from a backup — see the Restoring section of the deployment runbook,
+https://github.com/mjrossi/difm-spotify-sync/blob/main/docs/deploy.md#restoring
+```
+
+`<reason>` differs — a truncated or not-a-database file gives SQLite's own
+open error, an in-place-corrupt one gives its `quick_check` diagnosis —
+but the fix is the same either way: get a fresh copy of the backup, don't
+retry the file that's already in `/config`. The healthcheck opens the
+database the same way, so this also shows up as an unhealthy container,
+not only as a startup crash.
 
 `docker cp` chowns what it copies to the container's user, which is root,
 and `difmsync backup` wrote the snapshot `0600` — so the restored file

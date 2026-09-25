@@ -111,7 +111,8 @@ ENV DIFMSYNC_DB_PATH=/config/difmsync.db \
     DIFMSYNC_AUTH_BIND=0.0.0.0 \
     DIFMSYNC_HTTP_ADDR=0.0.0.0:3436 \
     DIFMSYNC_AUTH_HTTP_ADDR=0.0.0.0:3437 \
-    DIFMSYNC_SPOTIFY_REDIRECT_URL=http://127.0.0.1:3437/callback
+    DIFMSYNC_SPOTIFY_REDIRECT_URL=http://127.0.0.1:3437/callback \
+    DIFMSYNC_BACKUP_DIR=/config/backups
 
 # 3436 is "DIFM" on a phone keypad, chosen to stay clear of the ports a
 # homelab usually has spoken for (3000, 8080/8081, 8096, 8123, 8384,

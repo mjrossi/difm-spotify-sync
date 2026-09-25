@@ -71,9 +71,22 @@ var (
 	parenGroupRe = regexp.MustCompile(`\s*[\(\[]([^)\]]*)[\)\]]\s*`)
 	dashSuffixRe = regexp.MustCompile(`(?i)\s+-\s+([^-]*?(?:mix|edit|remix|version|dub|vip|bootleg|instrumental|live|acoustic))\s*$`)
 	featRe       = regexp.MustCompile(`(?i)\s*\b(?:feat\.?|ft\.?|featuring)\s+(.+)$`)
-	artistSplit  = regexp.MustCompile(`(?i)\s*(?:,|&|\+|\bx\b|\bvs\.?\b|\band\b|\bwith\b)\s*`)
-	nonAlnumRe   = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
-	spaceRe      = regexp.MustCompile(`\s+`)
+	// A word separator has to sit *between* two things; punctuation
+	// does not. Unanchored, the \bx\b / \band\b alternatives matched a
+	// field that is nothing but the token — an artist called X parsed
+	// to no artists at all — and, worse, ate the leading word of real
+	// names: "X Ambassadors" became "ambassadors", so a collaboration
+	// like "X & Beta" collapsed to "beta" and auto-matched a different
+	// artist's track at 1.0 in an add-only sync.
+	//
+	// A comma may carry a following "and" with it — the Oxford comma in
+	// "A, B, and C". The punctuation branch consumes the space after the
+	// comma, so the word branch's leading \s+ can no longer match and
+	// "and c" survived as an artist. Only "and": absorbing "x" here would
+	// reopen the bug above for "A, X Ambassadors".
+	artistSplit = regexp.MustCompile(`(?i)(?:\s*,\s*(?:and\s+)?|\s*[&+]\s*|\s+(?:x|vs\.?|and|with)\s+)`)
+	nonAlnumRe  = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
+	spaceRe     = regexp.MustCompile(`\s+`)
 	// Apostrophes are elisions, not word boundaries — "D'Void" is one
 	// token and "Don't" is one word. Stripped before the general
 	// punctuation rule, which would otherwise split them.

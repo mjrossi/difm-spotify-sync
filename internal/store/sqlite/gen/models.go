@@ -47,6 +47,7 @@ type SyncRun struct {
 	Queued     int64
 	Skipped    int64
 	Error      string
+	ErrorKind  string
 }
 
 type SyncedTrack struct {

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"time"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
@@ -15,10 +14,6 @@ import (
 	"github.com/mjrossi/difm-spotify-sync/pkg/match"
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
 )
-
-// minInterval floors the sync interval. Below this the jitter
-// computation degenerates and the API traffic stops being polite.
-const minInterval = time.Minute
 
 // ErrPassIncomplete reports a pass that finished but swallowed at least
 // one failure, so the watermark was held back and the affected likes will
@@ -41,6 +36,17 @@ type Engine struct {
 	PlaylistID string
 	Thresholds Thresholds
 	Log        *slog.Logger
+
+	// Backups, when non-nil, takes one snapshot per UTC day after a
+	// clean pass. See backup.go.
+	Backups *Backups
+
+	// after is the timer source Loop waits on; nil means time.After. A
+	// test injects one so the ticker can be driven without sleeping.
+	after func(time.Duration) <-chan time.Time
+
+	// now is the clock Loop stamps next_run with; nil means time.Now.
+	now func() time.Time
 }
 
 // RunOnce performs a single sync pass.
@@ -50,6 +56,52 @@ type Engine struct {
 // occurs. That is the intended first-run mode: a one-way playlist append
 // is tedious to undo by hand.
 func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, error) {
+	stats, err := e.pass(ctx, dryRun)
+
+	// Housekeeping rides on a clean, real pass, and runs only once pass
+	// has returned — after the ledger and the watermark, so it can never
+	// sit between them, and after pass's deferred FinishRun has closed
+	// this run's sync_runs row. That second half is the reason it lives
+	// out here: taken inside pass, every snapshot carried its own run
+	// still open, and a restore from it showed a phantom in-flight row
+	// that PruneRuns, which leaves unfinished rows alone, kept forever.
+	//
+	// err == nil && !dryRun is exactly the clean, real pass: pass returns
+	// nil for a non-dry run only from its last line, after the watermark,
+	// and returns ErrPassIncomplete for anything it swallowed.
+	//
+	// A shutdown landing between the ledger commit and here is a clean
+	// stop; skipping avoids a misleading Warn, and the next clean pass
+	// does it anyway.
+	if err == nil && !dryRun && ctx.Err() == nil {
+		e.housekeep(ctx)
+	}
+	return stats, err
+}
+
+// housekeep takes the day's snapshot and prunes old sync_runs rows. A
+// failure in either is logged and swallowed: it is not a like reaching or
+// missing durable state, so invariant 2 is not in play and the pass stays
+// clean.
+func (e *Engine) housekeep(ctx context.Context) {
+	// Before the run prune, so a restore from that day's snapshot still
+	// carries the rows the prune is about to delete.
+	if e.Backups != nil && e.Backups.Dir != "" {
+		e.Backups.take(ctx, e.Store, e.Account.Label, e.Log)
+	}
+
+	before := time.Now().Add(-RunsRetention)
+	if n, err := e.Store.PruneRuns(ctx, e.Account.ID, before, KeepRuns); err != nil {
+		e.Log.Warn("could not prune old sync runs", "err", err)
+	} else if n > 0 {
+		e.Log.Debug("pruned old sync runs", "count", n, "older_than", before)
+	}
+}
+
+// pass is RunOnce's pass proper: everything from reloading the account to
+// the watermark, with the sync_runs row opened at the start and closed by
+// a defer on every way out.
+func (e *Engine) pass(ctx context.Context, dryRun bool) (sqlite.RunStats, error) {
 	var stats sqlite.RunStats
 
 	// Re-read the account rather than trusting the copy taken at
@@ -72,6 +124,13 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		return stats, err
 	}
 	defer func() {
+		// Classified here, once, so that no return site can forget it.
+		// KindIncomplete is the exception: it is set at the single site
+		// that returns ErrPassIncomplete, because by then stats.Err is
+		// the first swallowed error rather than the wrapper.
+		if stats.Err != nil && stats.Kind == "" {
+			stats.Kind = classify(stats.Err)
+		}
 		// Detached from ctx. On SIGTERM mid-pass ctx is already canceled,
 		// and closing the row with a canceled context fails — leaving a
 		// run that never finishes and a phantom "in flight" in `difmsync
@@ -148,6 +207,17 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		// re-read it.
 		e.Log.Error("some likes could not be read; watermark will be held", "err", err)
 		fail(err)
+	case errors.Is(err, difm.ErrUnauthorized):
+		// Named, because the generic line below is what a network blip
+		// produces too, and the two call for different first moves. The
+		// key is a long-lived token with no rotation path (CLAUDE.md,
+		// Credentials); the fix is re-extracting it, not waiting. Points
+		// at the README rather than docs/ — this is what someone reading
+		// a container log with no checkout can actually reach.
+		e.Log.Error("DI.fm rejected the API key; set a fresh DIFMSYNC_API_KEY — the README Credentials section says where to find it",
+			"err", err)
+		stats.Err = err
+		return stats, fmt.Errorf("fetch likes: %w", err)
 	case err != nil:
 		// Includes difm.ErrTruncated, which carries a partial prefix. The
 		// prefix is deliberately not processed: a pass that cannot see all
@@ -156,7 +226,14 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		return stats, err
 	}
 	stats.Fetched = len(likes)
-	e.Log.Info("fetched likes", "count", len(likes), "since", account.WatermarkLikedAt, "dry_run", dryRun)
+	// Info only when there is something to say. At a long interval an
+	// idle pass every tick is the whole log, and "count=0" answers
+	// nothing; Loop's summary line is the heartbeat.
+	fetchedLevel := slog.LevelDebug
+	if len(likes) > 0 {
+		fetchedLevel = slog.LevelInfo
+	}
+	e.Log.Log(ctx, fetchedLevel, "fetched likes", "count", len(likes), "since", account.WatermarkLikedAt, "dry_run", dryRun)
 
 	// Reconcile against the live playlist, not just the ledger. The two can
 	// legitimately disagree — a restored database, a `resync --forget`, or a
@@ -270,6 +347,13 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 	}
 
 	if dryRun {
+		// This return precedes the !passClean site below, which would
+		// otherwise be the one place that sets KindIncomplete — so a dry
+		// run that swallowed a failure needs its own assignment here or
+		// the defer's classify(stats.Err) records a plain "error" for it.
+		if !passClean {
+			stats.Kind = sqlite.KindIncomplete
+		}
 		e.Log.Info("dry run complete — nothing written",
 			"would_add", len(pendingIDs), "would_queue", stats.Queued, "skipped", stats.Skipped)
 		stats.Added = len(pendingIDs)
@@ -350,6 +434,7 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 	}
 
 	if !passClean {
+		stats.Kind = sqlite.KindIncomplete
 		e.Log.Warn("pass completed with failures; watermark held back",
 			"watermark", account.WatermarkLikedAt, "err", stats.Err)
 		// Returned as an error so a one-shot `difmsync sync` — from cron,
@@ -360,7 +445,11 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		return stats, fmt.Errorf("%w: %w", ErrPassIncomplete, stats.Err)
 	}
 
-	e.Log.Info("sync complete",
+	completeLevel := slog.LevelDebug
+	if stats.Fetched > 0 {
+		completeLevel = slog.LevelInfo
+	}
+	e.Log.Log(ctx, completeLevel, "sync complete",
 		"added", stats.Added, "queued", stats.Queued, "skipped", stats.Skipped)
 	return stats, nil
 }
@@ -405,48 +494,6 @@ func (e *Engine) enqueue(ctx context.Context, like difm.Track, candidates []matc
 		Reason:      reason,
 		LikedAt:     like.LikedAt,
 	})
-}
-
-// Loop runs passes on an interval until ctx is canceled. The first tick
-// is jittered so multiple deployments don't stampede the APIs together.
-func (e *Engine) Loop(ctx context.Context, interval time.Duration, dryRun bool) error {
-	// The interval is operator-supplied via --interval/DIFMSYNC_INTERVAL.
-	// Two separate reasons to floor it: rand.Int64N panics outright below
-	// 4ns, and anything under a minute stops being polite to a private
-	// API. The floor is set by the second, which is why a deliberate
-	// --interval=30s is overridden rather than honored — it warns.
-	if interval < minInterval {
-		e.Log.Warn("interval too small; clamping",
-			"requested", interval, "using", minInterval)
-		interval = minInterval
-	}
-	jitter := time.Duration(rand.Int64N(int64(interval / 4)))
-	e.Log.Info("starting sync loop", "interval", interval, "first_run_in", jitter)
-
-	timer := time.NewTimer(jitter)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// A clean shutdown mid-pass is not an error: the watermark
-			// simply hasn't advanced, so the next boot re-reads.
-			if errors.Is(ctx.Err(), context.Canceled) {
-				e.Log.Info("sync loop stopped")
-				return nil
-			}
-			return ctx.Err()
-		case <-timer.C:
-			if _, err := e.RunOnce(ctx, dryRun); err != nil {
-				// Keep looping: a transient API failure should not kill
-				// a long-running daemon. ErrPassIncomplete in particular
-				// is self-correcting — the watermark held, so the next
-				// tick re-reads whatever was missed.
-				e.Log.Error("sync pass failed", "err", err)
-			}
-			timer.Reset(interval)
-		}
-	}
 }
 
 func bestOf(candidates []match.Scored) (match.Scored, bool) {

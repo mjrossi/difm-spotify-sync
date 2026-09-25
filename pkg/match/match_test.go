@@ -125,6 +125,100 @@ func TestParse(t *testing.T) {
 				Version: match.Version{Kind: match.VersionOriginal, Raw: "Original Mix"},
 			},
 		},
+		{
+			// Pins: a whole-name artist that IS a separator word must
+			// still parse as an artist. An unanchored \bx\b matches the
+			// entire field, and Split then returns only the two empty
+			// pieces around it, losing the name outright.
+			name:   "an artist whose whole name is a separator word survives",
+			artist: "X",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"x"},
+				Title:   "rain",
+			},
+		},
+		{
+			// Same failure, word-alternative form.
+			name:   "an artist whose whole name is the word AND survives",
+			artist: "AND",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"and"},
+				Title:   "rain",
+			},
+		},
+		{
+			// Regression guard the other direction: a genuinely
+			// punctuation-only field must still parse to no artists —
+			// there was never a name to recover here.
+			name:   "a punctuation-only artist field stays empty",
+			artist: "!!!",
+			title:  "Rain",
+			want: match.Track{
+				Title: "rain",
+			},
+		},
+		{
+			// A real "x" separator between two names must still split
+			// them — this is the behavior the token exists for.
+			name:   "a genuine x separator between two names still splits",
+			artist: "Chris Lake x Fisher",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"chris lake", "fisher"},
+				Title:   "rain",
+			},
+		},
+		{
+			// Pins: the leading word of a real name must not be eaten
+			// just because it matches a separator token. An unanchored
+			// \bx\b turned "X Ambassadors" into "ambassadors".
+			name:   "a separator word that leads a real name is kept whole",
+			artist: "X Ambassadors",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"x ambassadors"},
+				Title:   "rain",
+			},
+		},
+		{
+			// Pins the worst-shaped version of the same bug: a
+			// collaboration whose first member's name collides with the
+			// separator token must not collapse to the other member
+			// alone — that is a false-positive match on an add-only
+			// sync, not just a lost artist.
+			name:   "a collab where one member's name is the separator token still splits",
+			artist: "X & Beta",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"x", "beta"},
+				Title:   "rain",
+			},
+		},
+		{
+			// Pins the Oxford comma. Requiring whitespace before a word
+			// separator broke it: the comma branch eats the space, so
+			// "and" had none in front and "and c" parsed as an artist.
+			name:   "an Oxford comma before and still splits cleanly",
+			artist: "Alpha, Beta, and Gamma",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"alpha", "beta", "gamma"},
+				Title:   "rain",
+			},
+		},
+		{
+			// The comma absorbs "and", never "x": a name that starts with
+			// a separator word must survive coming after a comma too.
+			name:   "a separator word leading a name after a comma is kept whole",
+			artist: "Alpha, X Ambassadors",
+			title:  "Rain",
+			want: match.Track{
+				Artists: []string{"alpha", "x ambassadors"},
+				Title:   "rain",
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -300,6 +394,51 @@ func TestScore_UnknownDurationIsNotAMismatch(t *testing.T) {
 	if diff := withDur.Score - noDur.Score; diff > 0.05 || diff < -0.05 {
 		t.Errorf("dropping duration shifted score by %.3f, want ~0", diff)
 	}
+}
+
+// TestScore_AnArtistNamedLikeASeparatorIsStillAnArtist guards the worst
+// shape of the splitArtists bug: an unanchored separator token doesn't
+// just lose an artist name, it can make a *different* artist's track
+// auto-add at full confidence in a sync that only ever adds tracks and
+// never removes them.
+func TestScore_AnArtistNamedLikeASeparatorIsStillAnArtist(t *testing.T) {
+	t.Run("identical X/Rain pair clears the auto bar", func(t *testing.T) {
+		want := match.Parse("X", "Rain")
+		got := match.Parse("X", "Rain")
+		s := match.Score(want, 300, got, 300)
+		if s.Score < autoThreshold {
+			t.Errorf("Score = %.4f, want >= %.2f (was 0.3150 with the empty-artist bug)\n  why: %s",
+				s.Score, autoThreshold, s.Why)
+		}
+	})
+
+	t.Run("X does not match a different artist", func(t *testing.T) {
+		want := match.Parse("X", "Rain")
+		got := match.Parse("Deadmau5", "Rain")
+		s := match.Score(want, 300, got, 300)
+		if s.Score >= reviewThreshold {
+			t.Errorf("Score = %.4f, want < %.2f\n  why: %s", s.Score, reviewThreshold, s.Why)
+		}
+	})
+
+	t.Run("punctuation-only artist pair is not evidence of a match", func(t *testing.T) {
+		want := match.Parse("!!!", "Rain")
+		got := match.Parse("!!!", "Rain")
+		s := match.Score(want, 300, got, 300)
+		if s.Score >= reviewThreshold {
+			t.Errorf("Score = %.4f, want < %.2f\n  why: %s", s.Score, reviewThreshold, s.Why)
+		}
+	})
+
+	t.Run("a collaboration must not auto-add as one member's solo track", func(t *testing.T) {
+		want := match.Parse("X & Beta", "Rain")
+		got := match.Parse("Beta", "Rain")
+		s := match.Score(want, 300, got, 300)
+		if s.Score >= autoThreshold {
+			t.Errorf("Score = %.4f, want < %.2f — a collaboration auto-added as its solo member\n  why: %s",
+				s.Score, autoThreshold, s.Why)
+		}
+	})
 }
 
 func TestNormalize(t *testing.T) {

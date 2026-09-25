@@ -2,12 +2,14 @@ package status_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -71,6 +73,23 @@ func recordRun(t *testing.T, s *sqlite.Store, accountID int64, age time.Duration
 		t.Fatalf("StartRun: %v", err)
 	}
 	if err := s.FinishRun(ctx, id, sqlite.RunStats{Added: 1, Err: runErr}); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+}
+
+// recordFailedRun is recordRun for a pass that ended with a kind.
+func recordFailedRun(t *testing.T, s *sqlite.Store, accountID int64, age time.Duration, kind sqlite.RunErrorKind, runErr error) {
+	t.Helper()
+	ctx := context.Background()
+	at := time.Now().Add(-age)
+	s.SetClock(func() time.Time { return at })
+	defer s.SetClock(time.Now)
+
+	id, err := s.StartRun(ctx, accountID, false)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if err := s.FinishRun(ctx, id, sqlite.RunStats{Err: runErr, Kind: kind}); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
 }
@@ -145,7 +164,7 @@ func TestHealth(t *testing.T) {
 			s, account := newStore(t)
 			tt.setup(t, s, account.ID)
 
-			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 10)
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 10, "", "")
 			if err != nil {
 				t.Fatalf("Build: %v", err)
 			}
@@ -170,7 +189,9 @@ func TestReportCarriesNoSecrets(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, time.Minute, false, nil)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	// A real version string, so its presence in the body is a positive
+	// assertion rather than one that would pass vacuously with "".
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "v9.9.9-test", "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/status.json")
@@ -194,6 +215,19 @@ func TestReportCarriesNoSecrets(t *testing.T) {
 	// Guard against the test passing because the body was empty.
 	if !strings.Contains(string(body), testPlaylist) {
 		t.Fatalf("body does not look like a report: %s", body)
+	}
+	// Version, last_success_at and consecutive_failures are new fields on
+	// the same struct the secret checks above cover — asserting on them
+	// here is what keeps a future field from being added to Report
+	// without this test being looked at.
+	if !strings.Contains(string(body), `"version":"v9.9.9-test"`) {
+		t.Errorf("body does not carry the version: %s", body)
+	}
+	if !strings.Contains(string(body), `"last_success_at"`) {
+		t.Errorf("body does not carry last_success_at: %s", body)
+	}
+	if !strings.Contains(string(body), `"consecutive_failures":0`) {
+		t.Errorf("body does not carry consecutive_failures: %s", body)
 	}
 }
 
@@ -224,9 +258,13 @@ func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
 	s, account := newStore(t)
 	// Newest run failed, and nothing clean behind it — so health() has to
 	// fall through to describe(), which is the /healthz leak channel.
-	recordRun(t, s, account.ID, time.Minute, false, errWithMemberID)
+	//
+	// A kinded failure, because the kind path is the one branch of
+	// describe() that says more than the generic text — so it is the one
+	// that could leak if a later edit interpolated the run.
+	recordFailedRun(t, s, account.ID, time.Minute, sqlite.KindDiFMUnauthorized, errWithMemberID)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 	defer srv.Close()
 
 	for _, path := range []string{"/status.json", "/healthz"} {
@@ -255,6 +293,107 @@ func TestEndpointsCarryNoSecretsFromAFailedRun(t *testing.T) {
 	}
 }
 
+// TestReasonNamesTheFailureKind: the endpoints may not serve error text,
+// so before the kind existed every failed pass produced the same reason
+// and the operator had to exec into the container to learn whether the
+// first move was "re-extract the DI.fm key" or "click the consent URL".
+func TestReasonNamesTheFailureKind(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		kind       sqlite.RunErrorKind
+		wantReason string // substring
+	}{
+		{"spotify grant revoked", sqlite.KindSpotifyGrantRevoked, "grant revoked"},
+		{"difm unauthorized", sqlite.KindDiFMUnauthorized, "DI.fm API key rejected"},
+		{"rate limited", sqlite.KindRateLimited, "rate limited"},
+		{"incomplete", sqlite.KindIncomplete, "newest run errored"},
+		{"error", sqlite.KindError, "newest run errored"},
+		{"pre-0002 row", "", "newest run errored"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, account := newStore(t)
+			recordFailedRun(t, s, account.ID, time.Minute, tc.kind, errWithMemberID)
+
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", "")
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if rep.Healthy {
+				t.Fatal("Healthy = true over a failed newest run")
+			}
+			if !strings.Contains(rep.Reason, tc.wantReason) {
+				t.Errorf("Reason = %q, want it to contain %q", rep.Reason, tc.wantReason)
+			}
+			if strings.Contains(rep.Reason, testMemberID) {
+				t.Errorf("Reason leaked the member id: %q", rep.Reason)
+			}
+			if len(rep.Runs) == 0 || rep.Runs[0].ErrorKind != string(tc.kind) {
+				t.Errorf("Runs[0].ErrorKind = %q, want %q", rep.Runs[0].ErrorKind, tc.kind)
+			}
+		})
+	}
+}
+
+// TestStatusJSONDropsAnUnknownKind is the read-side half of the guard.
+// FinishRun refuses to write a kind this package did not define, but the
+// status endpoints answer from whatever database they are handed — a
+// restored or hand-edited one included — so a row that got an unknown
+// kind past the write side some other way must still not be published
+// verbatim.
+func TestStatusJSONDropsAnUnknownKind(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	ctx := context.Background()
+	s, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	account, err := s.EnsureAccount(ctx, testLabel, testMemberID, testPlaylist)
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	if err := s.SetSpotifyRefreshToken(ctx, account.ID, refreshToken); err != nil {
+		t.Fatalf("SetSpotifyRefreshToken: %v", err)
+	}
+	recordFailedRun(t, s, account.ID, time.Minute, sqlite.KindError, errWithMemberID)
+
+	// A row this process did not write through FinishRun: a hand edit, or
+	// what a restored database could carry. The Store API has no way to
+	// produce this on demand, so a raw connection on the same file is the
+	// only way to get it there.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	if _, err := raw.Exec(`UPDATE sync_runs SET error_kind = 'SMUGGLED-4242'`); err != nil {
+		t.Fatalf("UPDATE sync_runs: %v", err)
+	}
+
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
+	defer srv.Close()
+
+	for _, path := range []string{"/status.json", "/healthz"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if strings.Contains(string(body), "SMUGGLED") {
+				t.Errorf("%s published an unknown error_kind verbatim: %s", path, body)
+			}
+		})
+	}
+}
+
 // TestCLIKeepsTheErrorText is the other half of the fix. Redacting the
 // endpoints is only correct if the text is still reachable somewhere —
 // otherwise a failing deployment becomes undiagnosable, which is a worse
@@ -264,7 +403,7 @@ func TestCLIKeepsTheErrorText(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, time.Minute, false, errPass)
 
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit)
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -305,7 +444,7 @@ func TestHealthzStatusCodes(t *testing.T) {
 			s, account := newStore(t)
 			recordRun(t, s, account.ID, tt.age, false, nil)
 
-			srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+			srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 			defer srv.Close()
 
 			resp, err := http.Get(srv.URL + "/healthz")
@@ -336,7 +475,7 @@ func TestHealthzBeforeAuth(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/healthz")
@@ -355,7 +494,7 @@ func TestStatusJSONIs200WhenUnhealthy(t *testing.T) {
 	s, account := newStore(t)
 	recordRun(t, s, account.ID, 3*time.Hour, false, nil)
 
-	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, discardLogger()))
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", "", discardLogger()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/status.json")
@@ -386,7 +525,7 @@ func TestReportCarriesRuns(t *testing.T) {
 	recordRun(t, s, account.ID, 2*time.Minute, false, nil)
 	recordRun(t, s, account.ID, time.Minute, false, errPass)
 
-	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit)
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, status.DefaultRunLimit, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -418,7 +557,7 @@ func TestHealthIgnoresRunLimit(t *testing.T) {
 	}
 
 	for _, limit := range []int{1, 2, 5, 50} {
-		rep, err := status.Build(ctx, s, testLabel, testMaxAge, limit)
+		rep, err := status.Build(ctx, s, testLabel, testMaxAge, limit, "", "")
 		if err != nil {
 			t.Fatalf("Build(limit=%d): %v", limit, err)
 		}
@@ -441,7 +580,7 @@ func TestInFlightRunIsStillListed(t *testing.T) {
 		t.Fatalf("StartRun: %v", err)
 	}
 
-	rep, err := status.Build(ctx, s, testLabel, testMaxAge, status.DefaultRunLimit)
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, status.DefaultRunLimit, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -481,7 +620,7 @@ func TestUnauthorizedAccountReportsWhyItIsUnhealthy(t *testing.T) {
 	// cannot, because there is no token for it to have used.
 	recordRun(t, s, account.ID, time.Minute, false, nil)
 
-	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0)
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "", "")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -499,12 +638,298 @@ func TestUnauthorizedAccountReportsWhyItIsUnhealthy(t *testing.T) {
 	if err := s.SetSpotifyRefreshToken(ctx, account.ID, refreshToken); err != nil {
 		t.Fatalf("SetSpotifyRefreshToken: %v", err)
 	}
-	rep, err = status.Build(ctx, s, testLabel, testMaxAge, 0)
+	rep, err = status.Build(ctx, s, testLabel, testMaxAge, 0, "", "")
 	if err != nil {
 		t.Fatalf("Build after consent: %v", err)
 	}
 	if !rep.Authorized || !rep.Healthy {
 		t.Errorf("after consent: Authorized=%v Healthy=%v (%s), want both true",
 			rep.Authorized, rep.Healthy, rep.Reason)
+	}
+}
+
+// The three numbers a probe wants next to the boolean: when the last
+// success was, how many failures have stacked since, and which binary
+// is answering.
+func TestReportCarriesSuccessTimeAndFailureCount(t *testing.T) {
+	ctx := context.Background()
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, 40*time.Minute, false, nil) // clean
+	recordFailedRun(t, s, account.ID, 30*time.Minute, sqlite.KindError, errPass)
+	recordRun(t, s, account.ID, 20*time.Minute, true, errPass) // a dry run that swallowed a failure: still not counted
+	recordFailedRun(t, s, account.ID, 10*time.Minute, sqlite.KindRateLimited, errPass)
+	// An in-flight row: started, never finished. Not counted either.
+	if _, err := s.StartRun(ctx, account.ID, false); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	rep, err := status.Build(ctx, s, testLabel, testMaxAge, 0, "v9.9.9-test", "")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.Version != "v9.9.9-test" {
+		t.Errorf("Version = %q", rep.Version)
+	}
+	if rep.ConsecutiveFailures != 2 {
+		t.Errorf("ConsecutiveFailures = %d, want 2 (dry run and in-flight row excluded)", rep.ConsecutiveFailures)
+	}
+	if rep.LastSuccessAt == "" {
+		t.Fatal("LastSuccessAt empty with a clean run recorded")
+	}
+	at, err := time.Parse(sqlite.TimeFormat, rep.LastSuccessAt)
+	if err != nil {
+		t.Fatalf("LastSuccessAt = %q, not %s", rep.LastSuccessAt, sqlite.TimeFormat)
+	}
+	if age := time.Since(at); age < 39*time.Minute || age > 41*time.Minute {
+		t.Errorf("LastSuccessAt is %s old, want ~40m", age)
+	}
+	if !rep.Healthy {
+		t.Error("Healthy = false with a 40m-old clean run and a 45m window")
+	}
+}
+
+func TestConsecutiveFailuresIsZeroWhenTheNewestRunIsClean(t *testing.T) {
+	s, account := newStore(t)
+	recordFailedRun(t, s, account.ID, 20*time.Minute, sqlite.KindError, errPass)
+	recordRun(t, s, account.ID, 10*time.Minute, false, nil)
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", "")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0", rep.ConsecutiveFailures)
+	}
+}
+
+func TestConsecutiveFailuresWithNoCleanRunCountsTheWindow(t *testing.T) {
+	s, account := newStore(t)
+	for i := 1; i <= 3; i++ {
+		recordFailedRun(t, s, account.ID, time.Duration(i)*time.Minute, sqlite.KindError, errPass)
+	}
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", "")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.ConsecutiveFailures != 3 || rep.LastSuccessAt != "" {
+		t.Errorf("ConsecutiveFailures = %d, LastSuccessAt = %q; want 3 and empty", rep.ConsecutiveFailures, rep.LastSuccessAt)
+	}
+}
+
+// The verdict and the count must use the same fixed-size window
+// regardless of how many rows the caller asks to see, in either
+// direction. Narrowing was closed once already (TestHealthIgnoresRunLimit);
+// this covers widening: a --limit above HealthScanLimit must not pull a
+// clean run that has fallen out of the scan window back into the verdict.
+func TestScanWindowIsFixedInBothDirections(t *testing.T) {
+	s, account := newStore(t)
+	// The clean run is older than all HealthScanLimit+5 failures stacked
+	// on top of it, so it sits just past the fixed window.
+	recordRun(t, s, account.ID, 30*time.Minute, false, nil)
+	for i := 1; i <= status.HealthScanLimit+5; i++ {
+		recordFailedRun(t, s, account.ID, time.Duration(i)*time.Minute, sqlite.KindError, errPass)
+	}
+
+	for _, limit := range []int{5, status.HealthScanLimit, 50} {
+		rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, limit, "", "")
+		if err != nil {
+			t.Fatalf("Build(limit=%d): %v", limit, err)
+		}
+		if rep.Healthy {
+			t.Errorf("limit=%d: Healthy = true, want false — the clean run has fallen out of the window", limit)
+		}
+		if rep.ConsecutiveFailures != status.HealthScanLimit {
+			t.Errorf("limit=%d: ConsecutiveFailures = %d, want %d", limit, rep.ConsecutiveFailures, status.HealthScanLimit)
+		}
+		if rep.LastSuccessAt != "" {
+			t.Errorf("limit=%d: LastSuccessAt = %q, want empty", limit, rep.LastSuccessAt)
+		}
+	}
+}
+
+// TestLastBackupAtReadsTheNewestSnapshot: the report names the newest
+// snapshot's date, read straight from the directory listing rather than a
+// store column — there is no second place for it to disagree with what
+// backup.go actually wrote. Snapshot names are ISO-dated
+// (difmsync-YYYY-MM-DD.db), so a lexical sort over the filtered names is a
+// chronological one.
+func TestLastBackupAtReadsTheNewestSnapshot(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	dir := t.TempDir()
+	for _, name := range []string{
+		"difmsync-2026-01-05.db",
+		"difmsync-2026-01-06.db",
+		"difmsync-2026-01-04.db",
+		"not-a-snapshot.txt", // must be ignored rather than sorted in
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+	}
+
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.LastBackupAt != "2026-01-06" {
+		t.Errorf("LastBackupAt = %q, want 2026-01-06", rep.LastBackupAt)
+	}
+}
+
+// TestLastBackupAtIgnoresNamesThatAreNotDates: a name matching
+// difmsync-*.db whose middle is not a date — a manual `--to=` backup, a
+// half-written file — must not be read as the newest snapshot. Today
+// "zzz" sorts lexically above every real ISO date, so before this fix the
+// report published exactly that string: an unvalidated filename fragment,
+// on an endpoint served unauthenticated to the LAN.
+func TestLastBackupAtIgnoresNamesThatAreNotDates(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "difmsync-zzz.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.LastBackupAt != "" {
+		t.Errorf("LastBackupAt = %q, want empty — %q is not a date", rep.LastBackupAt, "difmsync-zzz.db")
+	}
+}
+
+// TestLastBackupAtEmptyWhenNoSnapshot covers the directory states that are
+// not an error but still have nothing to report: unset, empty and missing.
+func TestLastBackupAtEmptyWhenNoSnapshot(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	tests := []struct {
+		name string
+		dir  string
+	}{
+		{"unset", ""},
+		{"empty directory", t.TempDir()},
+		{"missing directory", filepath.Join(t.TempDir(), "does-not-exist")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", tt.dir)
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if rep.LastBackupAt != "" {
+				t.Errorf("LastBackupAt = %q, want empty", rep.LastBackupAt)
+			}
+		})
+	}
+}
+
+// TestLastBackupAtUnreadableDirDoesNotFailReport: a probe that 500s
+// because the backup directory is missing or unreadable is worse than a
+// report that just says nothing has been backed up yet.
+func TestLastBackupAtUnreadableDirDoesNotFailReport(t *testing.T) {
+	// Root reads through mode 000, so the directory is not unreadable
+	// and the fixture proves nothing — it would fail rather than skip in
+	// a root dev container, which is where `just check` often runs.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode 000 does not make a directory unreadable")
+	}
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "backups")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "difmsync-2026-01-06.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	// Restore permissions so t.TempDir()'s own cleanup can remove it.
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+	if err != nil {
+		t.Fatalf("Build: %v, want no error over an unreadable backup directory", err)
+	}
+	if rep.LastBackupAt != "" {
+		t.Errorf("LastBackupAt = %q, want empty for an unreadable directory", rep.LastBackupAt)
+	}
+}
+
+// TestLastBackupAtDoesNotAffectHealth: a missing or unreadable backup
+// directory is not evidence that syncing has stopped, and must not change
+// the health verdict computed from sync_runs.
+func TestLastBackupAtDoesNotAffectHealth(t *testing.T) {
+	dirs := map[string]string{
+		"unset":     "",
+		"missing":   filepath.Join(t.TempDir(), "does-not-exist"),
+		"empty":     t.TempDir(),
+		"populated": t.TempDir(),
+	}
+	if err := os.WriteFile(filepath.Join(dirs["populated"], "difmsync-2026-01-06.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		age        time.Duration
+		wantHealth bool
+	}{
+		{"fresh clean run", time.Minute, true},
+		{"stale clean run", 3 * time.Hour, false},
+	} {
+		for dirName, dir := range dirs {
+			t.Run(tc.name+"/"+dirName, func(t *testing.T) {
+				s, account := newStore(t)
+				recordRun(t, s, account.ID, tc.age, false, nil)
+
+				rep, err := status.Build(context.Background(), s, testLabel, testMaxAge, 0, "", dir)
+				if err != nil {
+					t.Fatalf("Build: %v", err)
+				}
+				if rep.Healthy != tc.wantHealth {
+					t.Errorf("Healthy = %v, want %v (backup dir %q must not affect the verdict)",
+						rep.Healthy, tc.wantHealth, dirName)
+				}
+			})
+		}
+	}
+}
+
+// TestReportCarriesLastBackupAt is the JSON-facing sibling of
+// TestLastBackupAtReadsTheNewestSnapshot: it belongs on the same struct
+// the secret checks above cover, so its presence in the encoded body gets
+// its own assertion rather than being inferred from Build's return value.
+func TestReportCarriesLastBackupAt(t *testing.T) {
+	s, account := newStore(t)
+	recordRun(t, s, account.ID, time.Minute, false, nil)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "difmsync-2026-01-06.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := httptest.NewServer(status.Handler(s, testLabel, testMaxAge, "", dir, discardLogger()))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/status.json")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(body), `"last_backup_at":"2026-01-06"`) {
+		t.Errorf("body does not carry last_backup_at: %s", body)
 	}
 }

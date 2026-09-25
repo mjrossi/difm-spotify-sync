@@ -6,7 +6,97 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet. Changes land here between releases.
+### Added
+
+- The daemon now takes its own scheduled backups: one verified snapshot
+  per UTC day into `DIFMSYNC_BACKUP_DIR` (`--backup-dir` /
+  `DIFMSYNC_BACKUP_DIR`, image default `/config/backups`) after every
+  clean pass, pruned to `--backup-keep` / `DIFMSYNC_BACKUP_KEEP` (default
+  14). Owned by the service rather than root, since the service writes
+  it itself — no host cron required. `difmsync status`, `--json` and
+  `/status.json` gain `last_backup_at`, the newest snapshot's date.
+- `compose.yaml` and the README's `docker run` snippet now drop every
+  Linux capability and add back only the four the entrypoint's privilege
+  drop needs (`CHOWN`, `DAC_OVERRIDE`, `SETUID`, `SETGID`), each proven
+  load-bearing by its own negative control in `container-tests.yml`.
+- `sqlite.Open` now refuses a database SQLite cannot read — a truncated
+  or non-SQLite file, or one that fails `PRAGMA quick_check` in place —
+  instead of surfacing as whatever query happens to touch it first. The
+  error names the file and points at the Restoring section of
+  `docs/deploy.md`. The healthcheck and `backup` open the database the
+  same way, so a corrupt file now fails `status --check`/`/healthz` and
+  `backup` before either does anything else.
+- `just fuzz` runs the matcher's fuzz targets (`Normalize`, `Parse`,
+  `Score`) for a bounded time; their seed corpus already runs as ordinary
+  test cases in `just check`.
+
+### Changed
+
+- `docs/deploy.md`'s Backups section no longer documents a host cron
+  recipe (`docker compose exec ... backup` plus a `find -mtime +14
+  -delete` prune) — the daemon's own scheduled backup, above, replaces
+  it. An existing root-owned `/config/backups` left by that recipe is
+  repaired automatically: `docker/entrypoint.sh` now repairs it by name
+  on every start, the same way it already repairs the database and its
+  sidecars. **Remove the cron itself:** it writes the same file name, so
+  on days the daemon has already taken its snapshot it fails on the
+  existing file.
+- `sync_runs` is pruned after each clean pass: 90 days of history, never
+  fewer than the newest 20 rows (the health scan window). Not
+  configurable — see CLAUDE.md, Sync semantics.
+
+- `DIFMSYNC_STATUS_MAX_AGE`, left unset, now follows the interval — three
+  times `DIFMSYNC_INTERVAL` — instead of a fixed 45m regardless of it, so
+  a longer interval no longer reports unhealthy between every pair of
+  passes. The declared default is still `45m`; set the variable to
+  override the derivation.
+- The loop logs one `pass finished` line per pass at Info, with the
+  fetch/add/queue/skip counts, whether it was clean, and `next_run` —
+  replacing the two lines an idle tick used to log without ever saying
+  when the next attempt was.
+- `difmsync status`, `--json` and `/status.json` gain `version`,
+  `last_success_at` (the accepted pass's own finish time) and
+  `consecutive_failures` (capped at the 20-row scan window), so an
+  operator or a dashboard can see which build answered and how long a
+  stall has been running without reading the runs table by hand.
+- A refresh token that Spotify revokes mid-life no longer needs a human
+  to run `difmsync auth` and restart the container. The daemon clears the
+  dead token, brings the consent server back up with a fresh URL and
+  nonce, and resumes once you click it. It clears only the token Spotify
+  actually rejected: one stored by another process in the meantime
+  (`review --approve`, `auth --manual`) is tried first, not erased.
+- A 429 from either API now delays the next pass by the `Retry-After`
+  the server sent (clamped to 1m–24h) instead of a full interval.
+- A rejected DI.fm API key gets its own log line and its own `/healthz`
+  reason, rather than the generic "newest run errored".
+- `difmsync status` and `/status.json` carry an `error_kind` for failed
+  passes — a fixed category, never the error text, which stays CLI-only.
+- A one-shot `difmsync sync` with a revoked grant now exits non-zero from
+  the playlist probe, before the pass runs and without recording a
+  `sync_runs` row; it used to warn and run the pass anyway.
+
+### Fixed
+
+- A daily backup that was written but whose pruning of older snapshots
+  failed was logged as `could not take a backup`. It is now logged as
+  `backup written`, with a separate `could not prune old backups`
+  warning.
+- The 20-row health scan window is now fixed in both directions. A large
+  `--limit` used to widen it, so `difmsync status --limit 50` could
+  report healthy in a case where `/healthz` — which always uses the
+  fixed window — reported unhealthy.
+- An artist whose name is or begins with a separator word (`X
+  Ambassadors`, `And One`, `With Confidence`) was parsed with that word
+  dropped. This both prevented genuine matches and, worse, could let a
+  collaboration auto-add as one member's solo track — `X & Beta`
+  parsed as just `Beta` and matched that artist's recording at full
+  confidence. A list with an Oxford comma (`A, B, and C`) still splits
+  into three artists.
+
+### Database
+
+- Migration `0002` adds `sync_runs.error_kind`. Applied automatically on
+  start; existing rows read as unclassified.
 
 ## [1.0.0] - 2026-08-25
 

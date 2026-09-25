@@ -209,6 +209,40 @@ Three invariants that the code depends on, in order:
    one-shot `difmsync sync` exits non-zero. `Loop` logs it and carries on —
    the watermark held, so the next tick re-reads whatever was missed.
 
+   Two pass outcomes change what `Loop` does next, and both are decided
+   by the pass error rather than by control flow. A rate limit from
+   either API carries `Retry-After`, and `nextDelay` (`loop.go`)
+   schedules the next tick from it, clamped to `[1m, 24h]`, instead of
+   the interval — before that the hint was parsed and never read, and at
+   a long interval one 429 cost hours. `spotify.ErrGrantRevoked` makes
+   `Loop` *return*: the engine cannot fix a dead grant, so it hands the
+   decision to `cmd/difmsync`, which clears the token and re-enters the
+   consent wait (see Operator surface). `ErrGrantRevoked` narrows
+   `ErrUnauthorized` to exactly `invalid_grant` from the token endpoint —
+   `invalid_client` and a bodiless 4xx stay plain `ErrUnauthorized` —
+   because it is the one error that authorizes deleting a stored
+   credential; anything looser would let a wrong client secret or a
+   transient upstream error erase a token that was never actually dead.
+
+   `Loop` logs exactly one `pass finished` line per pass, at Info, with
+   the counts, `clean` and `next_run` — and, on failure, the same `kind`
+   `classify` writes to `sync_runs.error_kind` — so an idle interval
+   costs one log line rather than the silence-or-noise choice between
+   nothing and every step. `RunOnce`'s own `fetched likes` and `sync
+   complete` lines stay Info only when they carry information — a
+   nonzero count — and drop to Debug otherwise, since `Loop` already
+   says the pass happened.
+
+   Every failed pass also records a **kind** (`sync_runs.error_kind`), set
+   once by `classify` in the engine's `FinishRun` defer — never by the
+   store, which must not import the API packages, and not at individual
+   return sites, where one branch forgets. The one exception is
+   `KindIncomplete`, which the two sites that end an unclean pass set
+   themselves, because by the time the defer runs `stats.Err` is the
+   first swallowed error rather than `ErrPassIncomplete`. The kind is an
+   enum the code chose; it is the only thing about a failure the status
+   endpoints may say.
+
    Correspondingly, a transport failure is never recorded as a *verdict*.
    "We could not ask Spotify" must not be stored as `no_match`.
 3. **Dedupe is reconciled, not assumed.** Each pass reads live playlist
@@ -224,11 +258,66 @@ rather than leaving it alone or clearing it outright: leaving it makes the
 command do nothing, and clearing it resets all of history, which is a much
 larger instruction than the operator gave.
 
+`sync_runs` is pruned after each clean pass, to `RunsRetention` (90 days),
+never below `KeepRuns` (`internal/syncer/loop.go`) — a floor asserted equal
+to `status.HealthScanLimit` by `TestKeepRunsIsTheHealthScanWindow`, so
+housekeeping can never delete a row the health rule is about to read. It is
+not a flag: a retention period is not a knob a self-hoster needs, and every
+flag is a README row and a Dockerfile line the config-drift test then
+polices. The prune runs in `RunOnce` (`engine.go`) as part of
+`housekeep`, *after* the pass proper (`pass`) has returned — so after the
+ledger transaction commits (`TestRunOnce_PruneRunsOnlyAfterTheLedgerCommits`
+pins that) and after `pass`'s deferred `FinishRun` has closed the run's own
+row. It is guarded by `err == nil && !dryRun`, which is exactly a clean,
+real pass (`pass` returns nil for one only from its last line), and by
+`ctx.Err() == nil`, so it never runs on a failed or dry pass, and a
+shutdown landing right after the commit skips it rather than logging a
+misleading warning. A prune
+failure is logged at Warn and never marks the pass incomplete: it is not a
+like reaching or missing durable state, so invariant 2 does not apply to it.
+`PruneRuns` also leaves every unfinished row alone regardless of age — one
+per hard crash, kept rather than guessed at.
+
+The daemon's own scheduled backup (`internal/syncer/backup.go`, wired as
+`Engine.Backups`) is the other half of `housekeep`, under the same guard,
+and runs before the prune rather than after, so a restore from that day's
+snapshot still carries the rows the prune is about to delete
+(`TestRunOnce_BackupPrecedesPruneRuns`). Running it after `FinishRun`
+rather than inside the pass is what keeps the snapshot free of an open
+run: taken mid-pass, every snapshot carried its own row unfinished, and
+each restore brought back a phantom in-flight run that `PruneRuns` would
+keep forever (`TestRunOnce_SnapshotCarriesItsOwnRunFinished`). A failed
+snapshot attempt is logged at Warn and does not mark the pass incomplete, for the same reason a failed run-prune does not: it is
+not a like reaching or missing durable state, so invariant 2 does not
+apply to it. The daily gate has two parts and neither is durable: a
+snapshot is skipped once `difmsync-<today>.db` already exists on disk
+(survives a restart), and an *attempt* — landed or failed — is recorded
+only in an in-memory `lastAttempt` field on `*Backups` (does not survive
+one). That split is deliberate: a permanent failure (an unwritable
+directory) should warn once a day rather than once a pass, but should not
+need surviving a restart to be retried, since the cause may have been
+transient and cleared in the meantime.
+
 ## Testing
 
 - `pkg/match` is where matching quality is proven. Any weight or
   threshold change must keep both directions passing: wrong edits stay
   below the auto bar, and genuine matches stay above it.
+- `pkg/match/fuzz_test.go` fuzzes `Normalize`, `Parse` and `Score`: no
+  panic, `Normalize` is idempotent, and a score lies in `[0, 1]`. The
+  seed corpus runs as ordinary test cases in `just check`; `just fuzz`
+  spends real wall-clock time exploring beyond it and is not part of the
+  gate. A crasher it finds is committed under `pkg/match/testdata/fuzz/`
+  as a permanent seed alongside the fix, not deleted once green — that
+  corpus is what caught `artistSplit` treating a separator word as a
+  match anywhere in a name rather than only between two names, which
+  parsed `X Ambassadors` down to `ambassadors` and collapsed `X & Beta`
+  to `beta`, auto-matching a different artist's track at full confidence.
+  The fix — a separator word must have whitespace on both sides to
+  count as one — is pinned by named cases in `match_test.go`
+  (`TestParse`), not only by the fuzz property that found it; a property
+  general enough to catch the bug is not specific enough to prevent a
+  regression from reading as intentional.
 - The DI.fm client tests run against a recorded fixture
   (`pkg/difm/testdata/`), never the live API.
 - `just check` (lint + workflow lint + race tests + codegen, go.mod and
@@ -254,8 +343,11 @@ larger instruction than the operator gave.
   production**: that the database ends up owned by `PUID` rather than
   root, that a root-run healthcheck leaves nothing root-owned behind,
   that a root-owned restored database is repaired rather than
-  crash-looping, that difmsync is pid 1 and exits 0 on SIGTERM, and that
-  the arm64 image runs at all. Add to that list when a new startup
+  crash-looping, that a root-owned backup directory (seeded to make the
+  fixture non-vacuous, the way the healthcheck negative control is) is
+  likewise repaired rather than leaving the daemon's own daily snapshot
+  silently broken, that difmsync is pid 1 and exits 0 on SIGTERM, and
+  that the arm64 image runs at all. Add to that list when a new startup
   behaviour can fail quietly.
 
   They live in `.github/workflows/container-tests.yml`, which `ci.yml`
@@ -301,11 +393,16 @@ wrong:
   `/app/difmsync` is internal. The wrapper drops to `PUID:PGID`;
   `docker/healthcheck.sh` goes through it rather than repeating the drop.
   A root process that creates a file under `/config` leaves it
-  root-owned, and the entrypoint repairs the database and its sidecars by
-  name but nothing else — its directory chown re-runs only when `/config`
-  *itself* has the wrong owner, which in steady state it does not.
-  `backup` is the case that lasts: run as root it creates
-  `/config/backups` root-owned and every snapshot in it.
+  root-owned, and the directory chown re-runs only when `/config`
+  *itself* has the wrong owner, which in steady state it does not — so a
+  file some other root process created is not fixed by that chown alone.
+  `backup` run as `/app/difmsync` (or the host-cron recipe the runbook
+  used to document) is the case that used to last: it created
+  `/config/backups` root-owned, and every snapshot in it, with nothing to
+  repair it short of a manual `chown`. It no longer lasts — see the fifth
+  repaired path below — but `/difmsync` still avoids creating the
+  root-owned window in the first place, which is why it stays the
+  documented way in.
 
   So: any new exec-based entry point goes through `/difmsync`, and any
   doc that tells an operator to exec names `/difmsync`. A path documented
@@ -318,9 +415,48 @@ wrong:
   `DIFMSYNC_DB_PATH`. That is what makes the documented restore work at
   all: `docker cp` lands the file root-owned `0600` inside a correctly-
   owned `/config`, which the conditional chown skips. It also covers a
-  `DIFMSYNC_DB_PATH` pointed outside `/config` entirely. Four named paths
-  rather than a recursive walk, so it stays cheap with a year of backups
-  in `/config`.
+  `DIFMSYNC_DB_PATH` pointed outside `/config` entirely. The fifth named
+  path is `DIFMSYNC_BACKUP_DIR` itself (`/config/backups` by default),
+  repaired directory-level only rather than by walking its contents —
+  unlinking a root-owned file only needs the directory's write bit, so a
+  bare chown of the directory is enough to let the daemon's own daily
+  snapshot and its prune both write again, without a recursive pass over
+  a year of accumulated snapshots. Five named paths rather than a
+  recursive walk, so it stays cheap with a year of backups in `/config`.
+
+- **The privilege drop needs a narrow, proven capability set.**
+  `docker/entrypoint.sh` runs as root only long enough to chown and drop;
+  what it does in that window is `chown` (by path, never recursively
+  except the top-level `/config` fallback) and `su-exec`'s switch to
+  `PUID:PGID`. `compose.yaml` and the README's `docker run` snippet grant
+  exactly `CHOWN` (the repair itself), `DAC_OVERRIDE` (`chown -R` has to
+  read into a directory it does not yet own to recurse into it —
+  enumerating is gated separately from the chown syscall itself, which
+  `CAP_CHOWN` alone covers), `SETUID` and `SETGID` (`su-exec`'s drop to
+  `PUID`/`PGID`), under `cap_drop: ALL` and `no-new-privileges:true`.
+  `FOWNER` was tried and left out: it gates `chmod`/`utimes`/`unlink` on
+  paths the caller does not own, and the entrypoint only ever stats and
+  chowns, so dropping it and repeating every scenario in
+  `container-tests.yml` still repaired ownership correctly. Each of the
+  four granted capabilities is proven load-bearing by its own negative
+  control in `container-tests.yml` — dropping just that one capability
+  fails a specific step in a specific way, not a generic permission
+  error, so the set is not guesswork that happens to work today.
+
+- **`sqlite.Open` refuses a database SQLite cannot read.** Two different
+  paths reach `ErrCorrupt`, and both matter because they catch different
+  damage: connecting classifies the driver's own codes 11
+  (`SQLITE_CORRUPT`) and 26 (`SQLITE_NOTADB`), which is where a truncated
+  or non-SQLite file fails — before any pragma runs, because SQLite
+  validates the page header at connect time — and `PRAGMA quick_check`,
+  on its own budget after that, catches in-place corruption that leaves
+  the header intact. Both return `ErrCorrupt` with the same one-line
+  restore pointer, so `cmd/difmsync` suppresses its usual
+  volume-ownership hint for it — a corrupt file is not a permissions
+  problem, and handing an operator two contradictory next steps for one
+  failure is worse than handing them one. The healthcheck opens the
+  database the same way, so a corrupt file fails `status --check` (and
+  `/healthz`) too, not just the next query that happens to touch it.
 
 - **The image declares its own `HEALTHCHECK`.** It lived only in
   `compose.yaml`, which left the `docker run` deployment the README leads
@@ -361,8 +497,9 @@ front, that is every peer on the tailnet, not one host. The nonce is the
 only guard that survives that, which is why it is the first of the four
 rather than a convenience.
 
-- It exists **only while there is no refresh token**, and shuts down for
-  the life of the process the moment one is stored. A *failed* consent
+- It exists **only while there is no refresh token**, and shuts down the
+  moment one is stored; it comes back only if the grant is later revoked
+  and the token cleared (below). A *failed* consent
   deliberately leaves it up: a denied grant or a mistyped state has to be
   retryable by clicking the URL again, not by restarting the container.
   `done` fires only after `Complete` returns nil, so the narrowing is the
@@ -375,12 +512,36 @@ rather than a convenience.
   token. Watching only its own callback left the daemon waiting forever
   on a URL nobody was going to open, with the account row already
   authorized, which is what made it hard to see.
-- Starting a flow requires a **nonce** generated at startup and emitted
-  once, to the log — one per process, valid until consent completes,
-  rather than one per attempt. Reaching the port is not sufficient. Without this,
-  anyone who could reach it could complete consent with their own Spotify
-  account and bind the sync to a stranger's playlist — the endpoint is
-  unauthenticated by necessity, since the operator has no session yet.
+
+  The converse also holds: when the token endpoint rejects the refresh
+  token (`spotify.ErrGrantRevoked`, and only that — an API 403 is not
+  it), `syncRunner` (`runloop.go`) clears the stored token and re-enters
+  the same wait. The daemon heals the way it bootstraps, through the same
+  `consentFlow`, with no new code path. Clearing first is what keeps this
+  sentence literal.
+
+  The clear is a **compare-and-clear on the token the engine held**
+  (`ClearSpotifyRefreshTokenIf`), not an unconditional one. The engine
+  keeps its token in memory for its whole life, while `review
+  --approve`, a one-shot `sync` or `auth --manual` in another process
+  may store a newer one; a rejection of the engine's copy is no verdict
+  on that. "Held" means the engine's *current* token — the one it was
+  built from, updated on every rotation it persists — because comparing
+  against the built-from copy instead would never match after a
+  rotation and leave a genuinely revoked token uncleared. A mismatch
+  sends the runner round again with the stored token, whose engine
+  probes the token endpoint at once; if that one is dead too, the next
+  rejection clears it. `TestSyncRunnerRetriesATokenReplacedWhileTheEngineRan`
+  and `TestSyncRunnerClearsATokenTheEngineRotatedItself` pin the two
+  directions.
+- Starting a flow requires a **nonce** generated when the wait begins
+  and emitted once, to the log — one per consent wait, valid until that
+  consent completes, rather than one per attempt. A daemon whose grant is
+  revoked mid-life re-enters the wait and gets a fresh one. Reaching the
+  port is not sufficient. Without this, anyone who could reach it could
+  complete consent with their own Spotify account and bind the sync to a
+  stranger's playlist — the endpoint is unauthenticated by necessity,
+  since the operator has no session yet.
 - The callback is guarded by the OAuth `state` parameter rather than the
   nonce, because Spotify redirects a browser to it and will not carry an
   extra parameter. That is the standard protection and the same one
@@ -441,29 +602,66 @@ Two consequences for code:
   `pkg/difm` scrubs the member id at the source as well
   (`scrubMemberID`), so the two defenses are independent.
 
+- `Report` also carries `version`, `last_success_at` and
+  `consecutive_failures`, none of which cost a second query:
+  `health()` returns the accepted row alongside its verdict, so
+  `last_success_at` is that row's own `finished_at` rather than a
+  fetch that could disagree with what decided the verdict, and
+  `consecutive_failures` walks the same fixed window, capped at
+  `HealthScanLimit` (20 means "at least 20").
+
+  What the endpoints *may* say is the kind: `describe()` switches on
+  `sync_runs.error_kind` first. A kind is an enum the engine chose from
+  its own sentinels, so naming it is not interpolation. A new reason
+  string may name a kind; it may not include `Error`. The exclusion is
+  enforced at both ends: `FinishRun` refuses to write a kind the store
+  does not define, and `newRun` publishes one only if `Known()` accepts
+  it — because the endpoints answer from whatever database they are
+  handed, restored or hand-edited included, and a guard in a different
+  process is not a guard. `TestStatusJSONDropsAnUnknownKind` is the
+  negative control.
+
 The health rule itself: the newest `sync_runs` row that finished,
 recorded no error, and was **not** a dry run must be within
-`--max-age`, **and must be within the last `healthScanLimit` (20) rows**.
+`--max-age`, **and must be within the last `HealthScanLimit` (20) rows**.
 The dry-run clause is load-bearing — the deployed loop never dry-runs, so
 without it a stale `just dry-run` from a debugging session keeps the probe
 green over a daemon that has not completed a real pass in days.
 
+`--max-age` unset is 3 × the floored interval — `MinInterval`, the same
+floor `Loop` applies — rather than a second number to keep in sync with
+it. `effectiveMaxAge` (`cmd/difmsync/main.go`) decides this once, and
+both the daemon's `status.Handler` and `status --check`'s `status.Build`
+call through it, so the two cannot compute from different intervals and
+disagree. The declared default stays `45m` in the flag and the README
+table regardless — `TestConfigSurfaceIsDocumentedAndConsistent` compares
+those two, and the `Dockerfile` sets no override — and an empty `DIFMSYNC_STATUS_MAX_AGE=` counts as
+unset (`nonEmptyEnv`), because urfave/cli otherwise treats the variable
+existing at all, even empty, as the flag being set.
+
 The row-count clause is a real part of the rule, not an implementation
-detail, so it is stated here rather than left to be discovered. It is
-unreachable at production defaults (20 rows at a 15m interval spans ~5h,
-well past the 45m `--max-age`) but reachable at any interval short enough
-that 20 rows span less than `--max-age` — a 2m interval, say, where 20
-rows is 40m and the window is 45m. There, a clean pass with 20 failures
-stacked on top of it reports unhealthy. That verdict is arguably the better one, which is why the
-window stays; what is not acceptable is the two disagreeing silently.
+detail, so it is stated here rather than left to be discovered. At one
+row per interval it is never the binding constraint — `HealthScanLimit`
+rows at interval *i* span ~20*i*, past the 3*i* `--max-age` derives to
+for every *i* — but rows are not always one per interval: a
+`Retry-After` shorter than the interval, or repeated restarts, can stack
+twenty failed rows in far less than 3*i* and evict the clean row behind
+them from the window. That verdict is arguably the better one, which is
+why the window stays; what is not acceptable is the two disagreeing
+silently.
 
 The scan window is deliberately decoupled from the caller's display
-limit. `health()` looks for the newest *qualifying* row, so letting a
-caller asking for a short list also narrow the search made `/healthz`
-disagree with `status --check` for the duration of every pass — the
-engine opens a `sync_runs` row when a pass starts, so at a limit of 1 the
-only visible row was the in-flight one. `Build` scans the fixed window,
-decides, and truncates afterwards; `TestHealthIgnoresRunLimit` pins it.
+limit, and fixed in **both** directions. `health()` looks for the newest
+*qualifying* row, so letting a caller asking for a short list also
+narrow the search made `/healthz` disagree with `status --check` for the
+duration of every pass — the engine opens a `sync_runs` row when a pass
+starts, so at a limit of 1 the only visible row was the in-flight one.
+Widening was the same bug the other way: a large `--limit` let
+`status --limit 50` see further back than `/healthz` did and disagree
+about the verdict. `Build` scans the fixed window, decides, and
+truncates afterwards regardless of what the caller asked to see;
+`TestHealthIgnoresRunLimit` pins the narrowing case and
+`TestScanWindowIsFixedInBothDirections` the widening one.
 
 ## Credentials
 

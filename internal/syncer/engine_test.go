@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/internal/syncer"
+	"github.com/mjrossi/difm-spotify-sync/pkg/difm"
 	"github.com/mjrossi/difm-spotify-sync/pkg/spotify"
 )
 
@@ -414,6 +417,9 @@ func TestRunOnce_RateLimitAbortsPass(t *testing.T) {
 	if got := h.reload(t).WatermarkLikedAt; !got.IsZero() {
 		t.Errorf("watermark = %s, want unchanged", got)
 	}
+	if got := h.lastRunKind(t); got != sqlite.KindRateLimited {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindRateLimited)
+	}
 }
 
 // `resync` is the recovery escape hatch, and the deployment keeps the
@@ -654,5 +660,548 @@ func TestLoopClampsANonPositiveInterval(t *testing.T) {
 				t.Fatal("Loop did not return after its context was canceled")
 			}
 		})
+	}
+}
+
+// The DI.fm API key is a long-lived token with no rotation path, and a
+// rejected one used to be indistinguishable from a network blip: the
+// same "sync pass failed" line, the same generic healthcheck reason. The
+// kind is what lets /healthz say which it was — but the dedicated branch's
+// only *other* observable effect is its log line (the generic branch
+// below it also satisfies errors.Is and the defer classifies either one
+// the same way), so that line is asserted directly here.
+func TestRunOnce_DiFMUnauthorizedIsTypedAndLogged(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.difmUnauthorized = true
+
+	_, err := h.Engine.RunOnce(ctx, false)
+	if !errors.Is(err, difm.ErrUnauthorized) {
+		t.Fatalf("err = %v, want difm.ErrUnauthorized", err)
+	}
+	if h.SearchCount != 0 {
+		t.Errorf("issued %d searches with no likes readable, want 0", h.SearchCount)
+	}
+	if got := h.reload(t).WatermarkLikedAt; !got.IsZero() {
+		t.Errorf("watermark = %s, want unchanged", got)
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindDiFMUnauthorized {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindDiFMUnauthorized)
+	}
+	if !strings.Contains(h.Logs.String(), "DI.fm rejected the API key") {
+		t.Errorf("operator-facing line missing from log:\n%s", h.Logs.String())
+	}
+}
+
+// The dry-run early return sits above the !passClean site that normally
+// sets KindIncomplete, so a dry run that swallowed a failure used to fall
+// through to the defer's raw classify(stats.Err) — recording a plain
+// "error" for a failure mode that is, in every other respect, identical
+// to the non-dry-run incomplete case.
+func TestRunOnce_DryRunSwallowedFailureIsRecordedAsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.failSearch["One"] = true
+
+	// The dry-run error is nil today regardless of a swallowed failure —
+	// pre-existing behavior this task does not change.
+	_, err := h.Engine.RunOnce(ctx, true)
+	if err != nil {
+		t.Fatalf("RunOnce(dry): %v", err)
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindIncomplete {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindIncomplete)
+	}
+}
+
+// A pass that swallowed a failure is recorded as incomplete, distinct
+// from one that aborted: the writes it made are durable and only the
+// watermark was held.
+func TestRunOnce_SwallowedFailureIsRecordedAsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.failSearch["One"] = true
+
+	_, err := h.Engine.RunOnce(ctx, false)
+	if !errors.Is(err, syncer.ErrPassIncomplete) {
+		t.Fatalf("err = %v, want ErrPassIncomplete", err)
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindIncomplete {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindIncomplete)
+	}
+}
+
+// fakeAfter stands in for time.After. Each delay Loop asks for is sent
+// on asked; each wait completes when the test sends on fire. Receiving
+// from asked is how a test knows Loop has reached its next wait, which
+// keeps the assertions free of sleeps and races.
+type fakeAfter struct {
+	asked chan time.Duration
+	fire  chan time.Time
+}
+
+func newFakeAfter() *fakeAfter {
+	return &fakeAfter{asked: make(chan time.Duration, 8), fire: make(chan time.Time)}
+}
+
+func (f *fakeAfter) after(d time.Duration) <-chan time.Time {
+	f.asked <- d
+	return f.fire
+}
+
+// startLoop runs Loop in the background and returns its result channel.
+func startLoop(ctx context.Context, h *harness, clock *fakeAfter, interval time.Duration) <-chan error {
+	syncer.SetAfter(h.Engine, clock.after)
+	done := make(chan error, 1)
+	go func() { done <- h.Engine.Loop(ctx, interval, false) }()
+	return done
+}
+
+// There was no Loop test that let a tick fire. These three drive the
+// ticker through a fake clock and pin the scheduling decisions the
+// daemon's whole cadence depends on.
+func TestLoop_ReschedulesAtTheIntervalAfterAPass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, nil)
+	clock := newFakeAfter()
+	const interval = 2 * time.Hour
+
+	done := startLoop(ctx, h, clock, interval)
+	if jitter := <-clock.asked; jitter < 0 || jitter >= interval/4 {
+		t.Errorf("first wait = %s, want a jitter in [0, %s)", jitter, interval/4)
+	}
+	clock.fire <- time.Time{} // first pass runs
+	if got := <-clock.asked; got != interval {
+		t.Errorf("wait after a clean pass = %s, want %s", got, interval)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Loop returned %v after cancellation, want nil", err)
+	}
+}
+
+func TestLoop_RateLimitDelaysTheNextPassByRetryAfter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.rateLimitSearch = true
+	h.retryAfter = "300"
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked // jitter
+	clock.fire <- time.Time{}
+	if got := <-clock.asked; got != 5*time.Minute {
+		t.Errorf("wait after a 429 with Retry-After 300 = %s, want 5m", got)
+	}
+	// Written without synchronization against the stub server's handler
+	// goroutine, which is safe because Loop is parked at its select (we
+	// just received from asked), so no request is in flight to race with.
+	h.rateLimitSearch = false
+	clock.fire <- time.Time{}
+	if got := <-clock.asked; got != 2*time.Hour {
+		t.Errorf("wait after the pass following a rate limit = %s, want the interval %s", got, 2*time.Hour)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Loop returned %v after cancellation, want nil", err)
+	}
+}
+
+func TestLoop_ReturnsWhenTheGrantIsRevoked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+	h.revokeGrant = true
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked // jitter
+	clock.fire <- time.Time{}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, spotify.ErrGrantRevoked) {
+			t.Errorf("Loop returned %v, want ErrGrantRevoked", err)
+		}
+	case d := <-clock.asked:
+		t.Fatalf("Loop rescheduled (%s) instead of returning on a revoked grant", d)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Loop neither returned nor rescheduled")
+	}
+	if got := h.lastRunKind(t); got != sqlite.KindSpotifyGrantRevoked {
+		t.Errorf("recorded kind = %q, want %q", got, sqlite.KindSpotifyGrantRevoked)
+	}
+}
+
+// infoLines returns the Info-level lines in the harness log.
+func infoLines(h *harness) []string {
+	var out []string
+	for _, line := range strings.Split(h.Logs.String(), "\n") {
+		if strings.Contains(line, "level=INFO") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// An idle pass used to cost two Info lines that said nothing and did not
+// say when the next attempt was. Now it is one line that says both.
+func TestLoop_IdlePassLogsOneLineWithNextRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, nil)
+	clock := newFakeAfter()
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.FixedZone("+01:00", 3600))
+	syncer.SetNow(h.Engine, func() time.Time { return now })
+	const interval = 2 * time.Hour
+
+	done := startLoop(ctx, h, clock, interval)
+	<-clock.asked
+	h.Logs.Reset() // drop "starting sync loop"
+	clock.fire <- time.Time{}
+	<-clock.asked
+
+	// Captured before cancel: shutdown adds its own "sync loop stopped"
+	// Info line, a real once-per-process lifecycle event rather than
+	// idle-pass noise, and it would otherwise land in this same buffer.
+	lines := infoLines(h)
+	log := h.Logs.String()
+	cancel()
+	<-done
+
+	if len(lines) != 1 || !strings.Contains(lines[0], "pass finished") {
+		t.Fatalf("idle pass logged %d Info line(s), want exactly one 'pass finished':\n%s", len(lines), h.Logs.String())
+	}
+	want := now.Add(interval).Format(time.RFC3339)
+	if !strings.Contains(lines[0], "next_run="+want) {
+		t.Errorf("line = %q, want next_run=%s", lines[0], want)
+	}
+	if !strings.Contains(lines[0], "clean=true") || !strings.Contains(lines[0], "fetched=0") {
+		t.Errorf("line = %q, want clean=true fetched=0", lines[0])
+	}
+	// Demoted to Debug, not deleted: the handler is at Debug level here
+	// specifically so this is distinguishable from the line never firing.
+	if !strings.Contains(log, `level=DEBUG msg="fetched likes"`) {
+		t.Errorf("idle pass lacks a Debug 'fetched likes' line:\n%s", log)
+	}
+}
+
+// An active pass keeps its detail: the summary line is in addition to,
+// not instead of, the lines that say what was matched.
+func TestLoop_ActivePassKeepsItsDetailLines(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked
+	h.Logs.Reset()
+	clock.fire <- time.Time{}
+	<-clock.asked
+	cancel()
+	<-done
+
+	log := h.Logs.String()
+	for _, want := range []string{"fetched likes", "sync complete", "pass finished", "added=1"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("active pass log lacks %q:\n%s", want, log)
+		}
+	}
+}
+
+// A failed pass names its kind on the summary line, in the same
+// vocabulary /status.json publishes as error_kind, so a log line and the
+// endpoint always agree on why — never the error text itself.
+func TestLoop_FailedPassNamesItsKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.difmUnauthorized = true
+	clock := newFakeAfter()
+
+	done := startLoop(ctx, h, clock, 2*time.Hour)
+	<-clock.asked
+	h.Logs.Reset()
+	clock.fire <- time.Time{}
+	<-clock.asked
+	cancel()
+	<-done
+
+	log := h.Logs.String()
+	if !strings.Contains(log, "clean=false") || !strings.Contains(log, "kind=difm_unauthorized") {
+		t.Errorf("failed pass log lacks clean=false/kind=difm_unauthorized:\n%s", log)
+	}
+}
+
+// A one-shot with nothing to do says nothing at Info: the exit code is
+// the answer, and a cron or CI caller has nothing to read.
+func TestRunOnce_IdlePassIsQuietAtInfo(t *testing.T) {
+	h := newHarness(t, nil)
+	if _, err := h.Engine.RunOnce(context.Background(), false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if lines := infoLines(h); len(lines) != 0 {
+		t.Errorf("idle one-shot logged at Info:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+// seedOldRuns writes n finished runs with started_at well past the
+// retention window, so a clean pass has something to prune.
+func seedOldRuns(t *testing.T, h *harness, n int) {
+	t.Helper()
+	ctx := context.Background()
+	old := time.Now().Add(-syncer.RunsRetention - 24*time.Hour)
+	h.Store.SetClock(func() time.Time { return old })
+	defer h.Store.SetClock(time.Now)
+	for range n {
+		id, err := h.Store.StartRun(ctx, h.Engine.Account.ID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := h.Store.FinishRun(ctx, id, sqlite.RunStats{}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+}
+
+func runCount(t *testing.T, h *harness) int {
+	t.Helper()
+	runs, err := h.Store.ListRuns(context.Background(), h.Engine.Account.ID, 1000)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	return len(runs)
+}
+
+// Housekeeping rides on a clean pass and on nothing else: a failed pass
+// has better things to do, and a dry run writes nothing by definition.
+func TestRunOnce_CleanPassPrunesOldRuns(t *testing.T) {
+	h := newHarness(t, nil)
+	seedOldRuns(t, h, syncer.KeepRuns+10)
+
+	if _, err := h.Engine.RunOnce(context.Background(), false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// KeepRuns newest survive; the pass's own row is among them.
+	if got := runCount(t, h); got != syncer.KeepRuns {
+		t.Errorf("%d rows after a clean pass, want %d", got, syncer.KeepRuns)
+	}
+	runs, err := h.Store.ListRuns(context.Background(), h.Engine.Account.ID, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if runs[0].FinishedAt == "" {
+		t.Error("newest run has no FinishedAt; the pass's own row did not survive pruning")
+	}
+	startedAt, err := time.Parse(sqlite.TimeFormat, runs[0].StartedAt)
+	if err != nil {
+		t.Fatalf("parse StartedAt %q: %v", runs[0].StartedAt, err)
+	}
+	if since := time.Since(startedAt); since < 0 || since > time.Minute {
+		t.Errorf("newest run StartedAt = %s, want within the last minute", startedAt)
+	}
+}
+
+func TestRunOnce_FailedAndDryPassesDoNotPrune(t *testing.T) {
+	t.Run("failed", func(t *testing.T) {
+		h := newHarness(t, []like{aLike(1, "A", "One", 200, feb)})
+		h.failSearch["One"] = true
+		seedOldRuns(t, h, syncer.KeepRuns+10)
+		_, _ = h.Engine.RunOnce(context.Background(), false)
+		if got := runCount(t, h); got != syncer.KeepRuns+11 {
+			t.Errorf("%d rows after a failed pass, want %d (nothing pruned)", got, syncer.KeepRuns+11)
+		}
+	})
+	t.Run("dry run", func(t *testing.T) {
+		h := newHarness(t, nil)
+		seedOldRuns(t, h, syncer.KeepRuns+10)
+		if _, err := h.Engine.RunOnce(context.Background(), true); err != nil {
+			t.Fatalf("RunOnce(dry): %v", err)
+		}
+		if got := runCount(t, h); got != syncer.KeepRuns+11 {
+			t.Errorf("%d rows after a dry run, want %d (nothing pruned)", got, syncer.KeepRuns+11)
+		}
+	})
+}
+
+// A prune failure is logged and swallowed. It is not a like reaching or
+// missing durable state, so invariant 2 is not in play: the pass is
+// still clean and the watermark still moves.
+func TestRunOnce_PruneFailureDoesNotMarkThePassIncomplete(t *testing.T) {
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	// A trigger that refuses every delete on sync_runs.
+	h.exec(t, `CREATE TRIGGER no_prune BEFORE DELETE ON sync_runs BEGIN SELECT RAISE(ABORT, 'no'); END`)
+	seedOldRuns(t, h, syncer.KeepRuns+1)
+
+	if _, err := h.Engine.RunOnce(context.Background(), false); err != nil {
+		t.Fatalf("RunOnce returned %v, want nil despite the prune failure", err)
+	}
+	if got := h.reload(t).WatermarkLikedAt; !got.Equal(feb) {
+		t.Errorf("watermark = %s, want %s — the pass was clean", got, feb)
+	}
+	if !strings.Contains(h.Logs.String(), "could not prune") {
+		t.Errorf("prune failure not logged:\n%s", h.Logs.String())
+	}
+}
+
+// The prune is appended after invariant 1's chain, not inserted into
+// it; if it ever moves ahead of the ledger transaction this fails.
+func TestRunOnce_PruneRunsOnlyAfterTheLedgerCommits(t *testing.T) {
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.exec(t, `CREATE TRIGGER no_ledger BEFORE INSERT ON synced_tracks BEGIN SELECT RAISE(ABORT, 'no'); END`)
+	seedOldRuns(t, h, syncer.KeepRuns+10)
+
+	if _, err := h.Engine.RunOnce(context.Background(), false); err == nil {
+		t.Fatal("RunOnce returned nil, want an error — the ledger write failed")
+	}
+	// Nothing pruned: seeded rows plus the pass's own row all survive.
+	if got := runCount(t, h); got != syncer.KeepRuns+11 {
+		t.Errorf("%d rows after a failed ledger write, want %d (nothing pruned)", got, syncer.KeepRuns+11)
+	}
+}
+
+// cancelAfterN wraps a context so its explicit Err() calls report nil for
+// the first n and context.Canceled after — without ever closing Done(),
+// so nothing that watches the context's cancellation channel (an
+// in-flight HTTP request, a database/sql call) is actually disturbed.
+// RunOnce checks ctx.Err() explicitly exactly twice in a pass that writes:
+// once before the ledger transaction and once before backup/prune. That
+// makes n a precise way to land a simulated shutdown between two specific
+// statements that no other technique can target without a real,
+// unreproducible race.
+type cancelAfterN struct {
+	context.Context
+	n     int
+	calls int
+}
+
+func (c *cancelAfterN) Err() error {
+	c.calls++
+	if c.calls > c.n {
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
+
+// TestRunOnce_NoBackupWhenContextCanceledAfterLedgerCommit pins the
+// ctx.Err() guard around the backup/prune housekeeping: a shutdown that
+// lands after the ledger transaction commits but before housekeeping runs
+// must skip the snapshot (and the prune), not attempt it against a
+// process that is already on its way out.
+func TestRunOnce_NoBackupWhenContextCanceledAfterLedgerCommit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "backups")
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.Engine.Backups = &syncer.Backups{Dir: dir, Keep: 14}
+
+	// The first ctx.Err() call (before the ledger tx) must read as not
+	// canceled, so the ledger commits; the second (before backup/prune)
+	// must read as canceled.
+	ctx := &cancelAfterN{Context: context.Background(), n: 1}
+	if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+		t.Fatalf("RunOnce: %v, want nil — a shutdown here is documented as a clean stop", err)
+	}
+	if got := h.reload(t).WatermarkLikedAt; !got.Equal(feb) {
+		t.Errorf("watermark = %s, want %s — the ledger commit must have completed before cancellation was observed", got, feb)
+	}
+	if got := snapshots(t, dir); len(got) != 0 {
+		t.Errorf("snapshot taken after the context was canceled: %v", got)
+	}
+}
+
+// TestRunOnce_BackupPrecedesPruneRuns pins the stated order in engine.go:
+// the snapshot is taken before PruneRuns runs, so a restore from that
+// day's file still carries the sync_runs rows the prune is about to
+// delete rather than the already-trimmed table. Pinned by reading the row
+// count back out of the snapshot file itself — an order flip would still
+// pass a test that only asserted the snapshot exists, since the prune
+// failing or succeeding doesn't stop the backup either way; only the
+// snapshot's actual contents distinguish the two orders.
+func TestRunOnce_BackupPrecedesPruneRuns(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "backups")
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.Engine.Backups = &syncer.Backups{Dir: dir, Keep: 14}
+	seeded := syncer.KeepRuns + 10
+	seedOldRuns(t, h, seeded)
+
+	if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := runCount(t, h); got != syncer.KeepRuns {
+		t.Fatalf("live rows after the pass = %d, want %d — prune did not run", got, syncer.KeepRuns)
+	}
+
+	dest := filepath.Join(dir, "difmsync-"+time.Now().UTC().Format("2006-01-02")+".db")
+	snap, err := sqlite.Open(dest)
+	if err != nil {
+		t.Fatalf("open snapshot: %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+	runs, err := snap.ListRuns(ctx, h.Engine.Account.ID, 1000)
+	if err != nil {
+		t.Fatalf("ListRuns on snapshot: %v", err)
+	}
+	// seeded rows, plus this pass's own row — none pruned yet at the
+	// moment the snapshot was taken.
+	if want := seeded + 1; len(runs) != want {
+		t.Errorf("snapshot carries %d run(s), want %d — the backup must run before PruneRuns "+
+			"so it still has the rows the prune is about to delete", len(runs), want)
+	}
+}
+
+// TestRunOnce_SnapshotCarriesItsOwnRunFinished pins why housekeeping runs
+// after pass returns rather than inside it: the snapshot must be taken
+// once the pass's own sync_runs row is closed. Taken from inside the pass,
+// every snapshot held that row still open, so each restore brought back a
+// phantom in-flight run that PruneRuns — which never touches an
+// unfinished row — kept forever.
+func TestRunOnce_SnapshotCarriesItsOwnRunFinished(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "backups")
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.Engine.Backups = &syncer.Backups{Dir: dir, Keep: 14}
+
+	if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	dest := filepath.Join(dir, "difmsync-"+time.Now().UTC().Format("2006-01-02")+".db")
+	snap, err := sqlite.Open(dest)
+	if err != nil {
+		t.Fatalf("open snapshot: %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+	runs, err := snap.ListRuns(ctx, h.Engine.Account.ID, 1000)
+	if err != nil {
+		t.Fatalf("ListRuns on snapshot: %v", err)
+	}
+	if len(runs) == 0 {
+		t.Fatal("snapshot carries no sync_runs rows, want this pass's own")
+	}
+	for _, r := range runs {
+		if r.FinishedAt == "" {
+			t.Errorf("snapshot carries run %d unfinished; a restore would show it in flight forever", r.ID)
+		}
 	}
 }

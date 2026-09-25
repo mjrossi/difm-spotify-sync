@@ -1,6 +1,7 @@
 package syncer_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -85,6 +86,12 @@ type harness struct {
 	// a specific write).
 	DBPath string
 
+	// Logs captures everything the engine logs, so a test can assert on an
+	// operator-facing line rather than only on state. Discarding logs left
+	// a branch whose only observable effect is its log line indistinguishable
+	// from deleting it.
+	Logs *bytes.Buffer
+
 	// Knobs the tests flip.
 	inPlaylist       []string
 	searchResult     map[string][]spotifyTrack
@@ -92,6 +99,17 @@ type harness struct {
 	failSearch       map[string]bool
 	rateLimitSearch  bool
 	failPlaylistRead bool
+	difmUnauthorized bool
+	// retryAfter is the Retry-After header sent with a rate-limited
+	// search; the engine reads it to schedule the next pass.
+	retryAfter string
+	// revokeGrant makes every Spotify request fail the way the oauth2
+	// transport does when the token endpoint refuses the refresh token.
+	// The error is produced by a RoundTripper rather than a stub token
+	// endpoint because that is the seam the real failure crosses:
+	// http.Client wraps the transport error and the engine sees it
+	// through spotify.Client.do, exactly as in production.
+	revokeGrant bool
 
 	// beforeSearch, when set, runs at the start of each search request.
 	// Tests use it to interleave an event — a shutdown, say — into the
@@ -110,15 +128,34 @@ type harness struct {
 	rawRecords []string
 }
 
+// revokableTransport fails every request with a revoked-grant error while
+// the knob is set, and otherwise forwards to the stub server.
+type revokableTransport struct {
+	h    *harness
+	next http.RoundTripper
+}
+
+func (t revokableTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.h.revokeGrant {
+		return nil, fmt.Errorf("%w (invalid_grant): %w", spotify.ErrGrantRevoked, spotify.ErrUnauthorized)
+	}
+	return t.next.RoundTrip(r)
+}
+
 func newHarness(t *testing.T, likes []like) *harness {
 	t.Helper()
 
 	h := &harness{
 		searchResult: map[string][]spotifyTrack{},
 		failSearch:   map[string]bool{},
+		Logs:         &bytes.Buffer{},
 	}
 
 	difmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.difmUnauthorized {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		if r.URL.Query().Get("page") != "1" {
 			_, _ = io.WriteString(w, "[]")
 			return
@@ -140,7 +177,11 @@ func newHarness(t *testing.T, likes []like) *harness {
 				h.beforeSearch()
 			}
 			if h.rateLimitSearch {
-				w.Header().Set("Retry-After", "30")
+				retryAfter := h.retryAfter
+				if retryAfter == "" {
+					retryAfter = "30"
+				}
+				w.Header().Set("Retry-After", retryAfter)
 				w.WriteHeader(http.StatusTooManyRequests)
 				return
 			}
@@ -224,13 +265,15 @@ func newHarness(t *testing.T, likes []like) *harness {
 
 	h.Store = store
 	h.Engine = &syncer.Engine{
-		DiFM:       dc,
-		Spotify:    spotify.NewClient(spotifySrv.Client(), spotifySrv.URL),
+		DiFM: dc,
+		Spotify: spotify.NewClient(&http.Client{
+			Transport: revokableTransport{h: h, next: spotifySrv.Client().Transport},
+		}, spotifySrv.URL),
 		Store:      store,
 		Account:    account,
 		PlaylistID: "PL1",
 		Thresholds: syncer.Thresholds{Auto: 0.85, Review: 0.60},
-		Log:        slog.New(slog.DiscardHandler),
+		Log:        slog.New(slog.NewTextHandler(h.Logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	return h
 }
@@ -262,6 +305,19 @@ func (h *harness) pending(t *testing.T) []sqlite.ReviewItem {
 		t.Fatalf("list review: %v", err)
 	}
 	return items
+}
+
+// lastRunKind reads the kind recorded on the newest sync_runs row.
+func (h *harness) lastRunKind(t *testing.T) sqlite.RunErrorKind {
+	t.Helper()
+	runs, err := h.Store.ListRuns(context.Background(), h.Engine.Account.ID, 1)
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(runs) == 0 {
+		t.Fatal("no sync_runs row recorded")
+	}
+	return runs[0].ErrorKind
 }
 
 // exec runs a statement against the store's file on a separate

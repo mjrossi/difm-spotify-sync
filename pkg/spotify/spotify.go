@@ -72,6 +72,20 @@ var ErrRateLimited = errors.New("spotify: rate limited")
 // should stop rather than back off and retry.
 var ErrUnauthorized = errors.New("spotify: unauthorized")
 
+// ErrGrantRevoked narrows ErrUnauthorized to the one cause a human can
+// only fix by consenting again: the token endpoint refused the refresh
+// token. It always satisfies errors.Is(err, ErrUnauthorized) too, so the
+// engine's abort branches are unchanged; what it adds is permission for
+// the daemon to clear the stored token and re-run consent. An API
+// 401/403 deliberately does not carry it — a missing scope or a
+// Development Mode restriction is not cured by re-consent, and treating
+// it as revoked would turn one bad request into a consent loop.
+//
+// Only invalid_grant carries it: invalid_client means the client secret
+// is wrong, which does not invalidate the grant, and a bodiless 4xx is
+// an upstream problem, not a verdict on the token.
+var ErrGrantRevoked = errors.New("spotify: refresh token rejected")
+
 // RateLimitError carries Spotify's backoff hint alongside ErrRateLimited.
 // Spotify's Retry-After is authoritative and can be minutes long.
 type RateLimitError struct {
@@ -197,6 +211,11 @@ func (r *rotatingTokenSource) Token() (*oauth2.Token, error) {
 // password change or a revoked app authorization produces — and left
 // untyped the engine misses its abort branch and instead retries every
 // remaining like against a credential that cannot work.
+//
+// It also decides which of those failures is re-consentable: only
+// invalid_grant is typed ErrGrantRevoked. invalid_client and a bodiless
+// 4xx still abort as ErrUnauthorized, but neither means the refresh
+// token itself is dead, so neither may trigger deleting it.
 func classifyTokenError(err error) error {
 	var re *oauth2.RetrieveError
 	if !errors.As(err, &re) {
@@ -212,11 +231,13 @@ func classifyTokenError(err error) error {
 			RetryAfter: retryAfter,
 			StatusCode: re.Response.StatusCode,
 		})
-	case re.ErrorCode == "invalid_grant" || re.ErrorCode == "invalid_client",
+	case re.ErrorCode == "invalid_grant":
+		return fmt.Errorf("%w (%s): %w", ErrGrantRevoked, re.ErrorCode, ErrUnauthorized)
+	case re.ErrorCode == "invalid_client",
 		re.Response != nil && (re.Response.StatusCode == http.StatusUnauthorized ||
 			re.Response.StatusCode == http.StatusBadRequest ||
 			re.Response.StatusCode == http.StatusForbidden):
-		return fmt.Errorf("spotify: refresh token rejected (%s): %w", re.ErrorCode, ErrUnauthorized)
+		return fmt.Errorf("spotify: token endpoint refused (%s): %w", re.ErrorCode, ErrUnauthorized)
 	}
 	return err
 }

@@ -5,13 +5,19 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/pressly/goose/v3"
+
+	migrations "github.com/mjrossi/difm-spotify-sync/migrations-sqlite"
 
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
 	"github.com/mjrossi/difm-spotify-sync/pkg/match"
@@ -121,6 +127,42 @@ func TestEnsureAccountUpsertsAndPreservesToken(t *testing.T) {
 	}
 	if again.SpotifyRefreshToken != "refresh-token" {
 		t.Errorf("refresh token = %q, want it preserved", again.SpotifyRefreshToken)
+	}
+}
+
+// The clear is a compare-and-clear: a token some other process stored
+// after the rejected one must survive, because nothing has rejected it.
+func TestClearSpotifyRefreshTokenIfClearsOnlyTheRejectedToken(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	acct, err := s.EnsureAccount(ctx, "default", "111", "playlistA")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	if err := s.SetSpotifyRefreshToken(ctx, acct.ID, "newer"); err != nil {
+		t.Fatalf("SetSpotifyRefreshToken: %v", err)
+	}
+
+	cleared, err := s.ClearSpotifyRefreshTokenIf(ctx, acct.ID, "older")
+	if err != nil {
+		t.Fatalf("ClearSpotifyRefreshTokenIf(older): %v", err)
+	}
+	if cleared {
+		t.Error("cleared = true for a token that is no longer stored")
+	}
+	if got, _ := s.GetAccount(ctx, "default"); got.SpotifyRefreshToken != "newer" {
+		t.Errorf("token = %q after a stale clear, want newer untouched", got.SpotifyRefreshToken)
+	}
+
+	cleared, err = s.ClearSpotifyRefreshTokenIf(ctx, acct.ID, "newer")
+	if err != nil {
+		t.Fatalf("ClearSpotifyRefreshTokenIf(newer): %v", err)
+	}
+	if !cleared {
+		t.Error("cleared = false for the stored token")
+	}
+	if got, _ := s.GetAccount(ctx, "default"); got.SpotifyRefreshToken != "" {
+		t.Errorf("token = %q, want cleared", got.SpotifyRefreshToken)
 	}
 }
 
@@ -518,4 +560,472 @@ func TestCorruptWatermarkWarnsRatherThanSilentlyZeroing(t *testing.T) {
 	if !strings.Contains(buf.String(), "unparseable watermark") {
 		t.Errorf("logged %q, want a warning naming the unparseable watermark", buf.String())
 	}
+}
+
+// TestFinishRunRecordsTheKind: the kind is what /healthz is allowed to
+// say about a failed pass, so it has to round-trip through the row.
+func TestFinishRunRecordsTheKind(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	runID, err := s.StartRun(ctx, acct.ID, false)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if err := s.FinishRun(ctx, runID, sqlite.RunStats{
+		Err: errors.New("difm: page 1: unauthorized"), Kind: sqlite.KindDiFMUnauthorized,
+	}); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	runs, err := s.ListRuns(ctx, acct.ID, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ErrorKind != sqlite.KindDiFMUnauthorized {
+		t.Fatalf("ListRuns = %+v, want one run with ErrorKind %q", runs, sqlite.KindDiFMUnauthorized)
+	}
+}
+
+// TestErrorKindDefaultsForPreexistingRows: a database written by v1.0.0
+// has sync_runs rows with no kind. After migrating they must read as the
+// empty kind, which status treats exactly as it did before the column
+// existed — not fail to scan, and not report something invented.
+func TestErrorKindDefaultsForPreexistingRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// Build the v1.0.0 schema by hand: migrate only to 0001, then write a
+	// row through raw SQL, since the Store API of this version cannot
+	// produce a row without a kind. Drives goose directly, outside
+	// Store.Migrate and its mutex; that is safe only because this
+	// package does not use t.Parallel.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	goose.SetBaseFS(migrations.FS)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("dialect: %v", err)
+	}
+	if err := goose.UpToContext(ctx, raw, ".", 1); err != nil {
+		t.Fatalf("goose up-to 1: %v", err)
+	}
+	for _, stmt := range []string{
+		`INSERT INTO accounts (id, label) VALUES (1, 'default')`,
+		`INSERT INTO sync_runs (account_id, finished_at, error) VALUES (1, '2026-01-01T00:00:00.000Z', 'boom')`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	runs, err := s.ListRuns(ctx, 1, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("ListRuns returned %d rows, want 1", len(runs))
+	}
+	if runs[0].ErrorKind != "" || runs[0].Error != "boom" {
+		t.Errorf("run = %+v, want ErrorKind \"\" and Error \"boom\"", runs[0])
+	}
+}
+
+// TestFinishRunRejectsAnUnknownKind: RunErrorKind is a plain string, so
+// nothing at compile time stops a caller from passing error text through
+// Kind instead of one of the package's sentinels. The column is
+// published by the status endpoints, so FinishRun must refuse it rather
+// than write it verbatim — and it must say so in the log, the same way
+// an unparseable watermark does, rather than fail silently.
+func TestFinishRunRejectsAnUnknownKind(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	var buf bytes.Buffer
+	s.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	runID, err := s.StartRun(ctx, acct.ID, false)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	smuggled := "difm: page 1: https://api.audioaddict.com/v1/di/members/4242/track_votes"
+	if err := s.FinishRun(ctx, runID, sqlite.RunStats{
+		Err:  errors.New("boom"),
+		Kind: sqlite.RunErrorKind(smuggled),
+	}); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+
+	runs, err := s.ListRuns(ctx, acct.ID, 1)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ErrorKind != sqlite.KindError {
+		t.Fatalf("ListRuns = %+v, want one run with ErrorKind %q", runs, sqlite.KindError)
+	}
+	if strings.Contains(string(runs[0].ErrorKind), "4242") {
+		t.Errorf("ErrorKind = %q, want the member id scrubbed rather than written through", runs[0].ErrorKind)
+	}
+	if !strings.Contains(buf.String(), "unknown error kind") {
+		t.Errorf("logged %q, want a warning naming the rejected kind", buf.String())
+	}
+}
+
+// TestPruneRunsKeepsTheWindowAndTheInFlightRow: retention is by age, but
+// the newest rows survive regardless — the health rule reads them — and
+// a row that has not finished is never a candidate, however old its
+// start looks to a rewound clock.
+func TestPruneRunsKeepsTheWindowAndTheInFlightRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	finished := func(age time.Duration) {
+		t.Helper()
+		s.SetClock(func() time.Time { return base.Add(-age) })
+		id, err := s.StartRun(ctx, acct.ID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := s.FinishRun(ctx, id, sqlite.RunStats{}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+	// 30 finished rows, one per day, the oldest 30 days old.
+	for d := 30; d >= 1; d-- {
+		finished(time.Duration(d) * 24 * time.Hour)
+	}
+	// One in-flight row that looks 40 days old.
+	s.SetClock(func() time.Time { return base.Add(-40 * 24 * time.Hour) })
+	if _, err := s.StartRun(ctx, acct.ID, false); err != nil {
+		t.Fatalf("StartRun (in-flight): %v", err)
+	}
+	s.SetClock(func() time.Time { return base })
+
+	// Retain 10 days, keep at least 5: rows 11..30 days old are
+	// candidates (20 rows); the floor of 5 is already satisfied by the
+	// newest 10, so all 20 go. The in-flight row stays.
+	n, err := s.PruneRuns(ctx, acct.ID, base.Add(-10*24*time.Hour), 5)
+	if err != nil {
+		t.Fatalf("PruneRuns: %v", err)
+	}
+	if n != 20 {
+		t.Errorf("pruned %d rows, want 20", n)
+	}
+	runs, err := s.ListRuns(ctx, acct.ID, 100)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 11 {
+		t.Fatalf("%d rows remain, want 11 (10 recent + in-flight)", len(runs))
+	}
+	inFlight := 0
+	for _, r := range runs {
+		if r.FinishedAt == "" {
+			inFlight++
+		}
+	}
+	if inFlight != 1 {
+		t.Errorf("in-flight rows remaining = %d, want 1", inFlight)
+	}
+
+	// Now retain nothing by age but keep 8: the floor is what saves rows.
+	n, err = s.PruneRuns(ctx, acct.ID, base.Add(time.Hour), 8)
+	if err != nil {
+		t.Fatalf("PruneRuns (floor): %v", err)
+	}
+	// 11 rows; newest 8 by started_at are kept — the in-flight row is
+	// oldest by started_at and is protected by finished_at, not the floor.
+	// Candidates: 11 - 8 = 3, minus the in-flight one = 2.
+	if n != 2 {
+		t.Errorf("pruned %d rows under the floor, want 2", n)
+	}
+	// Idempotent.
+	n, err = s.PruneRuns(ctx, acct.ID, base.Add(time.Hour), 8)
+	if err != nil || n != 0 {
+		t.Errorf("second prune = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+// Both account_id filters are load-bearing: the floor subquery is
+// exactly where dropping the inner one would keep another account's
+// newest rows and delete this one's.
+func TestPruneRunsIsScopedToTheAccount(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	a, err := s.EnsureAccount(ctx, "a", "1", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount a: %v", err)
+	}
+	b, err := s.EnsureAccount(ctx, "b", "2", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount b: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.SetClock(func() time.Time { return base.Add(-30 * 24 * time.Hour) })
+	for _, id := range []int64{a.ID, b.ID, b.ID} {
+		run, err := s.StartRun(ctx, id, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := s.FinishRun(ctx, run, sqlite.RunStats{}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+	s.SetClock(func() time.Time { return base })
+
+	if n, err := s.PruneRuns(ctx, a.ID, base, 0); err != nil || n != 1 {
+		t.Fatalf("prune a = (%d, %v), want (1, nil)", n, err)
+	}
+	runs, err := s.ListRuns(ctx, b.ID, 10)
+	if err != nil {
+		t.Fatalf("ListRuns b: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Errorf("account b has %d rows after pruning a, want 2", len(runs))
+	}
+}
+
+// TestOpenRefusesACorruptDatabase: the documented restore is a docker cp,
+// and a truncated or half-written copy used to surface as whatever query
+// tripped first — from inside a pass, under a restart policy, with no
+// file name and no next step. Now the open itself says which file and
+// where the runbook is.
+func TestOpenRefusesACorruptDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.db")
+	s := openAt(t, path)
+
+	// A freshly-migrated, insert-only database has nothing to free, so
+	// there is no freelist page for the corrupting write below to land
+	// on harmlessly — every page in size/2's neighborhood is live. Asked
+	// over a second raw connection to the same file: Store exposes no
+	// pragma escape hatch, and WAL allows the concurrent reader.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	var freelist int
+	if err := raw.QueryRowContext(context.Background(), "PRAGMA freelist_count").Scan(&freelist); err != nil {
+		t.Fatalf("freelist_count: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	if freelist != 0 {
+		t.Fatalf("freelist_count = %d, want 0 (corrupting write may land on a free page)", freelist)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Overwrite the middle of the file. Page 1 stays intact so SQLite
+	// still recognizes the header and reaches the check; a page inside
+	// the btree does not.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	garbage := bytes.Repeat([]byte{0xFF}, 512)
+	if _, err := f.WriteAt(garbage, info.Size()/2); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	_, err = sqlite.Open(path)
+	if err == nil {
+		t.Fatal("Open succeeded on a corrupt database")
+	}
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("Open error = %q, want errors.Is ErrCorrupt", err)
+	}
+	for _, want := range []string{path, "Restoring"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Open error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestOpenRefusesATruncatedDatabase covers the case the check exists
+// for: an interrupted docker cp. SQLite validates the page header when
+// the connection opens, before quick_check ever runs, so a truncated
+// file fails at the ping — with the old message, that read
+// "sqlite.Open: ping: database disk image is malformed (11)" and gave
+// no path and no next step.
+func TestOpenRefusesATruncatedDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncated.db")
+	s := openAt(t, path)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if err := os.Truncate(path, info.Size()/2); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	_, err = sqlite.Open(path)
+	if err == nil {
+		t.Fatal("Open succeeded on a truncated database")
+	}
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("Open error = %q, want errors.Is ErrCorrupt", err)
+	}
+	for _, want := range []string{path, "Restoring"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Open error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestOpenRefusesANonDatabaseFile covers a restore landing the wrong
+// file entirely — the header check trips exactly as it does for a
+// truncated one.
+func TestOpenRefusesANonDatabaseFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-database.db")
+	if err := os.WriteFile(path, []byte("this is not a database"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := sqlite.Open(path)
+	if err == nil {
+		t.Fatal("Open succeeded on a non-database file")
+	}
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("Open error = %q, want errors.Is ErrCorrupt", err)
+	}
+	for _, want := range []string{path, "Restoring"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Open error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestSnapshotToVerifiesBeforePublishing: the snapshot is what a restore
+// copies over the live database, so an unusable one must never reach the
+// destination to be mistaken for a good one later.
+func TestSnapshotToVerifiesBeforePublishing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	if _, err := s.EnsureAccount(ctx, "default", "111", "p"); err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	dir := t.TempDir()
+
+	dest := filepath.Join(dir, "good.db")
+	if err := s.SnapshotTo(ctx, dest, "default"); err != nil {
+		t.Fatalf("SnapshotTo: %v", err)
+	}
+	snap, err := sqlite.Open(dest)
+	if err != nil {
+		t.Fatalf("the snapshot does not open: %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+	if _, err := snap.GetAccount(ctx, "default"); err != nil {
+		t.Errorf("the snapshot has no account row: %v", err)
+	}
+
+	// A verify that cannot pass must leave nothing behind at all — not a
+	// partial file with a plausible name.
+	missing := filepath.Join(dir, "bad.db")
+	if err := s.SnapshotTo(ctx, missing, "no-such-account"); err == nil {
+		t.Fatal("SnapshotTo with an unknown account returned nil")
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a failed verify left %s behind (stat err = %v)", missing, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".difmsync-backup-") {
+			t.Errorf("staging directory %s left behind", e.Name())
+		}
+	}
+}
+
+func TestSnapshotToRefusesAnExistingDestination(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	if _, err := s.EnsureAccount(ctx, "default", "111", "p"); err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	dest := filepath.Join(t.TempDir(), "taken.db")
+	if err := os.WriteFile(dest, []byte("existing"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	err := s.SnapshotTo(ctx, dest, "default")
+	if err == nil {
+		t.Fatal("SnapshotTo overwrote an existing file")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("err = %v, want it to say the destination already exists", err)
+	}
+	// And the file it refused to overwrite is untouched.
+	b, err := os.ReadFile(dest)
+	if err != nil || string(b) != "existing" {
+		t.Errorf("the existing file was modified: %q, %v", b, err)
+	}
+}
+
+// openAt opens and migrates a store at a known path, then seeds enough
+// rows that the file spans several pages.
+func openAt(t *testing.T, path string) *sqlite.Store {
+	t.Helper()
+	ctx := context.Background()
+	s, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	acct, err := s.EnsureAccount(ctx, "default", "111", "p")
+	if err != nil {
+		t.Fatalf("EnsureAccount: %v", err)
+	}
+	for range 200 {
+		id, err := s.StartRun(ctx, acct.ID, false)
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		if err := s.FinishRun(ctx, id, sqlite.RunStats{Err: errors.New(strings.Repeat("x", 200))}); err != nil {
+			t.Fatalf("FinishRun: %v", err)
+		}
+	}
+	return s
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,7 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/urfave/cli/v3"
+
 	"github.com/mjrossi/difm-spotify-sync/internal/store/sqlite"
+	"github.com/mjrossi/difm-spotify-sync/internal/syncer"
 )
 
 // The CLI layer had no tests, and three of its bugs lived precisely
@@ -116,12 +122,26 @@ func TestCallbackTarget(t *testing.T) {
 // .env.local exports live credentials — and assertions about
 // missing configuration pass or fail depending on whose machine runs
 // them.
+//
+// It unsets rather than blanks: a present-but-empty variable is not the
+// same as an absent one (nonEmptyEnv in main.go depends on exactly that
+// difference), so setting each to "" would leave tests starting from a
+// state no real deployment is in.
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, kv := range os.Environ() {
-		if k, _, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(k, "DIFMSYNC_") {
-			t.Setenv(k, "")
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasPrefix(k, "DIFMSYNC_") {
+			continue
 		}
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatalf("unsetenv %s: %v", k, err)
+		}
+		t.Cleanup(func() {
+			if err := os.Setenv(k, v); err != nil {
+				t.Fatalf("restore %s: %v", k, err)
+			}
+		})
 	}
 }
 
@@ -354,6 +374,36 @@ func TestOpenStoreRestrictsPermissions(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("db mode = %o, want 600", perm)
+	}
+}
+
+// TestOpenStoreSuppressesMountDiagnosticForACorruptDatabase: a corrupt
+// database is not a permissions problem, and mountDiagnostic's advice
+// (check the volume's uid/gid) contradicts sqlite.ErrCorrupt's own
+// (restore from a backup). openStore must report only the one that
+// applies.
+func TestOpenStoreSuppressesMountDiagnosticForACorruptDatabase(t *testing.T) {
+	dbPath, _ := seed(t)
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if err := os.Truncate(dbPath, info.Size()/2); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	err = runCLI(t, dbPath, "status")
+	if err == nil {
+		t.Fatal("status succeeded against a truncated database")
+	}
+	if !errors.Is(err, sqlite.ErrCorrupt) {
+		t.Errorf("error = %q, want errors.Is ErrCorrupt", err)
+	}
+	if !strings.Contains(err.Error(), "Restoring") {
+		t.Errorf("error = %q, want it to name the restore runbook", err)
+	}
+	if strings.Contains(err.Error(), "volume ownership") || strings.Contains(err.Error(), "this process runs as uid") {
+		t.Errorf("error = %q, carries the mount diagnostic alongside ErrCorrupt's own advice", err)
 	}
 }
 
@@ -694,6 +744,24 @@ func TestStatusCheckIsTheHealthcheckContract(t *testing.T) {
 		}
 	})
 
+	t.Run("max-age follows DIFMSYNC_INTERVAL when unset", func(t *testing.T) {
+		// seed clears DIFMSYNC_* itself, so DIFMSYNC_INTERVAL is set after
+		// seeding (matching the --max-age subtest above) rather than
+		// before, where seed's own clearEnv would immediately wipe it.
+		dbPath, account := seed(t)
+		t.Setenv("DIFMSYNC_INTERVAL", "2h")
+		recordRun(t, dbPath, account.ID, 5*time.Hour)
+		if err := runCLI(t, dbPath, "status", "--check"); err != nil {
+			t.Errorf("5h-old pass at a 2h interval = %v, want nil (max-age should be 6h)", err)
+		}
+		dbPath, account = seed(t)
+		t.Setenv("DIFMSYNC_INTERVAL", "2h")
+		recordRun(t, dbPath, account.ID, 7*time.Hour)
+		if err := runCLI(t, dbPath, "status", "--check"); err == nil {
+			t.Error("7h-old pass at a 2h interval = nil, want an error")
+		}
+	})
+
 	t.Run("before auth exits non-zero", func(t *testing.T) {
 		// The pre-auth window is why compose.yaml sets a 30m start_period.
 		// A fresh deployment has no account row at all, and the check has
@@ -720,4 +788,160 @@ func TestStatusCheckIsTheHealthcheckContract(t *testing.T) {
 			t.Error("DIFMSYNC_STATUS_MAX_AGE=1s did not make a 10m-old pass unhealthy")
 		}
 	})
+}
+
+// TestEffectiveMaxAge: unset, the freshness window follows the interval.
+// A fixed 45m at a 2h interval is a probe that is red between every pair
+// of passes — wrong, not strict — and restart policies ignore health, so
+// nothing visibly breaks. Set, the operator's number wins.
+func TestEffectiveMaxAge(t *testing.T) {
+	clearEnv(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  map[string]string
+		want time.Duration
+	}{
+		{"defaults agree", nil, nil, 45 * time.Minute},
+		{"unset follows the interval", []string{"--interval", "2h"}, nil, 6 * time.Hour},
+		{"flag wins", []string{"--interval", "2h", "--max-age", "1h"}, nil, time.Hour},
+		{"env wins", []string{"--interval", "2h"}, map[string]string{"DIFMSYNC_STATUS_MAX_AGE": "90m"}, 90 * time.Minute},
+		{"env interval", nil, map[string]string{"DIFMSYNC_INTERVAL": "30m"}, 90 * time.Minute},
+		{"empty env derives", []string{"--interval", "2h"}, map[string]string{"DIFMSYNC_STATUS_MAX_AGE": ""}, 6 * time.Hour},
+		{"interval below the floor is clamped first", []string{"--interval", "30s"}, nil, 3 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			var got time.Duration
+			cmd := &cli.Command{
+				Flags:  []cli.Flag{intervalFlag(""), maxAgeFlag("")},
+				Action: func(_ context.Context, c *cli.Command) error { got = effectiveMaxAge(c); return nil },
+			}
+			if err := cmd.Run(context.Background(), append([]string{"x"}, tc.args...)); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("effectiveMaxAge = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSyncBackupFlagsAreWired proves --backup-dir/--backup-keep exist on
+// `sync` with the right identity — the right env var and the right
+// default. TestBuildEngineWiresBackups proves the engine is handed what
+// they say; the write path itself — one snapshot a day, pruning, the
+// dry-run/failed-pass/backup-failure cases — is covered end to end by
+// internal/syncer/backup_test.go, which drives RunOnce directly against
+// a real store. TestConfigSurfaceIsDocumentedAndConsistent separately
+// pins the env var name, the README row and the Dockerfile default
+// against this flag's own default.
+func TestSyncBackupFlagsAreWired(t *testing.T) {
+	app := newApp()
+	var sync *cli.Command
+	for _, c := range app.Commands {
+		if c.Name == "sync" {
+			sync = c
+		}
+	}
+	if sync == nil {
+		t.Fatal("no sync command registered")
+	}
+
+	var dirFlag, keepFlag cli.Flag
+	for _, f := range sync.Flags {
+		switch f.Names()[0] {
+		case "backup-dir":
+			dirFlag = f
+		case "backup-keep":
+			keepFlag = f
+		}
+	}
+
+	envVars := func(f cli.Flag) []string {
+		ev, ok := f.(interface{ GetEnvVars() []string })
+		if !ok {
+			t.Fatalf("%s does not expose GetEnvVars", f.Names()[0])
+		}
+		return ev.GetEnvVars()
+	}
+
+	if dirFlag == nil {
+		t.Fatal("--backup-dir is not defined on `sync`")
+	}
+	if got := envVars(dirFlag); len(got) != 1 || got[0] != "DIFMSYNC_BACKUP_DIR" {
+		t.Errorf("--backup-dir env vars = %v, want [DIFMSYNC_BACKUP_DIR]", got)
+	}
+	if sf, ok := dirFlag.(*cli.StringFlag); !ok || sf.Value != "" {
+		t.Errorf("--backup-dir default = %+v, want empty (disabled off the CLI)", dirFlag)
+	}
+
+	if keepFlag == nil {
+		t.Fatal("--backup-keep is not defined on `sync`")
+	}
+	if got := envVars(keepFlag); len(got) != 1 || got[0] != "DIFMSYNC_BACKUP_KEEP" {
+		t.Errorf("--backup-keep env vars = %v, want [DIFMSYNC_BACKUP_KEEP]", got)
+	}
+	if kf, ok := keepFlag.(*cli.IntFlag); !ok || kf.Value != 14 {
+		t.Errorf("--backup-keep default = %+v, want 14", keepFlag)
+	}
+}
+
+// TestBuildEngineWiresBackups drives the real sync command's flag set
+// into buildEngine — the action is swapped out only because the real one
+// probes Spotify before it gets that far. Backups are the one engine
+// field whose absence nothing notices: the daemon runs and syncs, and
+// the missing snapshots surface on the day a restore needs one.
+func TestBuildEngineWiresBackups(t *testing.T) {
+	clearEnv(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want syncer.Backups
+	}{
+		{
+			"daemon backs up and prunes",
+			[]string{"--loop", "--backup-dir", "/b", "--backup-keep", "3"},
+			syncer.Backups{Dir: "/b", Keep: 3},
+		},
+		// A debugging one-shot may take today's snapshot but must not
+		// prune the directory down to --backup-keep as a side effect.
+		{
+			"one-shot never prunes",
+			[]string{"--backup-dir", "/b", "--backup-keep", "3"},
+			syncer.Backups{Dir: "/b", Keep: 0},
+		},
+		{
+			"no dir, no backups",
+			[]string{"--loop"},
+			syncer.Backups{Dir: "", Keep: 14},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newApp()
+			var engine *syncer.Engine
+			for _, c := range app.Commands {
+				if c.Name == "sync" {
+					c.Action = func(_ context.Context, c *cli.Command) error {
+						engine = buildEngine(c, nil, nil, nil, sqlite.Account{}, nil)
+						return nil
+					}
+				}
+			}
+			if err := app.Run(context.Background(), append([]string{"difmsync", "sync"}, tc.args...)); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if engine == nil {
+				t.Fatal("sync action never ran")
+			}
+			if engine.Backups == nil {
+				t.Fatal("engine.Backups = nil; the daemon would never take a snapshot")
+			}
+			if diff := cmp.Diff(tc.want, *engine.Backups, cmpopts.IgnoreUnexported(syncer.Backups{})); diff != "" {
+				t.Errorf("Backups (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

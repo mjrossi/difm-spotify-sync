@@ -167,6 +167,91 @@ func TestRevokedGrantIsTypedUnauthorized(t *testing.T) {
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Errorf("Search err = %v, want ErrUnauthorized", err)
 	}
+	// The narrower sentinel is what lets the daemon re-enter consent on
+	// its own. It has to satisfy both: existing abort branches key on
+	// ErrUnauthorized, and only this one path may trigger re-consent.
+	if !errors.Is(err, ErrGrantRevoked) {
+		t.Errorf("Search err = %v, want ErrGrantRevoked", err)
+	}
+}
+
+// TestTokenEndpointRefusalsThatAreNotRevocations covers the two
+// token-endpoint failures that must stay ErrUnauthorized without
+// escalating to ErrGrantRevoked: a wrong client secret and a bodiless
+// upstream 4xx. ErrGrantRevoked is about to become the one error that
+// authorizes deleting a stored refresh token, so a wrong secret must not
+// delete a working grant — the operator would re-consent, exchange would
+// fail with the same invalid_client, and nothing would ever recover.
+func TestTokenEndpointRefusalsThatAreNotRevocations(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{
+			name: "invalid_client",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"invalid_client","error_description":"Invalid client secret"}`))
+			},
+		},
+		{
+			name: "bodiless upstream 403",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`<html><body>Forbidden</body></html>`))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tokenSrv := httptest.NewServer(tc.handler)
+			defer tokenSrv.Close()
+
+			a := &Authenticator{cfg: &oauth2.Config{
+				ClientID:     "id",
+				ClientSecret: "secret",
+				Endpoint:     oauth2.Endpoint{TokenURL: tokenSrv.URL},
+			}}
+
+			c, err := a.Client(context.Background(), "some-token", nil)
+			if err != nil {
+				t.Fatalf("Client: %v", err)
+			}
+
+			_, err = c.Search(context.Background(), "artist", "title", 5, "")
+			if !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("Search err = %v, want ErrUnauthorized", err)
+			}
+			if errors.Is(err, ErrGrantRevoked) {
+				t.Errorf("Search err = %v, must not be ErrGrantRevoked", err)
+			}
+		})
+	}
+}
+
+// TestAPIForbiddenIsNotARevokedGrant is the negative control for the
+// sentinel above. A 403 from the API — a missing scope, a Development
+// Mode restriction, a playlist the user does not own — is not something
+// re-consent can fix. If it were typed as a revoked grant the daemon
+// would clear a working token and loop through consent forever.
+func TestAPIForbiddenIsNotARevokedGrant(t *testing.T) {
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"status":403,"message":"Insufficient client scope"}}`))
+	}))
+	defer apiSrv.Close()
+
+	c := NewClient(apiSrv.Client(), apiSrv.URL)
+	_, err := c.Search(context.Background(), "artist", "title", 5, "")
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("Search err = %v, want ErrUnauthorized", err)
+	}
+	if errors.Is(err, ErrGrantRevoked) {
+		t.Errorf("Search err = %v, must not be ErrGrantRevoked", err)
+	}
 }
 
 // TestTokenEndpointRateLimitIsTyped: a 429 from the token endpoint is a

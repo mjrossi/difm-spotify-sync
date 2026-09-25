@@ -53,9 +53,16 @@ docker run -d --name difmsync \
   -e DIFMSYNC_SPOTIFY_CLIENT_ID=... \
   -e DIFMSYNC_SPOTIFY_CLIENT_SECRET=... \
   -e DIFMSYNC_PLAYLIST_ID=... \
+  --security-opt no-new-privileges:true --cap-drop ALL \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID \
   --restart unless-stopped \
   ghcr.io/mjrossi/difm-spotify-sync:latest
 ```
+
+The image starts as root for the few milliseconds it takes to fix `/config`'s
+ownership before dropping to `PUID`/`PGID`; the flags above narrow that root
+window to exactly the four capabilities that step needs, rather than leaving
+it with the full default set.
 
 or with Compose:
 
@@ -152,6 +159,13 @@ Every setting is an environment variable with a matching flag. The container
 image ships the defaults in this table; running the binary directly gets the
 CLI defaults noted where they differ.
 
+In the container, set these as environment variables rather than as flags in
+`command:`. The healthcheck and the entrypoint are separate processes that see
+the environment but not the daemon's command line, so `--interval=1h` passed
+as a flag leaves `/healthz` allowing 3h between passes while Docker's own
+healthcheck still allows 45m and reports the container unhealthy between
+every pair of them. `--db-path` and `--backup-dir` go wrong the same way.
+
 | Variable | Flag | Default in the image |
 |---|---|---|
 | `DIFMSYNC_API_KEY` | `--api-key` | — (required) |
@@ -171,7 +185,9 @@ CLI defaults noted where they differ.
 | `DIFMSYNC_HTTP_ADDR` | `--http-addr` | `0.0.0.0:3436` (CLI: off) |
 | `DIFMSYNC_AUTH_HTTP_ADDR` | `--auth-http-addr` | `0.0.0.0:3437` (CLI: off) |
 | `DIFMSYNC_AUTH_BIND` | `--auth-bind` | `0.0.0.0` (CLI: the redirect URL's host) |
-| `DIFMSYNC_STATUS_MAX_AGE` | `--max-age` | `45m` |
+| `DIFMSYNC_STATUS_MAX_AGE` | `--max-age` | `45m` (unset: 3 × `DIFMSYNC_INTERVAL`) |
+| `DIFMSYNC_BACKUP_DIR` | `--backup-dir` | `/config/backups` (CLI: off) |
+| `DIFMSYNC_BACKUP_KEEP` | `--backup-keep` | `14` |
 
 Container-level settings, following the usual self-hosted conventions:
 
@@ -257,7 +273,7 @@ serves the same verdict over HTTP, for a dashboard:
 | Endpoint | Answer |
 |---|---|
 | `GET /healthz` | `200 ok`, or `503` and the reason |
-| `GET /status.json` | the full report; always `200`, with `"healthy": false` when it is not |
+| `GET /status.json` | the full report; always `200`, with `"healthy": false` when it is not — `version`, `last_success_at` and `consecutive_failures` included |
 
 Both are **read-only and carry no secrets**, which is what makes them safe to
 expose on a LAN unauthenticated. Anything that writes — approving a queued
