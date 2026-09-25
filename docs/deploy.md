@@ -248,6 +248,21 @@ the service will look like it started fine. `DIFMSYNC_AUTH_BIND` must be
 `0.0.0.0`, because a published port forwards to the container's eth0
 address rather than its loopback.
 
+Override by environment variable, never by a flag appended to
+`command:`. The image's `HEALTHCHECK` runs `status --check` as its own
+process, and the entrypoint reads its paths before the daemon starts;
+both see the environment and neither sees the daemon's command line. A
+flag therefore configures the daemon and nothing that watches or repairs
+it:
+
+- `--interval=1h` stretches `/healthz`'s window to 3h, while the
+  Docker healthcheck, still deriving from the 15m default, allows 45m
+  and flaps unhealthy between passes. `DIFMSYNC_INTERVAL=1h` moves
+  both.
+- `--db-path` and `--backup-dir` point the daemon somewhere the
+  entrypoint never repairs, and the healthcheck opens a different
+  database from the one being synced.
+
 ### Day-2 commands
 
 Use `exec`, so you reach the container that is already running with the

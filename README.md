@@ -159,6 +159,13 @@ Every setting is an environment variable with a matching flag. The container
 image ships the defaults in this table; running the binary directly gets the
 CLI defaults noted where they differ.
 
+In the container, set these as environment variables rather than as flags in
+`command:`. The healthcheck and the entrypoint are separate processes that see
+the environment but not the daemon's command line, so `--interval=1h` passed
+as a flag leaves `/healthz` allowing 3h between passes while Docker's own
+healthcheck still allows 45m and reports the container unhealthy between
+every pair of them. `--db-path` and `--backup-dir` go wrong the same way.
+
 | Variable | Flag | Default in the image |
 |---|---|---|
 | `DIFMSYNC_API_KEY` | `--api-key` | — (required) |
