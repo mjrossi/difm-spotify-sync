@@ -13,6 +13,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   goose recorded it. Confirming a migration ran no longer needs `sqlite3`
   and a copy of the database.
 
+### Changed
+
+- JSON logs write durations the way they are configured —
+  `"interval":"2h0m0s"`, `"first_run_in":"19m14s"` — instead of integer
+  nanoseconds (`7200000000000`). Anything parsing those fields as numbers
+  needs to parse Go duration strings instead; text-format logs are
+  unchanged.
+
 ## [1.1.0] - 2026-09-25
 
 ### Added
