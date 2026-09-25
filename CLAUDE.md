@@ -264,23 +264,30 @@ to `status.HealthScanLimit` by `TestKeepRunsIsTheHealthScanWindow`, so
 housekeeping can never delete a row the health rule is about to read. It is
 not a flag: a retention period is not a knob a self-hoster needs, and every
 flag is a README row and a Dockerfile line the config-drift test then
-polices. The prune runs in `engine.go` after the ledger transaction commits
-and before the `!passClean` return — `TestRunOnce_PruneRunsOnlyAfterTheLedgerCommits`
-pins the placement — guarded by `passClean && !dryRun` and `ctx.Err() ==
-nil`, so it never runs on a failed or dry pass, and a shutdown landing right
-after the commit skips it rather than logging a misleading warning. A prune
+polices. The prune runs in `RunOnce` (`engine.go`) as part of
+`housekeep`, *after* the pass proper (`pass`) has returned — so after the
+ledger transaction commits (`TestRunOnce_PruneRunsOnlyAfterTheLedgerCommits`
+pins that) and after `pass`'s deferred `FinishRun` has closed the run's own
+row. It is guarded by `err == nil && !dryRun`, which is exactly a clean,
+real pass (`pass` returns nil for one only from its last line), and by
+`ctx.Err() == nil`, so it never runs on a failed or dry pass, and a
+shutdown landing right after the commit skips it rather than logging a
+misleading warning. A prune
 failure is logged at Warn and never marks the pass incomplete: it is not a
 like reaching or missing durable state, so invariant 2 does not apply to it.
 `PruneRuns` also leaves every unfinished row alone regardless of age — one
 per hard crash, kept rather than guessed at.
 
 The daemon's own scheduled backup (`internal/syncer/backup.go`, wired as
-`Engine.Backups`) rides the same guard as the run prune and runs inside
-it, before the prune rather than after: `passClean && !dryRun` and
-`ctx.Err() == nil`, so a snapshot is only ever taken after a fully clean
-pass and never of a database whose retention has just changed underneath
-it. A failed snapshot attempt is logged at Warn and does not mark the
-pass incomplete, for the same reason a failed run-prune does not: it is
+`Engine.Backups`) is the other half of `housekeep`, under the same guard,
+and runs before the prune rather than after, so a restore from that day's
+snapshot still carries the rows the prune is about to delete
+(`TestRunOnce_BackupPrecedesPruneRuns`). Running it after `FinishRun`
+rather than inside the pass is what keeps the snapshot free of an open
+run: taken mid-pass, every snapshot carried its own row unfinished, and
+each restore brought back a phantom in-flight run that `PruneRuns` would
+keep forever (`TestRunOnce_SnapshotCarriesItsOwnRunFinished`). A failed
+snapshot attempt is logged at Warn and does not mark the pass incomplete, for the same reason a failed run-prune does not: it is
 not a like reaching or missing durable state, so invariant 2 does not
 apply to it. The daily gate has two parts and neither is durable: a
 snapshot is skipped once `difmsync-<today>.db` already exists on disk

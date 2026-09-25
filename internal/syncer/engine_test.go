@@ -1166,3 +1166,42 @@ func TestRunOnce_BackupPrecedesPruneRuns(t *testing.T) {
 			"so it still has the rows the prune is about to delete", len(runs), want)
 	}
 }
+
+// TestRunOnce_SnapshotCarriesItsOwnRunFinished pins why housekeeping runs
+// after pass returns rather than inside it: the snapshot must be taken
+// once the pass's own sync_runs row is closed. Taken from inside the pass,
+// every snapshot held that row still open, so each restore brought back a
+// phantom in-flight run that PruneRuns — which never touches an
+// unfinished row — kept forever.
+func TestRunOnce_SnapshotCarriesItsOwnRunFinished(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "backups")
+	h := newHarness(t, []like{aLike(1, "DJ Rax", "Air Race (Spiritchaser Remix)", 480, feb)})
+	h.searchResult["Air Race"] = []spotifyTrack{
+		{ID: "sp1", Artist: "DJ Rax", Title: "Air Race - Spiritchaser Remix", Seconds: 480},
+	}
+	h.Engine.Backups = &syncer.Backups{Dir: dir, Keep: 14}
+
+	if _, err := h.Engine.RunOnce(ctx, false); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	dest := filepath.Join(dir, "difmsync-"+time.Now().UTC().Format("2006-01-02")+".db")
+	snap, err := sqlite.Open(dest)
+	if err != nil {
+		t.Fatalf("open snapshot: %v", err)
+	}
+	defer func() { _ = snap.Close() }()
+	runs, err := snap.ListRuns(ctx, h.Engine.Account.ID, 1000)
+	if err != nil {
+		t.Fatalf("ListRuns on snapshot: %v", err)
+	}
+	if len(runs) == 0 {
+		t.Fatal("snapshot carries no sync_runs rows, want this pass's own")
+	}
+	for _, r := range runs {
+		if r.FinishedAt == "" {
+			t.Errorf("snapshot carries run %d unfinished; a restore would show it in flight forever", r.ID)
+		}
+	}
+}

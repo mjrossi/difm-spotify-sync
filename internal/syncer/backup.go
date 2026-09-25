@@ -68,7 +68,7 @@ type Backups struct {
 	// pass, up to 96 times a day at the default interval.
 	//
 	// Unguarded because a *Backups is owned by exactly one Engine and
-	// run is only ever called from within that Engine's own RunOnce, one
+	// run is only ever called from that Engine's own RunOnce, one
 	// pass at a time — never shared across Engines or called
 	// concurrently with itself. A *Backups handed to more than one
 	// caller would need a mutex around this field.

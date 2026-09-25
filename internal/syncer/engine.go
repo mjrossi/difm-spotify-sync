@@ -56,6 +56,56 @@ type Engine struct {
 // occurs. That is the intended first-run mode: a one-way playlist append
 // is tedious to undo by hand.
 func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, error) {
+	stats, err := e.pass(ctx, dryRun)
+
+	// Housekeeping rides on a clean, real pass, and runs only once pass
+	// has returned — after the ledger and the watermark, so it can never
+	// sit between them, and after pass's deferred FinishRun has closed
+	// this run's sync_runs row. That second half is the reason it lives
+	// out here: taken inside pass, every snapshot carried its own run
+	// still open, and a restore from it showed a phantom in-flight row
+	// that PruneRuns, which leaves unfinished rows alone, kept forever.
+	//
+	// err == nil && !dryRun is exactly the clean, real pass: pass returns
+	// nil for a non-dry run only from its last line, after the watermark,
+	// and returns ErrPassIncomplete for anything it swallowed.
+	//
+	// A shutdown landing between the ledger commit and here is a clean
+	// stop; skipping avoids a misleading Warn, and the next clean pass
+	// does it anyway.
+	if err == nil && !dryRun && ctx.Err() == nil {
+		e.housekeep(ctx)
+	}
+	return stats, err
+}
+
+// housekeep takes the day's snapshot and prunes old sync_runs rows. A
+// failure in either is logged and swallowed: it is not a like reaching or
+// missing durable state, so invariant 2 is not in play and the pass stays
+// clean.
+func (e *Engine) housekeep(ctx context.Context) {
+	// Before the run prune, so a restore from that day's snapshot still
+	// carries the rows the prune is about to delete.
+	if e.Backups != nil && e.Backups.Dir != "" {
+		if dest, err := e.Backups.run(ctx, e.Store, e.Account.Label); err != nil {
+			e.Log.Warn("could not take a backup", "dir", e.Backups.Dir, "err", err)
+		} else if dest != "" {
+			e.Log.Info("backup written", "path", dest)
+		}
+	}
+
+	before := time.Now().Add(-RunsRetention)
+	if n, err := e.Store.PruneRuns(ctx, e.Account.ID, before, KeepRuns); err != nil {
+		e.Log.Warn("could not prune old sync runs", "err", err)
+	} else if n > 0 {
+		e.Log.Debug("pruned old sync runs", "count", n, "older_than", before)
+	}
+}
+
+// pass is RunOnce's pass proper: everything from reloading the account to
+// the watermark, with the sync_runs row opened at the start and closed by
+// a defer on every way out.
+func (e *Engine) pass(ctx context.Context, dryRun bool) (sqlite.RunStats, error) {
 	var stats sqlite.RunStats
 
 	// Re-read the account rather than trusting the copy taken at
@@ -384,36 +434,6 @@ func (e *Engine) RunOnce(ctx context.Context, dryRun bool) (sqlite.RunStats, err
 		}
 		if advanceMark {
 			e.Account.WatermarkLikedAt = highWater
-		}
-	}
-
-	// Housekeeping rides on a clean, real pass — after the ledger and
-	// the watermark, so it can never sit between them. A failure here
-	// is logged and swallowed: it is not a like reaching or missing
-	// durable state, so invariant 2 is not in play and passClean stays.
-	// dry runs returned at the top of the write phase; !dryRun is
-	// restated so the guard reads as the rule.
-	if passClean && !dryRun {
-		// A shutdown landing between the ledger commit and here is a
-		// clean stop; skipping the prune avoids a misleading Warn, and
-		// the next clean pass prunes anyway.
-		if ctx.Err() == nil {
-			// Before the run prune, so a snapshot is never taken of a
-			// database whose retention has just changed underneath it.
-			if e.Backups != nil && e.Backups.Dir != "" {
-				if dest, err := e.Backups.run(ctx, e.Store, account.Label); err != nil {
-					e.Log.Warn("could not take a backup", "dir", e.Backups.Dir, "err", err)
-				} else if dest != "" {
-					e.Log.Info("backup written", "path", dest)
-				}
-			}
-
-			before := time.Now().Add(-RunsRetention)
-			if n, err := e.Store.PruneRuns(ctx, account.ID, before, KeepRuns); err != nil {
-				e.Log.Warn("could not prune old sync runs", "err", err)
-			} else if n > 0 {
-				e.Log.Debug("pruned old sync runs", "count", n, "older_than", before)
-			}
 		}
 	}
 
