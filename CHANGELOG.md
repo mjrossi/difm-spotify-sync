@@ -75,6 +75,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A daily backup that was written but whose pruning of older snapshots
+  failed was logged as `could not take a backup`. It is now logged as
+  `backup written`, with a separate `could not prune old backups`
+  warning.
 - The 20-row health scan window is now fixed in both directions. A large
   `--limit` used to widen it, so `difmsync status --limit 50` could
   report healthy in a case where `/healthz` — which always uses the

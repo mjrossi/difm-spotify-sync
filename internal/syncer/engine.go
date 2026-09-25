@@ -87,11 +87,7 @@ func (e *Engine) housekeep(ctx context.Context) {
 	// Before the run prune, so a restore from that day's snapshot still
 	// carries the rows the prune is about to delete.
 	if e.Backups != nil && e.Backups.Dir != "" {
-		if dest, err := e.Backups.run(ctx, e.Store, e.Account.Label); err != nil {
-			e.Log.Warn("could not take a backup", "dir", e.Backups.Dir, "err", err)
-		} else if dest != "" {
-			e.Log.Info("backup written", "path", dest)
-		}
+		e.Backups.take(ctx, e.Store, e.Account.Label, e.Log)
 	}
 
 	before := time.Now().Add(-RunsRetention)

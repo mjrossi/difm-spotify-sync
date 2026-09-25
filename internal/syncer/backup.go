@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -79,6 +80,27 @@ type Backups struct {
 	// — and remembering "attempted" durably would mean a column and a
 	// migration for a value that is only ever advisory.
 	lastAttempt string
+}
+
+// take makes one backup attempt through run and logs what happened.
+//
+// A snapshot that landed is reported as written even when the prune
+// after it failed, and the prune failure gets a Warn of its own. Folding
+// both into "could not take a backup" told the operator a backup was
+// missing when it was sitting on disk, and hid that the real problem was
+// the directory filling up.
+func (b *Backups) take(ctx context.Context, store snapshotter, label string, log *slog.Logger) {
+	dest, err := b.run(ctx, store, label)
+	if dest != "" {
+		log.Info("backup written", "path", dest)
+	}
+	switch {
+	case err == nil:
+	case dest != "":
+		log.Warn("could not prune old backups", "dir", b.Dir, "err", err)
+	default:
+		log.Warn("could not take a backup", "dir", b.Dir, "err", err)
+	}
 }
 
 // run takes at most one snapshot attempt per UTC day and prunes older
