@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-25
+
 ### Added
 
 - The daemon now takes its own scheduled backups: one verified snapshot
@@ -44,7 +46,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `sync_runs` is pruned after each clean pass: 90 days of history, never
   fewer than the newest 20 rows (the health scan window). Not
   configurable — see CLAUDE.md, Sync semantics.
-
 - `DIFMSYNC_STATUS_MAX_AGE`, left unset, now follows the interval — three
   times `DIFMSYNC_INTERVAL` — instead of a fixed 45m regardless of it, so
   a longer interval no longer reports unhealthy between every pair of
@@ -159,5 +160,6 @@ three routes reach it, so that no deployment arrangement is locked out:
 - `difmsync --version` reports the build. Released images carry the git tag;
   a build from a checkout reports its commit.
 
-[Unreleased]: https://github.com/mjrossi/difm-spotify-sync/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/mjrossi/difm-spotify-sync/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/mjrossi/difm-spotify-sync/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/mjrossi/difm-spotify-sync/releases/tag/v1.0.0
