@@ -26,7 +26,7 @@ jobs:
       # mise is the single source of truth for the Go toolchain and for
       # sqlc/goose/golangci-lint versions, so CI and local runs cannot
       # drift apart.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
 
       - name: go build
         run: go build ./...
