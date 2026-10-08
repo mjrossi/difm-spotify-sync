@@ -52,7 +52,7 @@ jobs:
           # Tag messages and the full history, for the release notes.
           fetch-depth: 0
 
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
 
       # The gate has to run here too, not only on main. A tag can point
       # at any commit, including one that never went through a PR, and
